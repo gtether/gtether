@@ -1,0 +1,16 @@
+[workspace]
+
+members = [
+    "gtether",
+]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+
+[workspace.dependencies.gtether]
+path = "gtether"
