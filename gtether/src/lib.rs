@@ -1,3 +1,6 @@
+#[cfg(feature = "graphics")]
+pub mod render;
+
 /// Various metadata relating to an instance of the gTether Engine.
 ///
 /// Used to construct a new Engine. Metadata includes things like the name of the application that

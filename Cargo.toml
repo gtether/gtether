@@ -11,6 +11,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
+vulkano = "0.34"
 
 [workspace.dependencies.gtether]
 path = "gtether"
