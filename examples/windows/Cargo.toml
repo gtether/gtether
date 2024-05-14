@@ -1,0 +1,12 @@
+[package]
+name = "windows"
+version.workspace = true
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+gtether = { workspace = true, features = ["graphics"] }
+nalgebra-glm = { workspace = true }
+vulkano = { workspace = true }
+vulkano-shaders = "0.34"
