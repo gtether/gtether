@@ -1,12 +1,23 @@
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+
+use vulkano::{Validated, VulkanError};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
+use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::device::{Device as VKDevice, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::format::Format;
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::swapchain::{Surface, SurfaceCapabilities};
-use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
+use vulkano::sync::GpuFuture;
+
+use crate::render::render_pass::EngineRenderPass;
+use crate::render::swapchain::Swapchain;
+
+pub mod render_pass;
+pub mod swapchain;
 
 /// Collection of Vulkano structs that together represent a rendering device.
 ///
@@ -175,5 +186,100 @@ pub trait RenderTarget: Send + Sync + 'static {
     #[inline]
     fn framebuffer_count(&self) -> u32 {
         self.capabilities().min_image_count + 1
+    }
+}
+
+/// Overall structure that handles rendering for a particular render target.
+///
+/// Given a [RenderTarget] and an [EngineRenderPass], the [Renderer] will handle the actual logic
+/// around rendering to the target using an internally handled swapchain.
+pub struct Renderer {
+    target: Arc<dyn RenderTarget>,
+    render_pass: RefCell<Box<dyn EngineRenderPass>>,
+    swapchain: RefCell<Swapchain>,
+    stale: Cell<bool>,
+}
+
+impl Renderer {
+    /// Create a new renderer for a particular [RenderTarget] and [EngineRenderPass].
+    pub fn new(target: &Arc<dyn RenderTarget>, render_pass: Box<dyn EngineRenderPass>) -> Self {
+        let pipeline_cell = RefCell::new(render_pass);
+        let swapchain = {
+            let mut render_pass = pipeline_cell.borrow_mut();
+            render_pass.recreate(target);
+            Swapchain::new(target, &render_pass)
+        };
+
+        Renderer {
+            target: target.clone(),
+            render_pass: pipeline_cell,
+            swapchain: RefCell::new(swapchain),
+            stale: Cell::new(false),
+        }
+    }
+
+    /// Replace the current [EngineRenderPass] with a new one.
+    ///
+    /// Marks the renderer as stale, and will cause relevant resources to be recreated during the
+    /// next call to [Renderer::render]().
+    pub fn set_render_pass(&mut self, render_pass: Box<dyn EngineRenderPass>) {
+        self.render_pass.replace(render_pass);
+
+        self.stale.set(true);
+    }
+
+    /// Render a frame.
+    ///
+    /// Handles the logic required for recreating stale resources, rendering to a free framebuffer,
+    /// and swapping framebuffers in the swapchain.
+    pub fn render(&self) {
+        let device = self.target.device();
+
+        if self.stale.get() {
+            let mut render_pass = self.render_pass.borrow_mut();
+            render_pass.recreate(&self.target);
+            self.swapchain.borrow_mut().recreate(&render_pass)
+                .expect("Failed to recreate swapchain");
+
+            self.stale.set(false);
+        }
+
+        let swapchain = self.swapchain.borrow();
+        let (frame, suboptimal, join_future) = match swapchain.acquire_next_frame() {
+            Ok(r) => r,
+            Err(VulkanError::OutOfDate) => {
+                self.stale.set(true);
+                return
+            },
+            Err(e) => panic!("Failed to acquire next frame: {e}"),
+        };
+        if suboptimal { self.stale.set(true); }
+
+        let mut command_builder = AutoCommandBufferBuilder::primary(
+            device.command_buffer_allocator().as_ref(),
+            device.queue().queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        ).map_err(Validated::unwrap)
+            .expect("Failed to allocate command builder");
+        self.render_pass.borrow().build_commands(&mut command_builder, frame);
+        let command = command_builder.build().map_err(Validated::unwrap)
+            .expect("Failed to build command");
+
+        let command_future = join_future
+            .then_execute(device.queue().clone(), command).unwrap();
+
+        match frame.flush_command(command_future) {
+            Ok(_) => {},
+            Err(VulkanError::OutOfDate) => { self.stale.set(true); },
+            Err(e) => panic!("Failed to flush command: {e}"),
+        };
+    }
+
+    /// Mark this renderer as stale, required a recreation of some resources.
+    ///
+    /// Used for example when the render target's surface changes size.
+    #[inline]
+    pub fn mark_stale(&self) {
+        self.stale.set(true);
     }
 }
