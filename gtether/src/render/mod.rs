@@ -16,6 +16,7 @@ use vulkano::sync::GpuFuture;
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::swapchain::Swapchain;
 
+pub mod window;
 pub mod render_pass;
 pub mod swapchain;
 
