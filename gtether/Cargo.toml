@@ -12,3 +12,6 @@ graphics = ["dep:vulkano", "dep:winit"]
 vulkano = { workspace = true, optional = true }
 ump = { workspace = true }
 winit = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_matches = "1.5"

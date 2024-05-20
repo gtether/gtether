@@ -1,7 +1,11 @@
+#[cfg(test)] #[macro_use]
+extern crate assert_matches;
+
 use std::thread;
 
 #[cfg(feature = "graphics")]
 pub mod render;
+mod console;
 
 /// Various metadata relating to an instance of the gTether Engine.
 ///
