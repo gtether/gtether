@@ -8,7 +8,7 @@ use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
 use gtether::{Engine, EngineMetadata};
-use gtether::render::render_pass::{EngineRenderPassBuilder};
+use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::window::CreateWindowInfo;
 
 use crate::render::{MN, VP};

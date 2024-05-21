@@ -1,15 +1,17 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::sync::Arc;
+
+use vulkano::{swapchain, sync, Validated, VulkanError};
 use vulkano::command_buffer::CommandBufferExecFuture;
+use vulkano::device::Device as VKDevice;
 use vulkano::image::{Image, ImageUsage};
 use vulkano::image::view::ImageView;
 use vulkano::render_pass::{Framebuffer as VKFramebuffer, FramebufferCreateInfo, RenderPass};
-use vulkano::{swapchain, sync, Validated, VulkanError};
-use vulkano::device::Device as VKDevice;
 use vulkano::swapchain::{PresentFuture, Swapchain as VKSwapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
 use vulkano::sync::GpuFuture;
+
 use crate::render::render_pass::{AttachmentBuffer, EngineRenderPass};
 use crate::render::RenderTarget;
 
