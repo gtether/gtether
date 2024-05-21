@@ -52,7 +52,7 @@ impl DirectionalRenderer {
             graphics: None,
             screen_buffer: FlatVertex::screen_buffer(target),
             attachments: AttachmentSet::new(target, 0),
-            lights: Arc::new(UniformSet::new(Vec::new(), target, 1)),
+            lights: Arc::new(UniformSet::new(vec![], target, 1)),
         }
     }
 

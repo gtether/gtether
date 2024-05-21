@@ -252,10 +252,10 @@ impl EngineRenderPassBuilder {
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
         Self {
             target: target.clone(),
-            attachments: Vec::new(),
+            attachments: vec![],
             attachment_name_map: HashMap::new(),
-            clear_values: Vec::new(),
-            subpass_infos: Vec::new(),
+            clear_values: vec![],
+            subpass_infos: vec![],
         }
     }
 
@@ -403,10 +403,10 @@ impl EngineRenderSubpassBuilder {
     fn new(parent: EngineRenderPassBuilder) -> Self {
         Self {
             parent,
-            color_attachments: Vec::new(),
+            color_attachments: vec![],
             depth_stencil_attachment: None,
-            input_attachments: Vec::new(),
-            handlers: Vec::new(),
+            input_attachments: vec![],
+            handlers: vec![],
         }
     }
 

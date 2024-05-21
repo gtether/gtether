@@ -203,7 +203,7 @@ impl AttachmentSet {
             target: target.clone(),
             graphics: None,
             set_index,
-            input_buffers: Vec::new(),
+            input_buffers: vec![],
             descriptor_sets: OnceCell::new(),
         }
     }
