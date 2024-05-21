@@ -44,7 +44,7 @@ impl Framebuffer {
             },
         ).unwrap();
 
-        Framebuffer {
+        Self {
             index,
             target,
             vk_swapchain,
@@ -174,7 +174,7 @@ impl Swapchain {
             &images,
         );
 
-        Swapchain {
+        Self {
             target: target.clone(),
             vk_swapchain,
             framebuffers,

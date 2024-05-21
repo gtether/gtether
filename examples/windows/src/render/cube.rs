@@ -113,7 +113,7 @@ impl CubeRenderer {
             vertices,
         ).unwrap();
 
-        CubeRenderer {
+        Self {
             target: target.clone(),
             graphics: None,
             vertex_buffer,

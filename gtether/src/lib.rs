@@ -16,7 +16,7 @@ pub struct EngineMetadata {
 
 impl Default for EngineMetadata {
     fn default() -> Self {
-        EngineMetadata {
+        Self {
             application_name: None,
             _ne: NonExhaustive(()),
         }
@@ -57,7 +57,7 @@ impl Engine {
         let (window_manager, window_manager_join_handle)
             = render::window::WindowManager::start(metadata.clone());
 
-        Engine {
+        Self {
             metadata,
             #[cfg(feature = "graphics")]
             window_manager,

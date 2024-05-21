@@ -143,7 +143,7 @@ impl AttachmentData {
                 }).collect::<Vec<_>>()
         }).collect::<Vec<_>>();
 
-        Arc::new(AttachmentData {
+        Arc::new(Self {
             buffers,
             name_map,
         })
@@ -180,7 +180,7 @@ impl StandardEngineRenderPass {
     ) -> Self {
         let attachments = AttachmentData::new(target, &render_pass, attachment_name_map);
 
-        StandardEngineRenderPass {
+        Self {
             render_pass,
             subpasses,
             attachments,
@@ -250,7 +250,7 @@ impl EngineRenderPassBuilder {
     ///
     /// Requires a [RenderTarget] to use as a basis for the created [EngineRenderPass].
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        EngineRenderPassBuilder {
+        Self {
             target: target.clone(),
             attachments: Vec::new(),
             attachment_name_map: HashMap::new(),
@@ -401,7 +401,7 @@ pub struct EngineRenderSubpassBuilder {
 
 impl EngineRenderSubpassBuilder {
     fn new(parent: EngineRenderPassBuilder) -> Self {
-        EngineRenderSubpassBuilder {
+        Self {
             parent,
             color_attachments: Vec::new(),
             depth_stencil_attachment: None,

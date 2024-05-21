@@ -211,7 +211,7 @@ impl Renderer {
             Swapchain::new(target, &render_pass)
         };
 
-        Renderer {
+        Self {
             target: target.clone(),
             render_pass: pipeline_cell,
             swapchain: RefCell::new(swapchain),

@@ -40,7 +40,7 @@ pub struct AmbientLight {
 impl AmbientLight {
     #[inline]
     pub fn new(r: f32, g: f32, b: f32, intensity: f32) -> Self {
-        AmbientLight {
+        Self {
             color: [r, g, b],
             intensity,
         }
@@ -50,7 +50,7 @@ impl AmbientLight {
 impl Default for AmbientLight {
     #[inline]
     fn default() -> Self {
-        AmbientLight::new(1.0, 1.0, 1.0, 0.1)
+        Self::new(1.0, 1.0, 1.0, 0.1)
     }
 }
 
@@ -64,7 +64,7 @@ pub struct AmbientRenderer {
 
 impl AmbientRenderer {
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        AmbientRenderer {
+        Self {
             target: target.clone(),
             graphics: None,
             screen_buffer: FlatVertex::screen_buffer(target),

@@ -47,7 +47,7 @@ pub struct DirectionalRenderer {
 
 impl DirectionalRenderer {
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        DirectionalRenderer {
+        Self {
             target: target.clone(),
             graphics: None,
             screen_buffer: FlatVertex::screen_buffer(target),

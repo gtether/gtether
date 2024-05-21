@@ -22,7 +22,7 @@ struct UniformData<T> {
 impl<T> UniformData<T> {
     #[inline]
     fn new(value: T) -> Self {
-        UniformData {
+        Self {
             value,
             descriptor_set: OnceLock::new(),
         }
@@ -121,7 +121,7 @@ impl<T: Clone + BufferContents> UniformSet<T> {
             UniformData::new(value)
         }).collect();
 
-        UniformSet {
+        Self {
             inner: RwLock::new(uniforms),
             refs: RwLock::new(UniformRefs {
                 target: target.clone(),
@@ -199,7 +199,7 @@ struct AttachmentSet {
 
 impl AttachmentSet {
     fn new(target: &Arc<dyn RenderTarget>, set_index: u32) -> Self {
-        AttachmentSet {
+        Self {
             target: target.clone(),
             graphics: None,
             set_index,
@@ -297,7 +297,7 @@ pub struct MN {
 impl MN {
     #[inline]
     pub fn new(model: TMat4<f32>) -> Self {
-        MN {
+        Self {
             model,
             normals: glm::inverse_transpose(model),
         }
@@ -329,7 +329,7 @@ impl VP {
 impl Default for VP {
     #[inline]
     fn default() -> Self {
-        VP {
+        Self {
             view: identity(),
             projection: identity(),
         }

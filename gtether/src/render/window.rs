@@ -40,7 +40,7 @@ impl WindowRenderTarget {
             surface.clone(),
         ));
 
-        WindowRenderTarget {
+        Self {
             winit_window,
             surface,
             device,
@@ -80,7 +80,7 @@ pub struct CreateWindowInfo {
 
 impl Default for CreateWindowInfo {
     fn default() -> Self {
-        CreateWindowInfo {
+        Self {
             title: None,
             _ne: NonExhaustive(()),
         }
@@ -93,7 +93,7 @@ struct WindowModifyRequest {
 
 impl Default for WindowModifyRequest {
     fn default() -> Self {
-        WindowModifyRequest {
+        Self {
             render_pass: None,
         }
     }
@@ -208,7 +208,7 @@ impl Window {
             let render_pass = EngineRenderPassBuilder::noop(&dyn_target);
             let renderer = Renderer::new(&dyn_target, render_pass);
 
-            let mut window = Window {
+            let mut window = Self {
                 target,
                 renderer,
                 endpoint_modify,
@@ -372,7 +372,7 @@ impl WindowManager {
                 ..Default::default()
             }).expect("Failed to create instance");
 
-            let mut manager = WindowManager {
+            let mut manager = Self {
                 engine_metadata,
                 vulkan_instance,
                 windows: HashMap::new(),
