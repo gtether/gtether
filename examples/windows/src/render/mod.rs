@@ -1,7 +1,8 @@
 use std::cell::OnceCell;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use glm::{identity, TMat4, TVec3};
+use parking_lot::RwLock;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::image::view::ImageView;
@@ -16,18 +17,47 @@ pub mod cube;
 pub mod ambient;
 pub mod directional;
 
-struct UniformData<T> {
+struct UniformData<T: Clone + BufferContents> {
     value: T,
     descriptor_set: OnceLock<Arc<PersistentDescriptorSet>>,
 }
 
-impl<T> UniformData<T> {
+impl<T: Clone + BufferContents> UniformData<T> {
     #[inline]
     fn new(value: T) -> Self {
         Self {
             value,
             descriptor_set: OnceLock::new(),
         }
+    }
+
+    fn get_or_init_descriptor_set(&self, refs: &UniformRefs, set_index: u32) -> &Arc<PersistentDescriptorSet> {
+        self.descriptor_set.get_or_init(|| {
+            let graphics = refs.graphics.as_ref()
+                .expect(".recreate() must be called before .descriptor_set() can be accessed");
+
+            let buffer = Buffer::from_data(
+                refs.target.device().memory_allocator().clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::UNIFORM_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                self.value.clone(),
+            ).unwrap();
+
+            PersistentDescriptorSet::new(
+                refs.target.device().descriptor_set_allocator(),
+                graphics.layout().set_layouts().get(set_index as usize).unwrap().clone(),
+                [
+                    WriteDescriptorSet::buffer(0, buffer),
+                ],
+                [],
+            ).unwrap()
+        })
     }
 }
 
@@ -60,49 +90,24 @@ impl<T: Clone + BufferContents> Uniform<T> {
     }
 
     fn recreate(&self, target: &Arc<dyn RenderTarget>, graphics: &Arc<GraphicsPipeline>) {
-        self.inner.write().unwrap().descriptor_set.take();
-        *self.refs.write().unwrap() = UniformRefs {
+        self.inner.write().descriptor_set.take();
+        *self.refs.write() = UniformRefs {
             target: target.clone(),
             graphics: Some(graphics.clone()),
         }
     }
 
     #[inline]
-    pub fn get(&self) -> T { self.inner.read().unwrap().value.clone() }
+    pub fn get(&self) -> T { self.inner.read().value.clone() }
 
     #[inline]
-    pub fn set(&self, value: T) { *self.inner.write().unwrap() = UniformData::new(value); }
+    pub fn set(&self, value: T) { *self.inner.write() = UniformData::new(value); }
 
     fn descriptor_set(&self) -> Arc<PersistentDescriptorSet> {
-        let inner = self.inner.read().unwrap();
-        inner.descriptor_set.get_or_init(|| {
-            let refs = self.refs.read().unwrap();
-
-            let graphics = refs.graphics.as_ref()
-                .expect(".recreate() must be called before .descriptor_set() can be accessed");
-
-            let buffer = Buffer::from_data(
-                refs.target.device().memory_allocator().clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::UNIFORM_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                inner.value.clone(),
-            ).unwrap();
-
-            PersistentDescriptorSet::new(
-                refs.target.device().descriptor_set_allocator(),
-                graphics.layout().set_layouts().get(self.set_index as usize).unwrap().clone(),
-                [
-                    WriteDescriptorSet::buffer(0, buffer),
-                ],
-                [],
-            ).unwrap()
-        }).clone()
+        self.inner.read().get_or_init_descriptor_set(
+            &self.refs.read(),
+            self.set_index,
+        ).clone()
     }
 }
 
@@ -134,10 +139,10 @@ impl<T: Clone + BufferContents> UniformSet<T> {
     }
 
     fn recreate(&self, target: &Arc<dyn RenderTarget>, graphics: &Arc<GraphicsPipeline>) {
-        for uniform in self.inner.write().unwrap().iter_mut() {
+        for uniform in self.inner.write().iter_mut() {
             uniform.descriptor_set.take();
         }
-        *self.refs.write().unwrap() = UniformRefs {
+        *self.refs.write() = UniformRefs {
             target: target.clone(),
             graphics: Some(graphics.clone()),
         }
@@ -145,48 +150,24 @@ impl<T: Clone + BufferContents> UniformSet<T> {
 
     #[inline]
     pub fn get(&self) -> Vec<T> {
-        self.inner.read().unwrap().iter().map(|uniform| {
+        self.inner.read().iter().map(|uniform| {
             uniform.value.clone()
         }).collect()
     }
 
     #[inline]
     pub fn set(&self, values: Vec<T>) {
-        *self.inner.write().unwrap() = values.into_iter().map(|value| {
+        *self.inner.write() = values.into_iter().map(|value| {
             UniformData::new(value)
         }).collect();
     }
 
     fn descriptor_sets(&self) -> Vec<Arc<PersistentDescriptorSet>> {
-        self.inner.read().unwrap().iter().map(|uniform| {
-            uniform.descriptor_set.get_or_init(|| {
-                let refs = self.refs.read().unwrap();
-
-                let graphics = refs.graphics.as_ref()
-                    .expect(".recreate() must be called before .descriptor_set() can be accessed");
-
-                let buffer = Buffer::from_data(
-                    refs.target.device().memory_allocator().clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::UNIFORM_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    uniform.value.clone(),
-                ).unwrap();
-
-                PersistentDescriptorSet::new(
-                    refs.target.device().descriptor_set_allocator(),
-                    graphics.layout().set_layouts().get(self.set_index as usize).unwrap().clone(),
-                    [
-                        WriteDescriptorSet::buffer(0, buffer),
-                    ],
-                    [],
-                ).unwrap()
-            }).clone()
+        self.inner.read().iter().map(|uniform| {
+            uniform.get_or_init_descriptor_set(
+                &self.refs.read(),
+                self.set_index,
+            ).clone()
         }).collect()
     }
 }
