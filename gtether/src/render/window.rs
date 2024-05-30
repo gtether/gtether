@@ -1,26 +1,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
+use std::time::Instant;
 
 use ump::Error;
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
 use vulkano::VulkanLibrary;
+use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{Event, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopWindowTarget};
-#[cfg(target_os = "windows")]
-use winit::platform::windows::EventLoopBuilderExtWindows;
-#[cfg(target_os = "linux")]
-use winit::platform::x11::EventLoopBuilderExtX11;
+use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window as WinitWindow, WindowId};
-use winit::window::WindowBuilder as WinitWindowBuilder;
 
-use crate::{EngineMetadata, NonExhaustive};
+use crate::{Engine, EngineMetadata, EngineState, Application, NonExhaustive, Registry};
 use crate::render::{Device, Dimensions, RenderTarget};
 use crate::render::render_pass::{EngineRenderPass, EngineRenderPassBuilder};
 use crate::render::Renderer;
+
+pub use winit::window::WindowAttributes;
 
 struct WindowRenderTarget {
     winit_window: Arc<WinitWindow>,
@@ -70,10 +69,13 @@ impl RenderTarget for WindowRenderTarget {
 /// Parameters to create a new window.
 #[derive(Clone, Debug)]
 pub struct CreateWindowInfo {
-    /// The title to use for the window.
+    /// Attributes to use for the window.
+    pub attributes: WindowAttributes,
+
+    /// Should the engine exit when this window is closed.
     ///
-    /// The default value is empty, which will use an auto-generated name based on the application.
-    pub title: Option<String>,
+    /// Default is true.
+    pub exit_on_close: bool,
 
     pub _ne: NonExhaustive,
 }
@@ -81,7 +83,8 @@ pub struct CreateWindowInfo {
 impl Default for CreateWindowInfo {
     fn default() -> Self {
         Self {
-            title: None,
+            attributes: WindowAttributes::default(),
+            exit_on_close: true,
             _ne: NonExhaustive(()),
         }
     }
@@ -165,29 +168,22 @@ struct Window {
 
 impl Window {
     fn new(
-        create_info: CreateWindowInfo,
-        elwt: &EventLoopWindowTarget<()>,
+        attributes: WindowAttributes,
+        event_loop: &ActiveEventLoop,
         instance: &Arc<Instance>,
         engine_metadata: &EngineMetadata,
     ) -> (WindowHandle, thread::JoinHandle<()>) {
         let (endpoint_modify, sender_modify) = ump::channel();
         let (endpoint_event, sender_event) = ump::channel();
 
-        let title = {
-            if let Some(title) = create_info.title {
-                title
-            } else if let Some(title) = engine_metadata.application_name.clone() {
-                title
-            } else {
-                "gTether Window".into()
-            }
-        };
+        let mut attributes = attributes;
+        if attributes.title == "winit window".to_owned() {
+            attributes.title = engine_metadata.application_name.clone()
+                .unwrap_or("gTether Window".into());
+        }
+        let title = attributes.title.clone();
 
-        let winit_window = Arc::new(WinitWindowBuilder::new()
-            .with_resizable(true)
-            .with_title(title.clone())
-            .build(elwt).unwrap()
-        );
+        let winit_window = Arc::new(event_loop.create_window(attributes).unwrap());
 
         let window_id = winit_window.id();
 
@@ -259,168 +255,54 @@ impl Window {
     }
 }
 
-#[derive(Default)]
-struct WindowStatusRequest {
-    id: Option<WindowId>,
+struct WindowEntry {
+    window_handle: WindowHandle,
+    join_handle: thread::JoinHandle<()>,
+    exit_on_close: bool,
 }
 
-struct WindowStatus {
-    window_handle: Option<WindowHandle>,
-    window_count: u32,
-}
-
-/// Handle for the window manager.
-///
-/// Provides access to window creation and management methods.
-#[derive(Clone)]
-pub struct WindowManagerClient {
-    sender_create: ump::Client<CreateWindowInfo, WindowHandle, ()>,
-    sender_status: ump::Client<WindowStatusRequest, WindowStatus, ()>,
-    should_exit: Arc<AtomicBool>,
-}
-
-impl WindowManagerClient {
-    /// Create a new window.
-    ///
-    /// Blocks until the window is created and a handle is returned.
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the window management thread has stopped or is otherwise unresponsive.
-    #[inline]
-    pub fn create_window(&self, create_info: CreateWindowInfo) -> WindowHandle {
-        self.sender_create.req(create_info).unwrap()
-    }
-
-    /// Retrieves a [WindowHandle] for a given window.
-    ///
-    /// Blocks until the handle is returned. If there is no window associated with the given
-    /// [WindowId], returns None.
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the window management thread has stopped or is otherwise unresponsive.
-    #[inline]
-    pub fn get_handle(&self, window_id: WindowId) -> Option<WindowHandle> {
-        let status_request = WindowStatusRequest {
-            id: Some(window_id),
-        };
-
-        self.sender_status.req(status_request).unwrap().window_handle
-    }
-
-    /// Retrieves the total count of active windows.
-    ///
-    /// Blocks until a response is received, which means this method is not suitable for hot paths,
-    /// and responses should be cached by the caller if reasonable to do so.
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the window management thread has stopped or is otherwise unresponsive.
-    #[inline]
-    pub fn get_window_count(&self) -> u32 {
-        self.sender_status.req(WindowStatusRequest::default()).unwrap().window_count
-    }
-
-    #[inline]
-    pub(crate) fn request_exit(&self) {
-        self.should_exit.store(true, Ordering::Relaxed);
-    }
-}
-
-pub(crate) struct WindowManager {
+struct WindowManager {
     engine_metadata: EngineMetadata,
     vulkan_instance: Arc<Instance>,
-    windows: HashMap<WindowId, (WindowHandle, thread::JoinHandle<()>)>,
-    endpoint_create: ump::Server<CreateWindowInfo, WindowHandle, ()>,
-    endpoint_status: ump::Server<WindowStatusRequest, WindowStatus, ()>,
-    should_exit: Arc<AtomicBool>,
+    windows: HashMap<WindowId, WindowEntry>,
 }
 
 impl WindowManager {
-    pub(crate) fn start(engine_metadata: EngineMetadata) -> (WindowManagerClient, thread::JoinHandle<()>) {
-        let (endpoint_create, sender_create) = ump::channel();
-        let (endpoint_status, sender_status) = ump::channel();
-        let should_exit = Arc::new(AtomicBool::new(false));
-
-        let client = WindowManagerClient {
-            sender_create,
-            sender_status,
-            should_exit: should_exit.clone(),
-        };
-
-        let join_handle = thread::Builder::new().name("window-manager".into()).spawn(move || {
-            let event_loop = EventLoopBuilder::new()
-                // TODO: any_thread() may pose platform compat issues in the future, but should
-                //  work on at least Unix + Windows
-                .with_any_thread(true)
-                .build().unwrap();
-            event_loop.set_control_flow(ControlFlow::Poll);
-
-            // TODO: extract library + instance if they are required somewhere besides windowing
-            let library = VulkanLibrary::new()
-                .expect("Failed to load Vulkan library/DLL");
-
-            let required_extensions = Surface::required_extensions(&event_loop);
-
-            let vulkan_instance = Instance::new(library, InstanceCreateInfo {
-                application_name: engine_metadata.application_name.clone(),
-                engine_name: Some("gTether".to_owned()),
-                // TODO: Engine version
-                // engine_version: ,
-                enabled_extensions: required_extensions,
-                ..Default::default()
-            }).expect("Failed to create instance");
-
-            let mut manager = Self {
-                engine_metadata,
-                vulkan_instance,
-                windows: HashMap::new(),
-                endpoint_create,
-                endpoint_status,
-                should_exit,
-            };
-
-            event_loop.run(move |event, elwt| {
-                manager.handle_event(event, elwt);
-            }).expect("Failed to run winit loop");
-        }).unwrap();
-
-        (client, join_handle)
-    }
-
-    fn handle_event(&mut self, event: Event<()>, elwt: &EventLoopWindowTarget<()>) {
-        match event {
-            Event::WindowEvent { event, window_id } => {
-                self.handle_window_event(event, window_id);
-            },
-            Event::AboutToWait => {
-                self.handle_messages(elwt);
-                // Check for any exited windows
-                self.windows.retain(|_, (_, join_handle)| {
-                    !join_handle.is_finished()
-                });
-                if self.should_exit.load(Ordering::Relaxed) {
-                    elwt.exit();
-                }
-            },
-            _ => ()
+    fn new(engine_metadata: EngineMetadata, vulkan_instance: Arc<Instance>) -> Self {
+        Self {
+            engine_metadata,
+            vulkan_instance,
+            windows: HashMap::new(),
         }
     }
 
-    fn handle_window_event(&mut self, event: WindowEvent, window_id: WindowId) {
+    fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        // Check for any exited windows
+        self.windows.retain(|_, entry| {
+            let finished = entry.join_handle.is_finished();
+            if finished && entry.exit_on_close {
+                event_loop.exit();
+            }
+            !finished
+        });
+    }
+
+    fn window_event(&mut self, window_id: WindowId, event: WindowEvent, event_loop: &ActiveEventLoop) {
         match event {
             WindowEvent::CloseRequested => {
-                if let Some((window, join_handle)) = self.windows.remove(&window_id) {
+                if let Some(entry) = self.windows.remove(&window_id) {
                     // Don't care if this errors, because we'll be removing the window anyway
-                    window.handle_event(event).unwrap_or_default();
+                    entry.window_handle.handle_event(event).unwrap_or_default();
                     // TODO: Do we care about joining this? Possibly just drop the reference and move on
-                    join_handle.join().unwrap();
+                    entry.join_handle.join().unwrap();
+                    if entry.exit_on_close {
+                        event_loop.exit();
+                    }
                 }
             },
             _ => {
-                if let Some((window, _)) = self.windows.get(&window_id) {
-                    window.handle_event(event).unwrap_or_else(|err| {
+                if let Some(entry) = self.windows.get(&window_id) {
+                    entry.window_handle.handle_event(event).unwrap_or_else(|err| {
                         println!("Window {window_id:?} errored when handling event ({err:?}), dropping");
                         self.windows.remove(&window_id);
                     });
@@ -428,30 +310,125 @@ impl WindowManager {
             },
         }
     }
+}
 
-    fn handle_messages(&mut self, elwt: &EventLoopWindowTarget<()>) {
-        while let Some((create_info, rctx)) = self.endpoint_create.try_pop().unwrap() {
-            let (handle, join_handle) = Window::new(
-                create_info,
-                elwt,
-                &self.vulkan_instance,
-                &self.engine_metadata,
-            );
+pub struct WindowRegistry<'a> {
+    event_loop: &'a ActiveEventLoop,
+    manager: &'a mut WindowManager,
+}
 
-            self.windows.insert(handle.id(), (handle.clone(), join_handle));
-            rctx.reply(handle).unwrap();
+impl WindowRegistry<'_> {
+    /// Create a new window.
+    ///
+    /// Immediately starts the window and returns a handle. This handle cannot be retrieved again
+    /// later, so it should be stored by the user.
+    #[inline]
+    pub fn create_window(&mut self, create_info: CreateWindowInfo) -> WindowHandle {
+        let (handle, join_handle) = Window::new(
+            create_info.attributes,
+            self.event_loop,
+            &self.manager.vulkan_instance,
+            &self.manager.engine_metadata,
+        );
+
+        self.manager.windows.insert(handle.id(), WindowEntry {
+            window_handle: handle.clone(),
+            join_handle,
+            exit_on_close: create_info.exit_on_close,
+        });
+        handle
+    }
+}
+
+pub(crate) struct WindowAppHandler<A: Application> {
+    engine: Engine<A>,
+    manager: WindowManager,
+    last_tick: Instant,
+}
+
+impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        match (cause, self.engine.state) {
+            (StartCause::Poll, EngineState::Running) => {
+                let now = Instant::now();
+
+                self.manager.tick(event_loop);
+
+                self.engine.app.tick(&self.engine, now - self.last_tick);
+
+                if self.engine.should_exit.load(Ordering::Relaxed) {
+                    event_loop.exit();
+                }
+
+                self.last_tick = now;
+            },
+            _ => {},
         }
-        while let Some((status_request, rctx)) = self.endpoint_status.try_pop().unwrap() {
-            let window_handle = if let Some(id) = status_request.id {
-                self.windows.get(&id).map(|(handle, _)| handle.clone())
-            } else {
-                None
-            };
+    }
 
-            rctx.reply(WindowStatus {
-                window_handle,
-                window_count: self.windows.len() as u32,
-            }).unwrap();
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        match self.engine.state {
+            EngineState::Init => {
+                let window = WindowRegistry {
+                    event_loop,
+                    manager: &mut self.manager,
+                };
+
+                let mut registry = Registry {
+                    window,
+                };
+
+                self.engine.game().init(&self.engine, &mut registry);
+
+                self.engine.state = EngineState::Running;
+            },
+            _ => {}
         }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        self.manager.window_event(window_id, event, event_loop);
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, _event: DeviceEvent) {
+        // TODO
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // TODO
+    }
+}
+
+impl<A: Application> WindowAppHandler<A> {
+    pub(crate) fn start(engine: Engine<A>) {
+        let event_loop = EventLoop::builder()
+            .build().unwrap();
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        // TODO: extract library + instance if they are required somewhere besides windowing
+        let library = VulkanLibrary::new()
+            .expect("Failed to load Vulkan library/DLL");
+
+        let required_extensions = Surface::required_extensions(&event_loop);
+
+        let vulkan_instance = Instance::new(library, InstanceCreateInfo {
+            application_name: engine.metadata().application_name.clone(),
+            engine_name: Some("gTether".to_owned()),
+            // TODO: Engine version
+            // engine_version: ,
+            enabled_extensions: required_extensions,
+            ..Default::default()
+        }).expect("Failed to create instance");
+
+        let manager = WindowManager::new(engine.metadata().clone(), vulkan_instance);
+
+        let mut handler = Self {
+            engine,
+            manager,
+            last_tick: Instant::now(),
+        };
+
+        event_loop.run_app(&mut handler)
+            .expect("Failed to run winit loop");
     }
 }

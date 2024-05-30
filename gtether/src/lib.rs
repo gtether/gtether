@@ -1,7 +1,18 @@
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[cfg(feature = "graphics")]
 pub mod render;
+
+pub struct Registry<'a> {
+    #[cfg(feature = "graphics")]
+    pub window: render::window::WindowRegistry<'a>,
+}
+
+pub trait Application: Sized {
+    fn init(&self, engine: &Engine<Self>, registry: &mut Registry);
+    fn tick(&self, engine: &Engine<Self>, delta: Duration);
+}
 
 /// Various metadata relating to an instance of the gTether Engine.
 ///
@@ -23,68 +34,97 @@ impl Default for EngineMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum EngineState {
+    Init,
+    Running,
+}
+
 /// Represents an instance of the gTether Engine.
 ///
 /// All engine usage stems from this structure, and it is required to construct one first.
-pub struct Engine {
+pub struct Engine<A: Application> {
     metadata: EngineMetadata,
-
-    #[cfg(feature = "graphics")]
-    window_manager: render::window::WindowManagerClient,
-    #[cfg(feature = "graphics")]
-    window_manager_join_handle: thread::JoinHandle<()>,
+    state: EngineState,
+    app: A,
+    pub(crate) should_exit: AtomicBool,
 }
 
-impl Engine {
-    /// Construct a new gTether Engine.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gtether::{Engine, EngineMetadata};
-    ///
-    /// let engine = Engine::new(
-    ///     EngineMetadata {
-    ///         application_name: Some(String::from("My Application")),
-    ///         ..Default::default()
-    ///     }
-    /// );
-    /// ```
-    pub fn new(
-        metadata: EngineMetadata,
-    ) -> Self {
-        #[cfg(feature = "graphics")]
-        let (window_manager, window_manager_join_handle)
-            = render::window::WindowManager::start(metadata.clone());
-
-        Self {
-            metadata,
-            #[cfg(feature = "graphics")]
-            window_manager,
-            #[cfg(feature = "graphics")]
-            window_manager_join_handle,
-        }
-    }
-
+impl<A: Application> Engine<A> {
     #[inline]
     pub fn metadata(&self) -> &EngineMetadata { &self.metadata }
 
-    #[cfg(feature = "graphics")]
     #[inline]
-    pub fn window_manager(&self) -> &render::window::WindowManagerClient { &self.window_manager }
+    pub fn game(&self) -> &A { &self.app }
 
-    fn join(self) -> thread::Result<()> {
-        #[cfg(feature = "graphics")]
-        self.window_manager_join_handle.join()?;
+    #[inline]
+    pub fn state(&self) -> EngineState { self.state }
 
-        Ok(())
+    #[cfg(feature = "graphics")]
+    pub fn start(self) {
+        render::window::WindowAppHandler::start(self);
     }
 
-    pub fn exit(self) {
-        #[cfg(feature = "graphics")]
-        self.window_manager.request_exit();
+    #[cfg(not(feature = "graphics"))]
+    pub fn start(self) {
+        todo!()
+    }
 
-        self.join().unwrap();
+    pub fn request_exit(&self) {
+        self.should_exit.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Build a new gTether Engine.
+///
+/// # Examples
+///
+/// ```
+/// use gtether::{EngineBuilder, EngineMetadata};
+///
+/// let engine = EngineBuilder::new()
+///     .metadata(EngineMetadata {
+///         application_name: Some("My Application".into()),
+///         ..Default::default()
+///     })
+///     .build();
+/// ```
+pub struct EngineBuilder<A: Application> {
+    metadata: Option<EngineMetadata>,
+    app: Option<A>,
+}
+
+impl<A: Application> EngineBuilder<A> {
+    pub fn new() -> Self {
+        Self {
+            metadata: None,
+            app: None,
+        }
+    }
+
+    pub fn metadata(mut self, metadata: EngineMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn game(mut self, game: A) -> Self {
+        self.app = Some(game);
+        self
+    }
+
+    pub fn build(self) -> Engine<A> {
+        let metadata = self.metadata
+            .expect(".metadata() is required");
+
+        let app = self.app
+            .expect(".app() is required");
+
+        Engine {
+            metadata,
+            state: EngineState::Init,
+            app,
+            should_exit: AtomicBool::new(false),
+        }
     }
 }
 

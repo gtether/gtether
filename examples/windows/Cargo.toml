@@ -9,5 +9,6 @@ edition.workspace = true
 gtether = { workspace = true, features = ["graphics"] }
 nalgebra-glm = { workspace = true }
 parking_lot = { workspace = true }
+tracing-subscriber = "0.3"
 vulkano = { workspace = true }
 vulkano-shaders = "0.34"

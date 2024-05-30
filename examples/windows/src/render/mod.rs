@@ -1,4 +1,5 @@
 use std::cell::OnceCell;
+use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
 use glm::{identity, TMat4, TVec3};
@@ -20,6 +21,13 @@ pub mod directional;
 struct UniformData<T: Clone + BufferContents> {
     value: T,
     descriptor_set: OnceLock<Arc<PersistentDescriptorSet>>,
+}
+
+impl<T: Clone + BufferContents> Debug for UniformData<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniformData")
+            .finish()
+    }
 }
 
 impl<T: Clone + BufferContents> UniformData<T> {
@@ -66,6 +74,16 @@ struct UniformRefs {
     graphics: Option<Arc<GraphicsPipeline>>,
 }
 
+impl Debug for UniformRefs {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniformRefs")
+            // TODO: Should RenderTarget require Debug?
+            .field("graphics", &self.graphics)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 pub struct Uniform<T: Clone + BufferContents> {
     inner: RwLock<UniformData<T>>,
     refs: RwLock<UniformRefs>,
