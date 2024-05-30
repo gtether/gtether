@@ -11,7 +11,7 @@ use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentSt
 
 use gtether::{Engine, EngineBuilder, EngineMetadata, Application, Registry};
 use gtether::render::render_pass::EngineRenderPassBuilder;
-use gtether::render::window::{CreateWindowInfo, WindowAttributes};
+use gtether::gui::window::{CreateWindowInfo, WindowAttributes};
 
 use crate::render::{MN, Uniform, VP};
 use crate::render::ambient::AmbientRenderer;

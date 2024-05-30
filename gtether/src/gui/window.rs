@@ -1,20 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::Instant;
 
 use ump::Error;
-use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::instance::Instance;
 use vulkano::swapchain::Surface;
-use vulkano::VulkanLibrary;
-use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event::WindowEvent;
+use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window as WinitWindow, WindowId};
 
-use crate::{Engine, EngineMetadata, EngineState, Application, NonExhaustive, Registry};
+use crate::{EngineMetadata, NonExhaustive};
 use crate::render::{Device, Dimensions, RenderTarget};
 use crate::render::render_pass::{EngineRenderPass, EngineRenderPassBuilder};
 use crate::render::Renderer;
@@ -261,14 +257,14 @@ struct WindowEntry {
     exit_on_close: bool,
 }
 
-struct WindowManager {
+pub(in crate::gui) struct WindowManager {
     engine_metadata: EngineMetadata,
     vulkan_instance: Arc<Instance>,
     windows: HashMap<WindowId, WindowEntry>,
 }
 
 impl WindowManager {
-    fn new(engine_metadata: EngineMetadata, vulkan_instance: Arc<Instance>) -> Self {
+    pub(in crate::gui) fn new(engine_metadata: EngineMetadata, vulkan_instance: Arc<Instance>) -> Self {
         Self {
             engine_metadata,
             vulkan_instance,
@@ -276,7 +272,26 @@ impl WindowManager {
         }
     }
 
-    fn tick(&mut self, event_loop: &ActiveEventLoop) {
+    pub(in crate::gui) fn create_window(
+        &mut self,
+        create_info: CreateWindowInfo,
+        event_loop: &ActiveEventLoop,
+    ) -> WindowHandle {
+        let (handle, join_handle) = Window::new(
+            create_info.attributes,
+            event_loop,
+            &self.vulkan_instance,
+            &self.engine_metadata,
+        );
+        self.windows.insert(handle.id(), WindowEntry {
+            window_handle: handle.clone(),
+            join_handle,
+            exit_on_close: create_info.exit_on_close,
+        });
+        handle
+    }
+
+    pub(in crate::gui) fn tick(&mut self, event_loop: &ActiveEventLoop) {
         // Check for any exited windows
         self.windows.retain(|_, entry| {
             let finished = entry.join_handle.is_finished();
@@ -287,7 +302,7 @@ impl WindowManager {
         });
     }
 
-    fn window_event(&mut self, window_id: WindowId, event: WindowEvent, event_loop: &ActiveEventLoop) {
+    pub(in crate::gui) fn window_event(&mut self, window_id: WindowId, event: WindowEvent, event_loop: &ActiveEventLoop) {
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(entry) = self.windows.remove(&window_id) {
@@ -309,126 +324,5 @@ impl WindowManager {
                 }
             },
         }
-    }
-}
-
-pub struct WindowRegistry<'a> {
-    event_loop: &'a ActiveEventLoop,
-    manager: &'a mut WindowManager,
-}
-
-impl WindowRegistry<'_> {
-    /// Create a new window.
-    ///
-    /// Immediately starts the window and returns a handle. This handle cannot be retrieved again
-    /// later, so it should be stored by the user.
-    #[inline]
-    pub fn create_window(&mut self, create_info: CreateWindowInfo) -> WindowHandle {
-        let (handle, join_handle) = Window::new(
-            create_info.attributes,
-            self.event_loop,
-            &self.manager.vulkan_instance,
-            &self.manager.engine_metadata,
-        );
-
-        self.manager.windows.insert(handle.id(), WindowEntry {
-            window_handle: handle.clone(),
-            join_handle,
-            exit_on_close: create_info.exit_on_close,
-        });
-        handle
-    }
-}
-
-pub(crate) struct WindowAppHandler<A: Application> {
-    engine: Engine<A>,
-    manager: WindowManager,
-    last_tick: Instant,
-}
-
-impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        match (cause, self.engine.state) {
-            (StartCause::Poll, EngineState::Running) => {
-                let now = Instant::now();
-
-                self.manager.tick(event_loop);
-
-                self.engine.app.tick(&self.engine, now - self.last_tick);
-
-                if self.engine.should_exit.load(Ordering::Relaxed) {
-                    event_loop.exit();
-                }
-
-                self.last_tick = now;
-            },
-            _ => {},
-        }
-    }
-
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        match self.engine.state {
-            EngineState::Init => {
-                let window = WindowRegistry {
-                    event_loop,
-                    manager: &mut self.manager,
-                };
-
-                let mut registry = Registry {
-                    window,
-                };
-
-                self.engine.game().init(&self.engine, &mut registry);
-
-                self.engine.state = EngineState::Running;
-            },
-            _ => {}
-        }
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
-        self.manager.window_event(window_id, event, event_loop);
-    }
-
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, _event: DeviceEvent) {
-        // TODO
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // TODO
-    }
-}
-
-impl<A: Application> WindowAppHandler<A> {
-    pub(crate) fn start(engine: Engine<A>) {
-        let event_loop = EventLoop::builder()
-            .build().unwrap();
-        event_loop.set_control_flow(ControlFlow::Poll);
-
-        // TODO: extract library + instance if they are required somewhere besides windowing
-        let library = VulkanLibrary::new()
-            .expect("Failed to load Vulkan library/DLL");
-
-        let required_extensions = Surface::required_extensions(&event_loop);
-
-        let vulkan_instance = Instance::new(library, InstanceCreateInfo {
-            application_name: engine.metadata().application_name.clone(),
-            engine_name: Some("gTether".to_owned()),
-            // TODO: Engine version
-            // engine_version: ,
-            enabled_extensions: required_extensions,
-            ..Default::default()
-        }).expect("Failed to create instance");
-
-        let manager = WindowManager::new(engine.metadata().clone(), vulkan_instance);
-
-        let mut handler = Self {
-            engine,
-            manager,
-            last_tick: Instant::now(),
-        };
-
-        event_loop.run_app(&mut handler)
-            .expect("Failed to run winit loop");
     }
 }

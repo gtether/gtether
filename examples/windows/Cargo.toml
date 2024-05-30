@@ -6,7 +6,7 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-gtether = { workspace = true, features = ["graphics"] }
+gtether = { workspace = true, features = ["gui"] }
 nalgebra-glm = { workspace = true }
 parking_lot = { workspace = true }
 tracing-subscriber = "0.3"

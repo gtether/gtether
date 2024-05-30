@@ -1,12 +1,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "gui")]
+pub mod gui;
 #[cfg(feature = "graphics")]
 pub mod render;
 
 pub struct Registry<'a> {
-    #[cfg(feature = "graphics")]
-    pub window: render::window::WindowRegistry<'a>,
+    #[cfg(feature = "gui")]
+    pub window: gui::WindowRegistry<'a>,
 }
 
 pub trait Application: Sized {
@@ -60,12 +62,12 @@ impl<A: Application> Engine<A> {
     #[inline]
     pub fn state(&self) -> EngineState { self.state }
 
-    #[cfg(feature = "graphics")]
+    #[cfg(feature = "gui")]
     pub fn start(self) {
-        render::window::WindowAppHandler::start(self);
+        gui::WindowAppHandler::start(self);
     }
 
-    #[cfg(not(feature = "graphics"))]
+    #[cfg(not(feature = "gui"))]
     pub fn start(self) {
         todo!()
     }

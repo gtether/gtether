@@ -16,7 +16,6 @@ use vulkano::sync::GpuFuture;
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::swapchain::Swapchain;
 
-pub mod window;
 pub mod render_pass;
 pub mod swapchain;
 
@@ -127,7 +126,7 @@ impl Device {
 }
 
 /// Wrapper around an array of two u32s, that is used to represent width/height dimensions.
-pub struct Dimensions([u32; 2]);
+pub struct Dimensions(pub [u32; 2]);
 
 impl Dimensions {
     /// Calculate the width / height aspect ratio for these dimensions.
