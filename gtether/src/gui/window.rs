@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::thread;
+use tracing::{event, Level};
 
 use ump::Error;
 use vulkano::instance::Instance;
@@ -44,6 +46,14 @@ impl WindowRenderTarget {
 
     #[inline]
     fn winit_window(&self) -> &Arc<WinitWindow> { &self.winit_window }
+}
+
+impl Debug for WindowRenderTarget {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowRenderTarget")
+            .field("window_id", &self.winit_window.id())
+            .finish()
+    }
 }
 
 impl From<PhysicalSize<u32>> for Dimensions {
@@ -234,11 +244,10 @@ impl Window {
             let window_id = self.target.winit_window().id();
             match event {
                 WindowEvent::CloseRequested => {
-                    println!("Window {window_id:?} has received the signal to close");
+                    event!(Level::INFO, "Window {window_id:?} has received the signal to close");
                     status = Err(());
                 },
                 WindowEvent::Resized(_) => {
-                    println!("Window {window_id:?} has resized");
                     self.renderer.mark_stale();
                 },
                 _ => ()
@@ -295,8 +304,12 @@ impl WindowManager {
         // Check for any exited windows
         self.windows.retain(|_, entry| {
             let finished = entry.join_handle.is_finished();
-            if finished && entry.exit_on_close {
-                event_loop.exit();
+            if finished {
+                let window_id = entry.window_handle.id();
+                event!(Level::INFO, "Window {window_id:?} thread stopped, dropping");
+                if entry.exit_on_close {
+                    event_loop.exit();
+                }
             }
             !finished
         });
@@ -318,7 +331,7 @@ impl WindowManager {
             _ => {
                 if let Some(entry) = self.windows.get(&window_id) {
                     entry.window_handle.handle_event(event).unwrap_or_else(|err| {
-                        println!("Window {window_id:?} errored when handling event ({err:?}), dropping");
+                        event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
                         self.windows.remove(&window_id);
                     });
                 }

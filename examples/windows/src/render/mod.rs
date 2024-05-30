@@ -69,18 +69,10 @@ impl<T: Clone + BufferContents> UniformData<T> {
     }
 }
 
+#[derive(Debug)]
 struct UniformRefs {
     target: Arc<dyn RenderTarget>,
     graphics: Option<Arc<GraphicsPipeline>>,
-}
-
-impl Debug for UniformRefs {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UniformRefs")
-            // TODO: Should RenderTarget require Debug?
-            .field("graphics", &self.graphics)
-            .finish()
-    }
 }
 
 #[derive(Debug)]

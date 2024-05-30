@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::sync::Arc;
+use tracing::{event, Level};
 
 use vulkano::{swapchain, sync, Validated, VulkanError};
 use vulkano::command_buffer::CommandBufferExecFuture;
@@ -118,8 +119,7 @@ impl Framebuffer {
                 None
             },
             Err(e) => {
-                // TODO: Actual logging
-                println!("Failed to flush future: {e}");
+                event!(Level::WARN, "Failed to flush future: {e}");
                 None
             }
         };
