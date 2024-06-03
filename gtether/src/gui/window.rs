@@ -158,10 +158,7 @@ impl WindowHandle {
 
     fn handle_event(&self, event: WindowEvent) -> Result<(), Error<()>> {
         // Send the event without blocking
-        match self.sender_event.req_async(event) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.sender_event.req_async(event).map(|_| {})
     }
 }
 
@@ -183,7 +180,7 @@ impl Window {
         let (endpoint_event, sender_event) = ump::channel();
 
         let mut attributes = attributes;
-        if attributes.title == "winit window".to_owned() {
+        if &attributes.title == "winit window" {
             attributes.title = engine_metadata.application_name.clone()
                 .unwrap_or("gTether Window".into());
         }
@@ -316,26 +313,23 @@ impl WindowManager {
     }
 
     pub(in crate::gui) fn window_event(&mut self, window_id: WindowId, event: WindowEvent, event_loop: &ActiveEventLoop) {
-        match event {
-            WindowEvent::CloseRequested => {
-                if let Some(entry) = self.windows.remove(&window_id) {
-                    // Don't care if this errors, because we'll be removing the window anyway
-                    entry.window_handle.handle_event(event).unwrap_or_default();
-                    // TODO: Do we care about joining this? Possibly just drop the reference and move on
-                    entry.join_handle.join().unwrap();
-                    if entry.exit_on_close {
-                        event_loop.exit();
-                    }
+        if matches!(event, WindowEvent::CloseRequested) {
+            if let Some(entry) = self.windows.remove(&window_id) {
+                // Don't care if this errors, because we'll be removing the window anyway
+                entry.window_handle.handle_event(event).unwrap_or_default();
+                // TODO: Do we care about joining this? Possibly just drop the reference and move on
+                entry.join_handle.join().unwrap();
+                if entry.exit_on_close {
+                    event_loop.exit();
                 }
-            },
-            _ => {
-                if let Some(entry) = self.windows.get(&window_id) {
-                    entry.window_handle.handle_event(event).unwrap_or_else(|err| {
-                        event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
-                        self.windows.remove(&window_id);
-                    });
-                }
-            },
+            }
+        } else {
+            if let Some(entry) = self.windows.get(&window_id) {
+                entry.window_handle.handle_event(event).unwrap_or_else(|err| {
+                    event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
+                    self.windows.remove(&window_id);
+                });
+            }
         }
     }
 }

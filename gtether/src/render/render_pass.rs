@@ -86,7 +86,7 @@ struct EngineRenderSubpass {
 
 impl EngineRenderSubpass {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
-        for handler in self.handlers.iter() {
+        for handler in &self.handlers {
             handler.build_commands(builder, frame);
         }
     }
@@ -96,7 +96,7 @@ impl EngineRenderSubpass {
         target: &Arc<dyn RenderTarget>,
         attachments: &Arc<dyn AttachmentMap>,
     ) {
-        for handler in self.handlers.iter_mut() {
+        for handler in &mut self.handlers {
             handler.recreate(target, &self.subpass, attachments);
         }
     }
@@ -133,14 +133,17 @@ impl AttachmentData {
 
         let buffers = (0 .. target.framebuffer_count()).map(|_| {
             create_infos.iter()
-                .map(|create_info| match create_info.usage.contains(ImageUsage::TRANSIENT_ATTACHMENT) {
-                    true => AttachmentBuffer::Transient(ImageView::new_default(Image::new(
-                        target.device().memory_allocator().clone(),
-                        create_info.clone(),
-                        AllocationCreateInfo::default(),
-                    ).unwrap()).unwrap()),
-                    false => AttachmentBuffer::Output(),
-                }).collect::<Vec<_>>()
+                .map(|create_info|
+                    if create_info.usage.contains(ImageUsage::TRANSIENT_ATTACHMENT) {
+                        AttachmentBuffer::Transient(ImageView::new_default(Image::new(
+                            target.device().memory_allocator().clone(),
+                            create_info.clone(),
+                            AllocationCreateInfo::default(),
+                        ).unwrap()).unwrap())
+                    } else {
+                        AttachmentBuffer::Output()
+                    }
+                ).collect::<Vec<_>>()
         }).collect::<Vec<_>>();
 
         Arc::new(Self {

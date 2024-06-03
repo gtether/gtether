@@ -39,17 +39,17 @@ impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         match (cause, self.engine.state) {
             (StartCause::Poll, EngineState::Running) => {
-                let now = Instant::now();
+                let tick_start = Instant::now();
 
                 self.manager.tick(event_loop);
 
-                self.engine.app.tick(&self.engine, now - self.last_tick);
+                self.engine.app.tick(&self.engine, tick_start - self.last_tick);
 
                 if self.engine.should_exit.load(Ordering::Relaxed) {
                     event_loop.exit();
                 }
 
-                self.last_tick = now;
+                self.last_tick = tick_start;
             },
             _ => {},
         }
