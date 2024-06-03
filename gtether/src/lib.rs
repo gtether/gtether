@@ -82,13 +82,25 @@ impl<A: Application> Engine<A> {
 /// # Examples
 ///
 /// ```
-/// use gtether::{EngineBuilder, EngineMetadata};
+/// # use std::time::Duration;
+/// # use gtether::{Engine, Registry};
+/// use gtether::{Application, EngineBuilder, EngineMetadata};
 ///
+/// struct MyApp {};
+///
+/// impl Application for MyApp {
+///     // Implement relevant functions...
+/// #    fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {}
+/// #    fn tick(&self, engine: &Engine<Self>, delta: Duration) {}
+/// }
+/// 
+/// let app = MyApp {};
 /// let engine = EngineBuilder::new()
 ///     .metadata(EngineMetadata {
 ///         application_name: Some("My Application".into()),
 ///         ..Default::default()
 ///     })
+///     .app(app)
 ///     .build();
 /// ```
 pub struct EngineBuilder<A: Application> {
@@ -109,8 +121,8 @@ impl<A: Application> EngineBuilder<A> {
         self
     }
 
-    pub fn game(mut self, game: A) -> Self {
-        self.app = Some(game);
+    pub fn app(mut self, app: A) -> Self {
+        self.app = Some(app);
         self
     }
 

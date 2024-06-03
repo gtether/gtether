@@ -131,7 +131,7 @@ fn main() {
             application_name: Some(String::from("gTether Example - windows")),
             ..Default::default()
         })
-        .game(core)
+        .app(core)
         .build()
         .start();
 }
