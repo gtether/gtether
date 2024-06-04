@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::fmt::Debug;
 use std::sync::Arc;
+use tracing::{event, Level};
 
 use vulkano::{Validated, VulkanError};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
@@ -16,7 +18,6 @@ use vulkano::sync::GpuFuture;
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::swapchain::Swapchain;
 
-pub mod window;
 pub mod render_pass;
 pub mod swapchain;
 
@@ -127,7 +128,7 @@ impl Device {
 }
 
 /// Wrapper around an array of two u32s, that is used to represent width/height dimensions.
-pub struct Dimensions([u32; 2]);
+pub struct Dimensions(pub [u32; 2]);
 
 impl Dimensions {
     /// Calculate the width / height aspect ratio for these dimensions.
@@ -156,7 +157,7 @@ impl From<Dimensions> for [f32; 2] {
 ///
 /// Custom render targets can be created by implementing this trait, but the gTether engine library
 /// provides several of its own render targets that are intended for common use-cases.
-pub trait RenderTarget: Send + Sync + 'static {
+pub trait RenderTarget: Debug + Send + Sync + 'static {
     /// The [Surface] that is being rendered to.
     fn surface(&self) -> &Arc<Surface>;
     /// The [Dimensions] of the surface that is being rendered to.
@@ -211,7 +212,7 @@ impl Renderer {
             Swapchain::new(target, &render_pass)
         };
 
-        Renderer {
+        Self {
             target: target.clone(),
             render_pass: pipeline_cell,
             swapchain: RefCell::new(swapchain),
@@ -234,11 +235,13 @@ impl Renderer {
     /// Handles the logic required for recreating stale resources, rendering to a free framebuffer,
     /// and swapping framebuffers in the swapchain.
     pub fn render(&self) {
-        let device = self.target.device();
+        let target = &self.target;
+        let device = target.device();
 
         if self.stale.get() {
+            event!(Level::TRACE, "Renderer for target {target:?} is stale, recreating");
             let mut render_pass = self.render_pass.borrow_mut();
-            render_pass.recreate(&self.target);
+            render_pass.recreate(target);
             self.swapchain.borrow_mut().recreate(&render_pass)
                 .expect("Failed to recreate swapchain");
 

@@ -1,11 +1,24 @@
 #[cfg(test)] #[macro_use]
 extern crate assert_matches;
 
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+#[cfg(feature = "gui")]
+pub mod gui;
 #[cfg(feature = "graphics")]
 pub mod render;
 mod console;
+
+pub struct Registry<'a> {
+    #[cfg(feature = "gui")]
+    pub window: gui::WindowRegistry<'a>,
+}
+
+pub trait Application: Sized {
+    fn init(&self, engine: &Engine<Self>, registry: &mut Registry);
+    fn tick(&self, engine: &Engine<Self>, delta: Duration);
+}
 
 /// Various metadata relating to an instance of the gTether Engine.
 ///
@@ -20,75 +33,116 @@ pub struct EngineMetadata {
 
 impl Default for EngineMetadata {
     fn default() -> Self {
-        EngineMetadata {
+        Self {
             application_name: None,
             _ne: NonExhaustive(()),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum EngineState {
+    Init,
+    Running,
+}
+
 /// Represents an instance of the gTether Engine.
 ///
 /// All engine usage stems from this structure, and it is required to construct one first.
-pub struct Engine {
+pub struct Engine<A: Application> {
     metadata: EngineMetadata,
-
-    #[cfg(feature = "graphics")]
-    window_manager: render::window::WindowManagerClient,
-    #[cfg(feature = "graphics")]
-    window_manager_join_handle: thread::JoinHandle<()>,
+    state: EngineState,
+    app: A,
+    pub(crate) should_exit: AtomicBool,
 }
 
-impl Engine {
-    /// Construct a new gTether Engine.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gtether::{Engine, EngineMetadata};
-    ///
-    /// let engine = Engine::new(
-    ///     EngineMetadata {
-    ///         application_name: Some(String::from("My Application")),
-    ///         ..Default::default()
-    ///     }
-    /// );
-    /// ```
-    pub fn new(
-        metadata: EngineMetadata,
-    ) -> Self {
-        #[cfg(feature = "graphics")]
-        let (window_manager, window_manager_join_handle)
-            = render::window::WindowManager::start(metadata.clone());
-
-        Engine {
-            metadata,
-            #[cfg(feature = "graphics")]
-            window_manager,
-            #[cfg(feature = "graphics")]
-            window_manager_join_handle,
-        }
-    }
-
+impl<A: Application> Engine<A> {
     #[inline]
     pub fn metadata(&self) -> &EngineMetadata { &self.metadata }
 
-    #[cfg(feature = "graphics")]
     #[inline]
-    pub fn window_manager(&self) -> &render::window::WindowManagerClient { &self.window_manager }
+    pub fn game(&self) -> &A { &self.app }
 
-    fn join(self) -> thread::Result<()> {
-        #[cfg(feature = "graphics")]
-        self.window_manager_join_handle.join()?;
+    #[inline]
+    pub fn state(&self) -> EngineState { self.state }
 
-        Ok(())
+    #[cfg(feature = "gui")]
+    pub fn start(self) {
+        gui::WindowAppHandler::start(self);
     }
 
-    pub fn exit(self) {
-        #[cfg(feature = "graphics")]
-        self.window_manager.request_exit();
+    #[cfg(not(feature = "gui"))]
+    pub fn start(self) {
+        todo!()
+    }
 
-        self.join().unwrap();
+    pub fn request_exit(&self) {
+        self.should_exit.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Build a new gTether Engine.
+///
+/// # Examples
+///
+/// ```
+/// # use std::time::Duration;
+/// # use gtether::{Engine, Registry};
+/// use gtether::{Application, EngineBuilder, EngineMetadata};
+///
+/// struct MyApp {};
+///
+/// impl Application for MyApp {
+///     // Implement relevant functions...
+/// #    fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {}
+/// #    fn tick(&self, engine: &Engine<Self>, delta: Duration) {}
+/// }
+/// 
+/// let app = MyApp {};
+/// let engine = EngineBuilder::new()
+///     .metadata(EngineMetadata {
+///         application_name: Some("My Application".into()),
+///         ..Default::default()
+///     })
+///     .app(app)
+///     .build();
+/// ```
+pub struct EngineBuilder<A: Application> {
+    metadata: Option<EngineMetadata>,
+    app: Option<A>,
+}
+
+impl<A: Application> EngineBuilder<A> {
+    pub fn new() -> Self {
+        Self {
+            metadata: None,
+            app: None,
+        }
+    }
+
+    pub fn metadata(mut self, metadata: EngineMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn app(mut self, app: A) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    pub fn build(self) -> Engine<A> {
+        let metadata = self.metadata
+            .expect(".metadata() is required");
+
+        let app = self.app
+            .expect(".app() is required");
+
+        Engine {
+            metadata,
+            state: EngineState::Init,
+            app,
+            should_exit: AtomicBool::new(false),
+        }
     }
 }
 

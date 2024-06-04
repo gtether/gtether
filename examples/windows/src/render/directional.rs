@@ -1,4 +1,5 @@
 use std::sync::Arc;
+
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
@@ -11,9 +12,11 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::render_pass::Subpass;
+
 use gtether::render::render_pass::{AttachmentMap, EngineRenderHandler};
 use gtether::render::RenderTarget;
 use gtether::render::swapchain::Framebuffer;
+
 use crate::render::{AttachmentSet, FlatVertex, UniformSet};
 
 mod directional_vert {
@@ -47,12 +50,12 @@ pub struct DirectionalRenderer {
 
 impl DirectionalRenderer {
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        DirectionalRenderer {
+        Self {
             target: target.clone(),
             graphics: None,
             screen_buffer: FlatVertex::screen_buffer(target),
             attachments: AttachmentSet::new(target, 0),
-            lights: Arc::new(UniformSet::new(Vec::new(), target, 1)),
+            lights: Arc::new(UniformSet::new(vec![], target, 1)),
         }
     }
 

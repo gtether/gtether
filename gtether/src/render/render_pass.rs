@@ -86,7 +86,7 @@ struct EngineRenderSubpass {
 
 impl EngineRenderSubpass {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
-        for handler in self.handlers.iter() {
+        for handler in &self.handlers {
             handler.build_commands(builder, frame);
         }
     }
@@ -96,7 +96,7 @@ impl EngineRenderSubpass {
         target: &Arc<dyn RenderTarget>,
         attachments: &Arc<dyn AttachmentMap>,
     ) {
-        for handler in self.handlers.iter_mut() {
+        for handler in &mut self.handlers {
             handler.recreate(target, &self.subpass, attachments);
         }
     }
@@ -133,17 +133,20 @@ impl AttachmentData {
 
         let buffers = (0 .. target.framebuffer_count()).map(|_| {
             create_infos.iter()
-                .map(|create_info| match create_info.usage.contains(ImageUsage::TRANSIENT_ATTACHMENT) {
-                    true => AttachmentBuffer::Transient(ImageView::new_default(Image::new(
-                        target.device().memory_allocator().clone(),
-                        create_info.clone(),
-                        AllocationCreateInfo::default(),
-                    ).unwrap()).unwrap()),
-                    false => AttachmentBuffer::Output(),
-                }).collect::<Vec<_>>()
+                .map(|create_info|
+                    if create_info.usage.contains(ImageUsage::TRANSIENT_ATTACHMENT) {
+                        AttachmentBuffer::Transient(ImageView::new_default(Image::new(
+                            target.device().memory_allocator().clone(),
+                            create_info.clone(),
+                            AllocationCreateInfo::default(),
+                        ).unwrap()).unwrap())
+                    } else {
+                        AttachmentBuffer::Output()
+                    }
+                ).collect::<Vec<_>>()
         }).collect::<Vec<_>>();
 
-        Arc::new(AttachmentData {
+        Arc::new(Self {
             buffers,
             name_map,
         })
@@ -180,7 +183,7 @@ impl StandardEngineRenderPass {
     ) -> Self {
         let attachments = AttachmentData::new(target, &render_pass, attachment_name_map);
 
-        StandardEngineRenderPass {
+        Self {
             render_pass,
             subpasses,
             attachments,
@@ -250,12 +253,12 @@ impl EngineRenderPassBuilder {
     ///
     /// Requires a [RenderTarget] to use as a basis for the created [EngineRenderPass].
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        EngineRenderPassBuilder {
+        Self {
             target: target.clone(),
-            attachments: Vec::new(),
+            attachments: vec![],
             attachment_name_map: HashMap::new(),
-            clear_values: Vec::new(),
-            subpass_infos: Vec::new(),
+            clear_values: vec![],
+            subpass_infos: vec![],
         }
     }
 
@@ -401,12 +404,12 @@ pub struct EngineRenderSubpassBuilder {
 
 impl EngineRenderSubpassBuilder {
     fn new(parent: EngineRenderPassBuilder) -> Self {
-        EngineRenderSubpassBuilder {
+        Self {
             parent,
-            color_attachments: Vec::new(),
+            color_attachments: vec![],
             depth_stencil_attachment: None,
-            input_attachments: Vec::new(),
-            handlers: Vec::new(),
+            input_attachments: vec![],
+            handlers: vec![],
         }
     }
 

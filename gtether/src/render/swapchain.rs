@@ -1,15 +1,18 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::sync::Arc;
+use tracing::{event, Level};
+
+use vulkano::{swapchain, sync, Validated, VulkanError};
 use vulkano::command_buffer::CommandBufferExecFuture;
+use vulkano::device::Device as VKDevice;
 use vulkano::image::{Image, ImageUsage};
 use vulkano::image::view::ImageView;
 use vulkano::render_pass::{Framebuffer as VKFramebuffer, FramebufferCreateInfo, RenderPass};
-use vulkano::{swapchain, sync, Validated, VulkanError};
-use vulkano::device::Device as VKDevice;
 use vulkano::swapchain::{PresentFuture, Swapchain as VKSwapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
 use vulkano::sync::GpuFuture;
+
 use crate::render::render_pass::{AttachmentBuffer, EngineRenderPass};
 use crate::render::RenderTarget;
 
@@ -44,7 +47,7 @@ impl Framebuffer {
             },
         ).unwrap();
 
-        Framebuffer {
+        Self {
             index,
             target,
             vk_swapchain,
@@ -89,13 +92,12 @@ impl Framebuffer {
 
     #[inline]
     fn get_future(&self, device: Arc<VKDevice>) -> Box<dyn GpuFuture> {
-        match self.fence.borrow().deref().clone() {
-            None => {
-                let mut now = sync::now(device);
-                now.cleanup_finished();
-                now.boxed()
-            },
-            Some(fence) => fence.boxed()
+        if let Some(fence) = self.fence.borrow().deref().clone() {
+            fence.boxed()
+        } else {
+            let mut now = sync::now(device);
+            now.cleanup_finished();
+            now.boxed()
         }
     }
 
@@ -105,28 +107,31 @@ impl Framebuffer {
         command_future: CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>,
     ) -> Result<(), VulkanError> {
         let mut suboptimal = false;
-        let future = match command_future
+
+        let result = command_future
             .then_swapchain_present(
                 self.target.device().queue().clone(),
                 SwapchainPresentInfo::swapchain_image_index(self.vk_swapchain.clone(), self.index as u32),
-            ).then_signal_fence_and_flush().map_err(Validated::unwrap) {
+            ).then_signal_fence_and_flush()
+            .map_err(Validated::unwrap);
+        let future = match result {
             Ok(value) => Some(Arc::new(value)),
             Err(VulkanError::OutOfDate) => {
                 suboptimal = true;
                 None
             },
             Err(e) => {
-                // TODO: Actual logging
-                println!("Failed to flush future: {e}");
+                event!(Level::WARN, "Failed to flush future: {e}");
                 None
             }
         };
         self.fence.replace(future);
 
-        match suboptimal {
-            true => Err(VulkanError::OutOfDate),
-            false => Ok(()),
+        if suboptimal {
+            return Err(VulkanError::OutOfDate)
         }
+
+        Ok(())
     }
 
     /// Reference to the wrapped [vulkano::render_pass::Framebuffer].
@@ -174,7 +179,7 @@ impl Swapchain {
             &images,
         );
 
-        Swapchain {
+        Self {
             target: target.clone(),
             vk_swapchain,
             framebuffers,

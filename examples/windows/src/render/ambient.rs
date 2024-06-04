@@ -1,4 +1,5 @@
 use std::sync::Arc;
+
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
@@ -11,9 +12,11 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::render_pass::Subpass;
+
 use gtether::render::render_pass::{AttachmentMap, EngineRenderHandler};
 use gtether::render::RenderTarget;
 use gtether::render::swapchain::Framebuffer;
+
 use crate::render::{AttachmentSet, FlatVertex, Uniform};
 
 mod ambient_vert {
@@ -40,7 +43,7 @@ pub struct AmbientLight {
 impl AmbientLight {
     #[inline]
     pub fn new(r: f32, g: f32, b: f32, intensity: f32) -> Self {
-        AmbientLight {
+        Self {
             color: [r, g, b],
             intensity,
         }
@@ -50,7 +53,7 @@ impl AmbientLight {
 impl Default for AmbientLight {
     #[inline]
     fn default() -> Self {
-        AmbientLight::new(1.0, 1.0, 1.0, 0.1)
+        Self::new(1.0, 1.0, 1.0, 0.1)
     }
 }
 
@@ -64,7 +67,7 @@ pub struct AmbientRenderer {
 
 impl AmbientRenderer {
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        AmbientRenderer {
+        Self {
             target: target.clone(),
             graphics: None,
             screen_buffer: FlatVertex::screen_buffer(target),
