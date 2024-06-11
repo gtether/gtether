@@ -8,7 +8,7 @@ use std::time::Duration;
 pub mod gui;
 #[cfg(feature = "graphics")]
 pub mod render;
-mod console;
+pub mod console;
 
 pub struct Registry<'a> {
     #[cfg(feature = "gui")]

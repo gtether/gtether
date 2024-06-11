@@ -10,6 +10,7 @@ graphics = ["dep:vulkano"]
 gui = ["graphics", "dep:winit"]
 
 [dependencies]
+shlex = { workspace = true }
 tracing = { workspace = true }
 vulkano = { workspace = true, optional = true }
 ump = { workspace = true }
