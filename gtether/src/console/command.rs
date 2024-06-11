@@ -1,20 +1,124 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::fmt::{Formatter};
+use std::fmt::{Debug, Formatter};
 
+/// Validation check for parameter counts.
+///
+/// Can be used to validate that the count of parameters used for a command match certain
+/// conditions.
+///
+/// # Examples
+///
+/// Simple usage:
+/// ```
+/// # use gtether::console::command::CommandError;
+/// use gtether::console::command::ParamCountCheck;
+///
+/// # fn inner() -> Result<(), CommandError> {
+/// let param_count = 5;
+///
+/// // Check parameter count equals 3
+/// ParamCountCheck::Equal(3).check(param_count)?;
+///
+/// // Check parameter count is between 3 and 4
+/// ParamCountCheck::Range {min: 3, max: 4}.check(param_count)?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Multiple conditions:
+/// ```
+/// # use gtether::console::command::CommandError;
+/// use gtether::console::command::ParamCountCheck;
+///
+/// # fn inner() -> Result<(), CommandError> {
+/// let param_count = 5;
+///
+/// // Check parameter count is one of:
+/// //  - 2
+/// //  - between 5 and 7 (inclusive)
+/// //  - greater than or equal to 10
+/// ParamCountCheck::OneOf(vec![
+///     ParamCountCheck::Equal(2),
+///     ParamCountCheck::Range {min: 5, max: 7},
+///     ParamCountCheck::AtLeast(10),
+/// ]).check(param_count)?;
+/// ParamCountCheck::Equal(3).check(param_count)?;
+/// # Ok(())
+/// # }
+/// ```
 #[allow(unused)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ParamCountCompareOp {
-    Equal,
-    AtLeast,
-    AtMost,
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParamCountCheck {
+    /// Parameter count should be equal the target.
+    Equal(u32),
+    /// Parameter count should be equal to or greater than the target.
+    AtLeast(u32),
+    /// Parameter count should be equal to or less than the target.
+    AtMost(u32),
+    /// Parameter count should be within the given range (inclusive).
+    Range{ min: u32, max: u32 },
+    /// Parameter count should match one of the given sub-conditions
+    OneOf(Vec<Self>),
 }
 
+impl fmt::Display for ParamCountCheck {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ParamCountCheck::Equal(target) =>
+                write!(f, "x == {target}"),
+            ParamCountCheck::AtLeast(target) =>
+                write!(f, "{target} <= x"),
+            ParamCountCheck::AtMost(target) =>
+                write!(f, "x <= {target}"),
+            ParamCountCheck::Range {min, max} =>
+                write!(f, "{min} <= x <= {max}"),
+            ParamCountCheck::OneOf(sub_conditions) => {
+                for (idx, condition) in sub_conditions.iter().enumerate() {
+                    if idx != 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{condition}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ParamCountCheck {
+    /// Check that the given count matches this condition.
+    pub fn matches(&self, count: u32) -> bool {
+        match self {
+            ParamCountCheck::Equal(target) => &count == target,
+            ParamCountCheck::AtLeast(target) => target <= &count,
+            ParamCountCheck::AtMost(target) => &count <= target,
+            ParamCountCheck::Range {min, max} => min <= &count && &count <= max,
+            ParamCountCheck::OneOf(conditions) => conditions.iter()
+                .any(|condition| condition.matches(count)),
+        }
+    }
+
+    /// Check that the given count matches this condition, and create the appropriate [CommandError]
+    /// if it doesn't.
+    pub fn check(self, count: u32) -> Result<(), CommandError> {
+        if !self.matches(count) {
+            return Err(CommandError::InvalidParameterCount {actual: count, compare_op: self});
+        }
+        Ok(())
+    }
+}
+
+/// Errors that can be encountered during command execution.
 #[derive(Debug)]
 pub enum CommandError {
+    /// The given parameter is invalid for this command, or there is no command that matches said
+    /// parameter.
     InvalidParameter(String),
-    InvalidParameterCount{ actual: u32, expected: u32, compare_op: ParamCountCompareOp },
+    /// The count of parameters is invalid for this command.
+    InvalidParameterCount{ actual: u32, compare_op: ParamCountCheck },
+    /// Generalized catch-all for all other failure types.
     CommandFailure(Box<dyn Error>),
 }
 
@@ -23,14 +127,8 @@ impl fmt::Display for CommandError {
         match self {
             CommandError::InvalidParameter(parameter) =>
                 write!(f, "Invalid command parameter: {parameter}"),
-            CommandError::InvalidParameterCount {actual, expected, compare_op } => match compare_op {
-                ParamCountCompareOp::Equal =>
-                    write!(f, "Expected {expected} parameters; got {actual} parameters"),
-                ParamCountCompareOp::AtLeast =>
-                    write!(f, "Expected at least {expected} parameters; got {actual} parameters"),
-                ParamCountCompareOp::AtMost =>
-                    write!(f, "Expected at most {expected} parameters; got {actual} parameters"),
-            },
+            CommandError::InvalidParameterCount {actual, compare_op } =>
+                write!(f, "Parameter count ({actual}) does not match constraint(s): {compare_op}"),
             CommandError::CommandFailure(e) =>
                 write!(f, "Command failed: {}", e.to_string()),
         }
@@ -46,32 +144,47 @@ impl Error for CommandError {
     }
 }
 
-impl CommandError {
-    pub fn check_param_count(actual: u32, expected: u32, compare_op: ParamCountCompareOp) -> Result<(), CommandError> {
-        let pass = match compare_op {
-            ParamCountCompareOp::Equal => actual == expected,
-            ParamCountCompareOp::AtLeast => actual >= expected,
-            ParamCountCompareOp::AtMost => actual <= expected,
-        };
-
-        match pass {
-            true => Ok(()),
-            false => Err(CommandError::InvalidParameterCount {actual, expected, compare_op}),
-        }
-    }
-}
-
-pub trait Command {
+/// Command that can be executed to trigger custom logic.
+///
+/// Must be Send + Sync.
+pub trait Command: Debug + Send + Sync + 'static {
+    /// Handle the execution of this command.
+    ///
+    /// Process the given parameters and execute the logic this command represents. If there are
+    /// any issues, return a [CommandError].
+    ///
+    /// Note that implementations should _avoid_ panics if anything goes wrong, and prefer to report
+    /// failures as [CommandError]s where possible.
+    ///
+    /// The input parameters are expected to NOT include the command name, but start after said
+    /// command name.
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError>;
+
+    /// Retrieve auto-complete options for this command.
+    ///
+    /// Given any already partially written parameters, determine the collection of valid
+    /// possibilities that the next (or current partially written) parameter could be.
+    ///
+    /// If auto-completion is undesired or unnecessary, it is safe to return an empty list.
+    ///
+    /// The input parameters are expected to NOT include the command name, but start after said
+    /// command name.
+    ///
+    /// A blank string ("") should be used as the final parameter to indicate that all possibilities
+    /// should be retrieved for that parameter; otherwise it is assumed that possibilities are
+    /// wanted for the last parameter specified, fully written or not.
     #[allow(unused)]
     fn options(&self, parameters: &[String]) -> Vec<String> {
         vec![]
     }
 }
 
+/// Errors that can be encountered when registering commands.
 #[derive(Debug)]
 pub enum CommandRegisterError {
+    /// A command already exists for the given name/key.
     CommandExists(String),
+    /// No command exists for the given alias target.
     AliasTargetMissing(String),
 }
 
@@ -88,22 +201,72 @@ impl fmt::Display for CommandRegisterError {
 
 impl Error for CommandRegisterError {}
 
+/// Interface to register commands.
+///
+/// # Examples
+/// ```
+/// # use gtether::console::command::{Command, CommandRegistry};
+/// # fn inner(registry: &mut impl CommandRegistry, command: Box<dyn Command>) {
+/// // Register a command
+/// registry.register_command("myCommand", command)
+///     .expect("Command failed to register");
+///
+/// // Register an alias to a command
+/// registry.register_alias("myAlias", "myCommand")
+///     .expect("Alias failed to register");
+/// # }
+/// ```
+pub trait CommandRegistry {
+    /// Register a new command.
+    ///
+    /// Can fail to register if a command is already registered with the same key.
+    fn register_command<S: Into<String>>(
+        &mut self,
+        key: S,
+        command: Box<dyn Command>,
+    ) -> Result<&mut Self, CommandRegisterError>;
+
+    /// Register a new alias.
+    ///
+    /// Can fail to register if an alias is already registered with the same key, or if the alias
+    /// target does NOT exist.
+    fn register_alias<S: Into<String>, T: Into<String>>(
+        &mut self,
+        alias: S,
+        key: T,
+    ) -> Result<&mut Self, CommandRegisterError>;
+}
+
+#[derive(Debug)]
 enum CommandEntry {
     COMMAND(Box<dyn Command>),
     ALIAS(String),
 }
 
-pub struct CommandMap {
+/// A collection of sub-commands.
+///
+/// A command that holds sub-commands, and delegates to sub-commands based on sub-parameters.
+/// Implements both [Command] and [CommandRegistry].
+///
+/// # Examples
+/// ```
+/// # use gtether::console::command::{Command, CommandRegistry};
+/// use gtether::console::command::CommandTree;
+/// # fn inner(registry: &mut impl CommandRegistry, command_a: Box<dyn Command>, command_b: Box<dyn Command>) {
+/// let mut command_tree = CommandTree::default();
+/// command_tree
+///     .register_command("a", command_a).unwrap()
+///     .register_command("b", command_b).unwrap()
+///     .register_alias("otherB", "b").unwrap();
+/// registry.register_command("commands", Box::new(command_tree)).unwrap();
+/// # }
+/// ```
+#[derive(Debug, Default)]
+pub struct CommandTree {
     commands: HashMap<String, CommandEntry>,
 }
 
-impl CommandMap {
-    pub fn new() -> Self {
-        CommandMap {
-            commands: HashMap::new(),
-        }
-    }
-
+impl CommandTree {
     fn get(&self, key: &String) -> Option<&Box<dyn Command>> {
         let entry = self.commands.get(key)?;
         match entry {
@@ -111,12 +274,14 @@ impl CommandMap {
             CommandEntry::ALIAS(alias) => self.get(alias),
         }
     }
+}
 
-    pub fn register_command<S: Into<String>>(
+impl CommandRegistry for CommandTree {
+    fn register_command<S: Into<String>>(
         &mut self,
         key: S,
         command: Box<dyn Command>,
-    ) -> Result<(), CommandRegisterError> {
+    ) -> Result<&mut Self, CommandRegisterError> {
         let key: String = key.into();
 
         if self.commands.contains_key(&key) {
@@ -124,14 +289,14 @@ impl CommandMap {
         }
 
         self.commands.insert(key, CommandEntry::COMMAND(command));
-        Ok(())
+        Ok(self)
     }
 
-    pub fn register_alias<S: Into<String>, T: Into<String>>(
+    fn register_alias<S: Into<String>, T: Into<String>>(
         &mut self,
         alias: S,
         key: T,
-    ) -> Result<(), CommandRegisterError> {
+    ) -> Result<&mut Self, CommandRegisterError> {
         let alias: String = alias.into();
         let key: String = key.into();
 
@@ -142,11 +307,11 @@ impl CommandMap {
         }
 
         self.commands.insert(alias, CommandEntry::ALIAS(key));
-        Ok(())
+        Ok(self)
     }
 }
 
-impl Command for CommandMap {
+impl Command for CommandTree {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         if parameters.len() < 1 {
             return Err(CommandError::InvalidParameter("".into()))
@@ -179,29 +344,29 @@ impl Command for CommandMap {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell};
     use std::fmt::{Display};
     use std::ptr;
+    use parking_lot::RwLock;
     use super::*;
 
-    #[derive(Default)]
+    #[derive(Default, Debug)]
     struct StoreCommand {
-        value: Cell<Option<String>>,
+        value: RwLock<Option<String>>,
     }
 
     impl Command for StoreCommand {
         fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
-            CommandError::check_param_count(parameters.len() as u32, 1, ParamCountCompareOp::AtLeast)?;
+            ParamCountCheck::Range{min: 1, max: 2}.check(parameters.len() as u32)?;
 
             match parameters[0].as_str() {
                 "set" => {
-                    CommandError::check_param_count(parameters.len() as u32, 2, ParamCountCompareOp::Equal)?;
-                    self.value.set(Some(parameters[1].clone()));
+                    ParamCountCheck::Equal(2).check(parameters.len() as u32)?;
+                    *self.value.write() = Some(parameters[1].clone());
                     Ok(())
                 },
                 "clear" => {
-                    CommandError::check_param_count(parameters.len() as u32, 1, ParamCountCompareOp::Equal)?;
-                    self.value.set(None);
+                    ParamCountCheck::Equal(1).check(parameters.len() as u32)?;
+                    *self.value.write() = None;
                     Ok(())
                 },
                 _ => Err(CommandError::InvalidParameter(parameters[0].clone())),
@@ -246,21 +411,21 @@ mod tests {
 
     #[test]
     fn test_command_success() {
-        let mut command = StoreCommand::default();
+        let command = StoreCommand::default();
 
-        assert_eq!(command.value.get_mut().clone(), None);
+        assert_eq!(command.value.read().clone(), None);
 
         command.handle(&["set".into(), "a".into()])
             .expect("Command should succeed");
-        assert_eq!(command.value.get_mut().clone(), Some("a".to_owned()));
+        assert_eq!(command.value.read().clone(), Some("a".to_owned()));
 
         command.handle(&["set".into(), "b".into()])
             .expect("Command should succeed");
-        assert_eq!(command.value.get_mut().clone(), Some("b".to_owned()));
+        assert_eq!(command.value.read().clone(), Some("b".to_owned()));
 
         command.handle(&["clear".into()])
             .expect("Command should succeed");
-        assert_eq!(command.value.get_mut().clone(), None);
+        assert_eq!(command.value.read().clone(), None);
     }
 
     #[test]
@@ -270,7 +435,7 @@ mod tests {
         assert_matches!(
             command.handle(&[])
                 .expect_err("Command should fail"),
-            CommandError::InvalidParameterCount {actual: 0, expected: 1, compare_op: ParamCountCompareOp::AtLeast}
+            CommandError::InvalidParameterCount {actual: 0, compare_op: ParamCountCheck::Range{min: 1, max: 2}}
         );
 
         assert_matches!(
@@ -284,19 +449,19 @@ mod tests {
         assert_matches!(
             command.handle(&["set".into()])
                 .expect_err("Command should fail"),
-            CommandError::InvalidParameterCount {actual: 1, expected: 2, compare_op: ParamCountCompareOp::Equal}
+            CommandError::InvalidParameterCount {actual: 1, compare_op: ParamCountCheck::Equal(2)}
         );
 
         assert_matches!(
             command.handle(&["set".into(), "val".into(), "extra".into()])
                 .expect_err("Command should fail"),
-            CommandError::InvalidParameterCount {actual: 3, expected: 2, compare_op: ParamCountCompareOp::Equal}
+            CommandError::InvalidParameterCount {actual: 3, compare_op: ParamCountCheck::Range{min: 1, max: 2}}
         );
 
         assert_matches!(
             command.handle(&["clear".into(), "extra".into()])
                 .expect_err("Command should fail"),
-            CommandError::InvalidParameterCount {actual: 2, expected: 1, compare_op: ParamCountCompareOp::Equal}
+            CommandError::InvalidParameterCount {actual: 2, compare_op: ParamCountCheck::Equal(1)}
         );
     }
 
@@ -311,7 +476,7 @@ mod tests {
 
     impl Error for CommandFailure {}
 
-    #[derive(Default)]
+    #[derive(Default, Debug)]
     struct FailCommand;
 
     impl Command for FailCommand {
@@ -333,7 +498,7 @@ mod tests {
         )
     }
 
-    #[derive(Default)]
+    #[derive(Default, Debug)]
     struct NoOpCommand;
 
     impl Command for NoOpCommand {
@@ -342,22 +507,21 @@ mod tests {
         }
     }
 
-    fn create_command_map() -> CommandMap {
-        let mut map = CommandMap::new();
+    fn create_command_map() -> CommandTree {
+        let mut map = CommandTree::default();
         map.register_command("noop", Box::new(NoOpCommand::default()))
-            .expect("Command should register");
-        map.register_alias("noop2", "noop")
-            .expect("Alias to command should register");
-        map.register_alias("noop3", "noop2")
+            .expect("Command should register")
+            .register_alias("noop2", "noop")
+            .expect("Alias to command should register")
+            .register_alias("noop3", "noop2")
             .expect("Alias to alias should register");
-
         map
     }
 
-    fn create_nested_command_map() -> CommandMap {
+    fn create_nested_command_map() -> CommandTree {
         let sub_map = create_command_map();
 
-        let mut map = CommandMap::new();
+        let mut map = CommandTree::default();
         map.register_command("sub", Box::new(sub_map))
             .expect("Subcommand map should register");
         map.register_command("fail", Box::new(FailCommand::default()))
