@@ -57,7 +57,7 @@ impl<A: Application> Engine<A> {
     pub fn metadata(&self) -> &EngineMetadata { &self.metadata }
 
     #[inline]
-    pub fn game(&self) -> &A { &self.app }
+    pub fn app(&self) -> &A { &self.app }
 
     #[inline]
     pub fn state(&self) -> EngineState { self.state }
