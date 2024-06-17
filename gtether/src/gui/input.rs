@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 
 use parking_lot::RwLock;
 use tracing::{event, Level};
-use ump::Error;
 use winit::event::{DeviceEvent, KeyEvent as WinitKeyEvent, WindowEvent};
 
 pub use winit::event::{ElementState, MouseButton};
@@ -62,18 +63,48 @@ pub enum InputDelegateEvent {
     MouseMotion(glm::TVec2<f64>),
 }
 
+/// Lock struct for locking [InputDelegate]s.
+///
+/// This lock struct will automatically unlock the relevant [InputDelegate] when it is dropped, so
+/// it can be used to maintain a lock within a given scope.
+pub struct InputDelegateLock {
+    id: usize,
+    manager: Arc<DelegateManager>,
+}
+
+impl InputDelegateLock {
+    fn lock(manager: Arc<DelegateManager>, id: usize, priority: u32) -> Self {
+        manager.lock(id, priority);
+
+        Self {
+            id,
+            manager,
+        }
+    }
+}
+
+impl Drop for InputDelegateLock {
+    fn drop(&mut self) {
+        self.manager.unlock(self.id);
+    }
+}
+
 /// A delegate that can be used to operate on individual input events instead of just querying
 /// active state.
 ///
 /// All input events that occur will be sent to delegates, even duplicates. This makes it more
 /// suitable if the count of input changes between ticks is required.
 pub struct InputDelegate {
-    endpoint: ump::Server<InputDelegateEvent, (), ()>,
+    id: usize,
+    receiver: mpsc::Receiver<InputDelegateEvent>,
+    manager: Arc<DelegateManager>,
 }
 
 impl fmt::Debug for InputDelegate {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InputDelegate").finish()
+        f.debug_struct("InputDelegate")
+            .field("id", &self.id)
+            .finish()
     }
 }
 
@@ -82,8 +113,23 @@ impl InputDelegate {
     /// polled.
     pub fn events(&self) -> InputDelegateIter {
         InputDelegateIter {
-            delegate: self
+            inner: self
         }
+    }
+
+    /// Lock this delegate so that input events are only sent here.
+    ///
+    /// [InputDelegate]s can be locked with a given priority. If _any_ [InputDelegate]s belonging to
+    /// a particular [InputState] are locked, then [InputDelegateEvent]s will only be sent to the
+    /// delegate with the highest locking priority.
+    ///
+    /// Multiple [InputDelegate]s can be locked at once, but only the highest priority one will
+    /// receive events.
+    ///
+    /// If _any_ [InputDelegate]s are locked, then the owning [InputState] will also return default
+    /// states for any queries (e.g. querying a key state will always return that is unpressed).
+    pub fn lock(&self, priority: u32) -> InputDelegateLock {
+        InputDelegateLock::lock(self.manager.clone(), self.id, priority)
     }
 
     /// Start a loop that continually waits for new events and fires the provided handler.
@@ -94,26 +140,144 @@ impl InputDelegate {
     /// The loop will block and wait for new events when done handling current events, and does not
     /// operate at a consistent interval. If consistent intervals are required (such as 60 "ticks"
     /// per second), it may be more suitable to use a custom loop that calls [Self::events()].
-    pub fn start(self, handler: impl Fn(InputDelegateEvent)) -> ! {
+    pub fn start(self, handler: impl Fn(&InputDelegate, InputDelegateEvent)) -> ! {
         loop {
-            let (input, rctx) = self.endpoint.wait().unwrap();
-            handler(input);
-            rctx.reply(()).unwrap();
+            // TODO: Possibly break the loop if an error occurred? As that means the sender was disconnected
+            let event = self.receiver.recv().unwrap();
+            handler(&self, event);
         }
     }
 }
 
 pub struct InputDelegateIter<'a> {
-    delegate: &'a InputDelegate,
+    inner: &'a InputDelegate,
 }
 
 impl<'a> Iterator for InputDelegateIter<'a> {
     type Item = InputDelegateEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (event, rctx) = self.delegate.endpoint.try_pop().unwrap()?;
-        rctx.reply(()).unwrap();
-        Some(event)
+        match self.inner.receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => panic!("Server hung up"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq)]
+struct DelegateLockEntry {
+    id: usize,
+    priority: u32,
+}
+
+impl PartialEq for DelegateLockEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl PartialOrd for DelegateLockEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.priority.partial_cmp(&other.priority)
+    }
+}
+
+impl Ord for DelegateLockEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
+struct DelegateManager {
+    next_id: AtomicUsize,
+    senders: RwLock<HashMap<usize, mpsc::Sender<InputDelegateEvent>>>,
+    locks: RwLock<BinaryHeap<DelegateLockEntry>>,
+}
+
+impl Default for DelegateManager {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicUsize::new(0),
+            senders: RwLock::new(HashMap::new()),
+            locks: RwLock::new(BinaryHeap::new()),
+        }
+    }
+}
+
+impl fmt::Debug for DelegateManager {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DelegateManager")
+            .field("next_id", &self.next_id)
+            .field("delegate_ids", &self.senders.read().keys().collect::<Vec<_>>())
+            .field("locks", &*self.locks.read())
+            .finish()
+    }
+}
+
+impl DelegateManager {
+    fn create_delegate(manager: &Arc<DelegateManager>) -> InputDelegate {
+        let (sender, receiver) = mpsc::channel();
+        let id = manager.next_id.fetch_add(1, Ordering::Relaxed);
+
+        manager.senders.write().insert(id, sender);
+
+        InputDelegate {
+            id,
+            receiver,
+            manager: manager.clone(),
+        }
+    }
+
+    fn lock(&self, id: usize, priority: u32) {
+        if !self.senders.read().contains_key(&id) {
+            panic!("Tried to lock input delegate (id=={id}) that doesn't exist in this manager {self:?}");
+        }
+
+        self.locks.write().push(DelegateLockEntry {
+            id,
+            priority,
+        });
+    }
+
+    fn unlock(&self, id: usize) {
+        if !self.senders.read().contains_key(&id) {
+            panic!("Tried to unlock input delegate (id=={id}) that doesn't exist in this manager {self:?}");
+        }
+
+        self.locks.write().retain(|lock| lock.id != id)
+    }
+
+    fn is_locked(&self) -> bool {
+        !self.locks.read().is_empty()
+    }
+
+    fn send_event(&self, event: InputDelegateEvent) {
+        let mut invalid_ids = vec![];
+        let mut senders = self.senders.upgradable_read();
+
+        let locks = self.locks.read();
+        if let Some(locked) = locks.peek() {
+            if senders[&locked.id].send(event).is_err() {
+                // Receiver has hung up
+                invalid_ids.push(locked.id.clone());
+            }
+        } else {
+            for (id, sender) in &*senders {
+                if sender.send(event.clone()).is_err() {
+                    // Receiver has hung up
+                    invalid_ids.push(id.clone());
+                }
+            }
+        }
+
+        if !invalid_ids.is_empty() {
+            senders.with_upgraded(|senders| {
+                for id in invalid_ids {
+                    senders.remove(&id);
+                }
+            })
+        }
     }
 }
 
@@ -164,7 +328,7 @@ pub struct InputState {
     modifiers: RwLock<ModifiersState>,
     mouse_buttons: RwLock<HashSet<MouseButton>>,
     mouse_position: RwLock<glm::TVec2<f64>>,
-    delegate_senders: RwLock<Vec<ump::Client<InputDelegateEvent, (), ()>>>,
+    delegates: Arc<DelegateManager>,
 }
 
 impl Default for InputState {
@@ -174,38 +338,12 @@ impl Default for InputState {
             modifiers: RwLock::new(ModifiersState::empty()),
             mouse_buttons: RwLock::new(HashSet::new()),
             mouse_position: RwLock::new(glm::vec2(0.0, 0.0)),
-            delegate_senders: RwLock::new(Vec::new()),
+            delegates: Arc::new(DelegateManager::default()),
         }
     }
 }
 
 impl InputState {
-    fn send_delegate_event(&self, event: InputDelegateEvent) {
-        let mut invalid_indices = vec![];
-        let mut delegates = self.delegate_senders.upgradable_read();
-        for (idx, delegate) in delegates.iter().enumerate() {
-            match delegate.req_async(event.clone()) {
-                Ok(_) => {
-                    // Don't care about the response
-                },
-                Err(Error::ServerDisappeared) => {
-                    invalid_indices.push(idx);
-                },
-                Err(e) => {
-                    panic!("Unrecoverable pipe error: {e}");
-                },
-            }
-        }
-
-        if !invalid_indices.is_empty() {
-            delegates.with_upgraded(|delegates| {
-                for idx in invalid_indices.into_iter().rev() {
-                    delegates.remove(idx);
-                }
-            })
-        }
-    }
-
     pub(in crate::gui) fn handle_event(&self, event: InputEvent) {
         match event {
             InputEvent::Key(event) => {
@@ -229,7 +367,7 @@ impl InputState {
                     }
                 }
 
-                self.send_delegate_event(InputDelegateEvent::Key(event));
+                self.delegates.send_event(InputDelegateEvent::Key(event));
             },
             InputEvent::Modifiers(modifiers) => {
                 *self.modifiers.write() = modifiers;
@@ -241,7 +379,7 @@ impl InputState {
                     ElementState::Released => mouse_buttons.remove(&button),
                 };
 
-                self.send_delegate_event(InputDelegateEvent::MouseButton(MouseButtonEvent {
+                self.delegates.send_event(InputDelegateEvent::MouseButton(MouseButtonEvent {
                     button,
                     state,
                     position: self.mouse_position.read().clone(),
@@ -251,20 +389,24 @@ impl InputState {
                 *self.mouse_position.write() = position;
             },
             InputEvent::MouseMotion(motion) => {
-                self.send_delegate_event(InputDelegateEvent::MouseMotion(motion.clone()))
+                self.delegates.send_event(InputDelegateEvent::MouseMotion(motion.clone()))
             },
         }
     }
 
     /// Create an [InputDelegate] which will receive copies of input events.
+    #[inline]
     pub fn create_delegate(&self) -> InputDelegate {
-        let (endpoint, sender) = ump::channel();
+        DelegateManager::create_delegate(&self.delegates)
+    }
 
-        self.delegate_senders.write().push(sender);
-
-        InputDelegate {
-            endpoint,
-        }
+    /// Whether the [InputState] is currently priority locked by a delegate.
+    ///
+    /// If the [InputState] is locked, events will only be sent to the locking delegate, and all
+    /// queries about input states will return a default state (e.g. 'false' for key presses).
+    #[inline]
+    pub fn is_locked_by_delegate(&self) -> bool {
+        self.delegates.is_locked()
     }
 
     /// Query whether the given key is pressed.
@@ -272,19 +414,22 @@ impl InputState {
     /// A [ModifierState] can optionally be specified. If it is None, then this will return true if
     /// the given key is pressed, regardless of modifiers. If it is Some, then this will only return
     /// true if the given key is pressed AND the _exact_ set of modifiers are also pressed.
-    #[inline]
     pub fn is_key_pressed(&self, key: KeyCode, modifiers: Option<ModifiersState>) -> bool {
-        match modifiers {
-            Some(modifiers)
+        if self.delegates.is_locked() {
+            false
+        } else {
+            match modifiers {
+                Some(modifiers)
                 => modifiers == *self.modifiers.read() && self.keys.read().contains(&key),
-            None => self.keys.read().contains(&key),
+                None => self.keys.read().contains(&key),
+            }
         }
     }
 
     /// Query whether the given mouse button is pressed.
     #[inline]
     pub fn is_mouse_pressed(&self, button: MouseButton) -> bool {
-        self.mouse_buttons.read().contains(&button)
+        !self.delegates.is_locked() && self.mouse_buttons.read().contains(&button)
     }
 
     /// Get the current position of the mouse cursor in the window.
@@ -383,6 +528,22 @@ mod tests {
     }
 
     #[test]
+    fn test_key_pressed_locked() {
+        let input = InputState::default();
+        let delegate = input.create_delegate();
+
+        do_key_input(&input, KeyCode::KeyX, ElementState::Pressed);
+        assert!(input.is_key_pressed(KeyCode::KeyX, None));
+
+        let lock = delegate.lock(10);
+        assert!(!input.is_key_pressed(KeyCode::KeyX, None));
+
+        // Unlocking should once again allow the state to be queried
+        drop(lock);
+        assert!(input.is_key_pressed(KeyCode::KeyX, None));
+    }
+
+    #[test]
     fn test_mouse_pressed() {
         let input = InputState::default();
 
@@ -396,6 +557,22 @@ mod tests {
         do_mouse_input(&input, MouseButton::Left, ElementState::Released);
         assert!(!input.is_mouse_pressed(MouseButton::Left));
         assert!(!input.is_mouse_pressed(MouseButton::Right));
+    }
+
+    #[test]
+    fn test_mouse_pressed_locked() {
+        let input = InputState::default();
+        let delegate = input.create_delegate();
+
+        do_mouse_input(&input, MouseButton::Left, ElementState::Pressed);
+        assert!(input.is_mouse_pressed(MouseButton::Left));
+
+        let lock = delegate.lock(10);
+        assert!(!input.is_mouse_pressed(MouseButton::Left));
+
+        // Unlocking should once again allow the state to be queried
+        drop(lock);
+        assert!(input.is_mouse_pressed(MouseButton::Left));
     }
 
     #[test]
@@ -551,5 +728,38 @@ mod tests {
             InputDelegateEvent::Key(create_key_event(KeyCode::Escape, ElementState::Pressed)),
             InputDelegateEvent::Key(create_key_event(KeyCode::Escape, ElementState::Released)),
         ]);
+    }
+
+    #[test]
+    fn test_locked_delegate_events() {
+        let input = InputState::default();
+        let delegate_1 = input.create_delegate();
+        let delegate_2 = input.create_delegate();
+        let delegate_3 = input.create_delegate();
+
+        let lock_2 = delegate_2.lock(10);
+        let lock_3 = delegate_3.lock(99);
+
+        do_key_input(&input, KeyCode::Escape, ElementState::Pressed);
+        let events_1 = delegate_1.events().collect::<Vec<_>>();
+        assert!(events_1.is_empty());
+        let events_2 = delegate_2.events().collect::<Vec<_>>();
+        assert!(events_2.is_empty());
+        let events_3 = delegate_3.events().collect::<Vec<_>>();
+        assert_eq!(events_3, vec![
+            InputDelegateEvent::Key(create_key_event(KeyCode::Escape, ElementState::Pressed)),
+        ]);
+
+        // Dropping lock_3 should revert to delegate_2 receiving events
+        drop(lock_3);
+        do_key_input(&input, KeyCode::Escape, ElementState::Pressed);
+        let events_1 = delegate_1.events().collect::<Vec<_>>();
+        assert!(events_1.is_empty());
+        let events_2 = delegate_2.events().collect::<Vec<_>>();
+        assert_eq!(events_2, vec![
+            InputDelegateEvent::Key(create_key_event(KeyCode::Escape, ElementState::Pressed)),
+        ]);
+        let events_3 = delegate_3.events().collect::<Vec<_>>();
+        assert!(events_3.is_empty());
     }
 }
