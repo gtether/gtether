@@ -1,18 +1,19 @@
 use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::thread;
+use std::{fmt, thread};
 use tracing::{event, Level};
 
 use ump::Error;
 use vulkano::instance::Instance;
 use vulkano::swapchain::Surface;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::error::ExternalError;
+use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{Window as WinitWindow, WindowId};
+use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
 use crate::{EngineMetadata, NonExhaustive};
+use crate::gui::input::{InputEvent, InputState};
 use crate::render::{Device, Dimensions, RenderTarget};
 use crate::render::render_pass::{EngineRenderPass, EngineRenderPassBuilder};
 use crate::render::Renderer;
@@ -48,8 +49,8 @@ impl WindowRenderTarget {
     fn winit_window(&self) -> &Arc<WinitWindow> { &self.winit_window }
 }
 
-impl Debug for WindowRenderTarget {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for WindowRenderTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WindowRenderTarget")
             .field("window_id", &self.winit_window.id())
             .finish()
@@ -110,6 +111,11 @@ impl Default for WindowModifyRequest {
     }
 }
 
+enum WindowEventRequest {
+    Window(WindowEvent),
+    Device(DeviceEvent),
+}
+
 /// Handle for a specific window.
 ///
 /// Provides access to window information and manipulation methods.
@@ -117,8 +123,18 @@ impl Default for WindowModifyRequest {
 pub struct WindowHandle {
     id: WindowId,
     target: Arc<dyn RenderTarget>,
+    input: Arc<InputState>,
     sender_modify: ump::Client<WindowModifyRequest, (), ()>,
-    sender_event: ump::Client<WindowEvent, (), ()>,
+    sender_event: ump::Client<WindowEventRequest, (), ()>,
+}
+
+impl fmt::Debug for WindowHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowHandle")
+            .field("id", &self.id)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WindowHandle {
@@ -129,6 +145,10 @@ impl WindowHandle {
     /// The [RenderTarget] for this window.
     #[inline]
     pub fn render_target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+
+    /// The current [InputState] for this window.
+    #[inline]
+    pub fn input_state(&self) -> &Arc<InputState> { &self.input }
 
     /// Replace this window's [RenderTarget] with a new one.
     ///
@@ -164,10 +184,10 @@ impl WindowHandle {
     ///
     /// - Panics if the window's main thread has stopped or is otherwise unresponsive.
     pub fn request_close(&self) {
-        self.sender_event.req(WindowEvent::CloseRequested).unwrap();
+        self.sender_event.req(WindowEventRequest::Window(WindowEvent::CloseRequested)).unwrap();
     }
 
-    fn handle_event(&self, event: WindowEvent) -> Result<(), Error<()>> {
+    fn handle_event(&self, event: WindowEventRequest) -> Result<(), Error<()>> {
         // Send the event without blocking
         self.sender_event.req_async(event).map(|_| {})
     }
@@ -176,9 +196,10 @@ impl WindowHandle {
 struct Window {
     target: Arc<WindowRenderTarget>,
     renderer: Renderer,
+    input: Arc<InputState>,
     cursor_visible: bool,
     endpoint_modify: ump::Server<WindowModifyRequest, (), ()>,
-    endpoint_event: ump::Server<WindowEvent, (), ()>,
+    endpoint_event: ump::Server<WindowEventRequest, (), ()>,
 }
 
 impl Window {
@@ -207,9 +228,12 @@ impl Window {
             instance.clone(),
         ));
 
+        let input = Arc::new(InputState::default());
+
         let window_handle = WindowHandle {
             id: window_id,
             target: target.clone(),
+            input: input.clone(),
             sender_modify,
             sender_event,
         };
@@ -222,6 +246,7 @@ impl Window {
             let mut window = Self {
                 target,
                 renderer,
+                input,
                 cursor_visible: true,
                 endpoint_modify,
                 endpoint_event,
@@ -276,24 +301,35 @@ impl Window {
         while let Some((event, rctx)) = self.endpoint_event.try_pop().unwrap() {
             let window_id = self.target.winit_window().id();
             match event {
-                WindowEvent::CloseRequested => {
-                    event!(Level::INFO, "Window {window_id:?} has received the signal to close");
-                    status = Err(());
-                },
-                WindowEvent::Resized(_) => {
-                    self.renderer.mark_stale();
-                },
-                WindowEvent::Focused(focused) => {
-                    if focused {
-                        self.set_cursor_visible(self.cursor_visible);
-                    } else {
-                        self.set_cursor_visible(true);
+                WindowEventRequest::Window(event) => match event {
+                    WindowEvent::CloseRequested => {
+                        event!(Level::INFO, "Window {window_id:?} has received the signal to close");
+                        status = Err(());
+                    },
+                    WindowEvent::Resized(_) => {
+                        self.renderer.mark_stale();
+                    },
+                    WindowEvent::Focused(focused) => {
+                        if focused {
+                            self.set_cursor_visible(self.cursor_visible);
+                        } else {
+                            self.set_cursor_visible(true);
+                        }
+                    },
+                    WindowEvent::Destroyed => {
+                        return Err(());
+                    },
+                    event => {
+                        if let Some(input_event) = InputEvent::from_window_event(event) {
+                            self.input.handle_event(input_event);
+                        }
                     }
                 },
-                WindowEvent::Destroyed => {
-                    return Err(());
-                },
-                _ => ()
+                WindowEventRequest::Device(event) => {
+                    if let Some(input_event) = InputEvent::from_device_event(event) {
+                        self.input.handle_event(input_event);
+                    }
+                }
             }
 
             rctx.reply(()).unwrap();
@@ -362,7 +398,7 @@ impl WindowManager {
         if matches!(event, WindowEvent::CloseRequested) {
             if let Some(entry) = self.windows.remove(&window_id) {
                 // Don't care if this errors, because we'll be removing the window anyway
-                entry.window_handle.handle_event(event).unwrap_or_default();
+                entry.window_handle.handle_event(WindowEventRequest::Window(event)).unwrap_or_default();
                 // TODO: Do we care about joining this? Possibly just drop the reference and move on
                 entry.join_handle.join().unwrap();
                 if entry.exit_on_close {
@@ -371,11 +407,24 @@ impl WindowManager {
             }
         } else {
             if let Some(entry) = self.windows.get(&window_id) {
-                entry.window_handle.handle_event(event).unwrap_or_else(|err| {
+                entry.window_handle.handle_event(WindowEventRequest::Window(event)).unwrap_or_else(|err| {
                     event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
                     self.windows.remove(&window_id);
                 });
             }
+        }
+    }
+
+    pub(in crate::gui) fn device_event(&mut self, event: DeviceEvent) {
+        let mut invalid_window_ids = vec![];
+        for (window_id, entry) in &self.windows {
+            entry.window_handle.handle_event(WindowEventRequest::Device(event.clone())).unwrap_or_else(|err| {
+                event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
+                invalid_window_ids.push(window_id.clone());
+            })
+        }
+        for window_id in invalid_window_ids {
+            self.windows.remove(&window_id);
         }
     }
 }

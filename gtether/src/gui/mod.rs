@@ -84,8 +84,8 @@ impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
         self.manager.window_event(window_id, event, event_loop);
     }
 
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, _event: DeviceEvent) {
-        // TODO
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, event: DeviceEvent) {
+        self.manager.device_event(event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
