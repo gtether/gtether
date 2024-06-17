@@ -98,12 +98,14 @@ impl Default for CreateWindowInfo {
 
 struct WindowModifyRequest {
     render_pass: Option<Box<dyn EngineRenderPass>>,
+    cursor_visible: Option<bool>,
 }
 
 impl Default for WindowModifyRequest {
     fn default() -> Self {
         Self {
             render_pass: None,
+            cursor_visible: None,
         }
     }
 }
@@ -145,6 +147,15 @@ impl WindowHandle {
         self.sender_modify.req(modify_request).unwrap();
     }
 
+    pub fn set_cursor_visible(&self, visible: bool) {
+        let modify_request = WindowModifyRequest {
+            cursor_visible: Some(visible),
+            ..Default::default()
+        };
+
+        self.sender_modify.req(modify_request).unwrap();
+    }
+
     /// Requests this window to close.
     ///
     /// Sends a request which may be honored by the window when available. Does not block.
@@ -165,6 +176,7 @@ impl WindowHandle {
 struct Window {
     target: Arc<WindowRenderTarget>,
     renderer: Renderer,
+    cursor_visible: bool,
     endpoint_modify: ump::Server<WindowModifyRequest, (), ()>,
     endpoint_event: ump::Server<WindowEvent, (), ()>,
 }
@@ -210,6 +222,7 @@ impl Window {
             let mut window = Self {
                 target,
                 renderer,
+                cursor_visible: true,
                 endpoint_modify,
                 endpoint_event,
             };
@@ -224,6 +237,24 @@ impl Window {
         (window_handle, join_handle)
     }
 
+    fn set_cursor_visible(&mut self, cursor_visible: bool) {
+        self.target.winit_window.set_cursor_visible(cursor_visible);
+        let result = if cursor_visible {
+            self.target.winit_window.set_cursor_grab(CursorGrabMode::None)
+        } else {
+            self.target.winit_window.set_cursor_grab(CursorGrabMode::Confined).or_else(|e| {
+                if matches!(e, ExternalError::NotSupported(..)) {
+                    self.target.winit_window.set_cursor_grab(CursorGrabMode::Locked)
+                } else {
+                    Err(e)
+                }
+            })
+        };
+        if let Err(e) = result {
+            event!(Level::WARN, "Failed to set cursor grab mode: {e}")
+        }
+    }
+
     fn tick(&mut self) -> Result<(), ()> {
         let mut status = Ok(());
 
@@ -232,6 +263,11 @@ impl Window {
         while let Some((modify_request, rctx)) = self.endpoint_modify.try_pop().unwrap() {
             if let Some(render_pass) = modify_request.render_pass {
                 self.renderer.set_render_pass(render_pass);
+            }
+
+            if let Some(visible) = modify_request.cursor_visible {
+                self.cursor_visible = visible;
+                self.set_cursor_visible(visible);
             }
 
             rctx.reply(()).unwrap();
@@ -246,6 +282,16 @@ impl Window {
                 },
                 WindowEvent::Resized(_) => {
                     self.renderer.mark_stale();
+                },
+                WindowEvent::Focused(focused) => {
+                    if focused {
+                        self.set_cursor_visible(self.cursor_visible);
+                    } else {
+                        self.set_cursor_visible(true);
+                    }
+                },
+                WindowEvent::Destroyed => {
+                    return Err(());
                 },
                 _ => ()
             }
