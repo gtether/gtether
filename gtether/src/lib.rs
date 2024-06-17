@@ -1,3 +1,5 @@
+extern crate nalgebra_glm as glm;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 

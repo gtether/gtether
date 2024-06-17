@@ -10,6 +10,8 @@ graphics = ["dep:vulkano"]
 gui = ["graphics", "dep:winit"]
 
 [dependencies]
+nalgebra-glm = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 vulkano = { workspace = true, optional = true }
 ump = { workspace = true }

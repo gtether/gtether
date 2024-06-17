@@ -12,6 +12,7 @@ use crate::{Application, Engine, EngineState, Registry};
 use crate::gui::window::{CreateWindowInfo, WindowHandle};
 
 pub mod window;
+pub mod input;
 
 pub struct WindowRegistry<'a> {
     event_loop: &'a ActiveEventLoop,
