@@ -10,7 +10,7 @@ use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
 use gtether::{Engine, EngineBuilder, EngineMetadata, Application, Registry};
-use gtether::gui::input::{InputDelegate, InputDelegateEvent, KeyCode};
+use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 
@@ -200,19 +200,19 @@ impl Application for AppCore {
             }
         }
 
-        if window.input_state().is_key_pressed(KeyCode::KeyW, None) {
+        if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap() {
             camera.pos += orient * distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyS, None) {
+        if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap() {
             camera.pos += orient * -distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyD, None) {
+        if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap() {
             camera.pos += right * distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyA, None) {
+        if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap() {
             camera.pos += right * -distance;
             changed = true;
         }
@@ -224,7 +224,7 @@ impl Application for AppCore {
             vp_uniform.set(vp);
         }
 
-        if window.input_state().is_key_pressed(KeyCode::Escape, None) {
+        if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap() {
             engine.request_exit();
         }
     }

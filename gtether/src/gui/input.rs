@@ -11,6 +11,92 @@ use winit::event::{DeviceEvent, KeyEvent as WinitKeyEvent, WindowEvent};
 pub use winit::event::{ElementState, MouseButton};
 pub use winit::keyboard::{Key as LogicalKey, KeyCode, KeyLocation, ModifiersState, PhysicalKey};
 
+pub trait InputStateLayer {
+    /// Query whether the given key is pressed.
+    ///
+    /// A [ModifierState] can optionally be specified. If it is None, then this will return true if
+    /// the given key is pressed, regardless of modifiers. If it is Some, then this will only return
+    /// true if the given key is pressed AND the _exact_ set of modifiers are also pressed.
+    ///
+    /// If the [InputState] is locked by an [InputDelegate], this will return None if the current
+    /// layer does not have priority.
+    fn is_key_pressed(&self, key: KeyCode, modifiers: Option<ModifiersState>) -> Option<bool>;
+
+    /// Query whether the given mouse button is pressed.
+    ///
+    /// If the [InputState] is locked by an [InputDelegate], this will return None if the current
+    /// layer does not have priority.
+    fn is_mouse_pressed(&self, button: MouseButton) -> Option<bool>;
+
+    /// Get the current position of the mouse cursor in the window.
+    ///
+    /// (0, 0) is top-left of the window.
+    fn mouse_position(&self) -> glm::TVec2<f64>;
+}
+
+struct StateManager {
+    keys: RwLock<HashSet<KeyCode>>,
+    modifiers: RwLock<ModifiersState>,
+    mouse_buttons: RwLock<HashSet<MouseButton>>,
+    mouse_position: RwLock<glm::TVec2<f64>>,
+}
+
+impl Default for StateManager {
+    fn default() -> Self {
+        Self {
+            keys: RwLock::new(HashSet::new()),
+            modifiers: RwLock::new(ModifiersState::empty()),
+            mouse_buttons: RwLock::new(HashSet::new()),
+            mouse_position: RwLock::new(glm::vec2(0.0, 0.0)),
+        }
+    }
+}
+
+impl StateManager {
+    fn set_key(&self, key_code: KeyCode, state: ElementState) {
+        event!(Level::TRACE, "Key state change: {key_code:?} - {state:?}");
+        let mut inner = self.keys.write();
+        match state {
+            ElementState::Pressed => inner.insert(key_code),
+            ElementState::Released => inner.remove(&key_code),
+        };
+    }
+
+    fn set_modifiers(&self, modifiers: ModifiersState) {
+        event!(Level::TRACE, "Modifiers state change: {modifiers:?}");
+        *self.modifiers.write() = modifiers;
+    }
+
+    fn set_mouse_button(&self, button: MouseButton, state: ElementState) {
+        event!(Level::TRACE, "Mouse button state change: {button:?} - {state:?}");
+        let mut mouse_buttons = self.mouse_buttons.write();
+        match state {
+            ElementState::Pressed => mouse_buttons.insert(button),
+            ElementState::Released => mouse_buttons.remove(&button),
+        };
+    }
+
+    fn set_mouse_position(&self, position: glm::TVec2<f64>) {
+        *self.mouse_position.write() = position;
+    }
+
+    fn is_key_pressed(&self, key: KeyCode, modifiers: Option<ModifiersState>) -> bool {
+        match modifiers {
+            Some(modifiers) =>
+                modifiers == *self.modifiers.read() && self.keys.read().contains(&key),
+            None => self.keys.read().contains(&key),
+        }
+    }
+
+    fn is_mouse_pressed(&self, button: MouseButton) -> bool {
+        self.mouse_buttons.read().contains(&button)
+    }
+
+    fn mouse_position(&self) -> glm::TVec2<f64> {
+        self.mouse_position.read().clone()
+    }
+}
+
 /// Event representing an individual Key state change.
 ///
 /// This event is effectively a recreation of [winit::event::KeyEvent], with crate-private parts
@@ -149,6 +235,20 @@ impl InputDelegate {
     }
 }
 
+impl InputStateLayer for InputDelegate {
+    fn is_key_pressed(&self, key: KeyCode, modifiers: Option<ModifiersState>) -> Option<bool> {
+        self.manager.is_key_pressed(self.id, key, modifiers)
+    }
+
+    fn is_mouse_pressed(&self, button: MouseButton) -> Option<bool> {
+        self.manager.is_mouse_pressed(self.id, button)
+    }
+
+    fn mouse_position(&self) -> glm::TVec2<f64> {
+        self.manager.state.mouse_position()
+    }
+}
+
 pub struct InputDelegateIter<'a> {
     inner: &'a InputDelegate,
 }
@@ -190,19 +290,10 @@ impl Ord for DelegateLockEntry {
 }
 
 struct DelegateManager {
+    state: Arc<StateManager>,
     next_id: AtomicUsize,
     senders: RwLock<HashMap<usize, mpsc::Sender<InputDelegateEvent>>>,
     locks: RwLock<BinaryHeap<DelegateLockEntry>>,
-}
-
-impl Default for DelegateManager {
-    fn default() -> Self {
-        Self {
-            next_id: AtomicUsize::new(0),
-            senders: RwLock::new(HashMap::new()),
-            locks: RwLock::new(BinaryHeap::new()),
-        }
-    }
 }
 
 impl fmt::Debug for DelegateManager {
@@ -216,6 +307,15 @@ impl fmt::Debug for DelegateManager {
 }
 
 impl DelegateManager {
+    fn new(state: Arc<StateManager>) -> Self {
+        Self {
+            state,
+            next_id: AtomicUsize::new(0),
+            senders: RwLock::new(HashMap::new()),
+            locks: RwLock::new(BinaryHeap::new()),
+        }
+    }
+
     fn create_delegate(manager: &Arc<DelegateManager>) -> InputDelegate {
         let (sender, receiver) = mpsc::channel();
         let id = manager.next_id.fetch_add(1, Ordering::Relaxed);
@@ -279,6 +379,30 @@ impl DelegateManager {
             })
         }
     }
+
+    fn has_priority(&self, id: usize) -> bool {
+        if let Some(top) = self.locks.read().peek() {
+            top.id == id
+        } else {
+            true
+        }
+    }
+
+    fn is_key_pressed(&self, id: usize, key: KeyCode, modifiers: Option<ModifiersState>) -> Option<bool> {
+        if !self.has_priority(id) {
+            return None;
+        } else {
+            Some(self.state.is_key_pressed(key, modifiers))
+        }
+    }
+
+    fn is_mouse_pressed(&self, id: usize, button: MouseButton) -> Option<bool> {
+        if !self.has_priority(id) {
+            return None;
+        } else {
+            Some(self.state.is_mouse_pressed(button))
+        }
+    }
 }
 
 pub(in crate::gui) enum InputEvent {
@@ -324,21 +448,16 @@ impl InputEvent {
 ///
 /// This state is thread-safe, and so is suitable for use with e.g. an Arc<>.
 pub struct InputState {
-    keys: RwLock<HashSet<KeyCode>>,
-    modifiers: RwLock<ModifiersState>,
-    mouse_buttons: RwLock<HashSet<MouseButton>>,
-    mouse_position: RwLock<glm::TVec2<f64>>,
+    state: Arc<StateManager>,
     delegates: Arc<DelegateManager>,
 }
 
 impl Default for InputState {
     fn default() -> Self {
+        let state = Arc::new(StateManager::default());
         Self {
-            keys: RwLock::new(HashSet::new()),
-            modifiers: RwLock::new(ModifiersState::empty()),
-            mouse_buttons: RwLock::new(HashSet::new()),
-            mouse_position: RwLock::new(glm::vec2(0.0, 0.0)),
-            delegates: Arc::new(DelegateManager::default()),
+            state: state.clone(),
+            delegates: Arc::new(DelegateManager::new(state)),
         }
     }
 }
@@ -357,36 +476,26 @@ impl InputState {
 
                 if !event.repeat {
                     if let Some(key_code) = key_code {
-                        let state = event.state;
-                        event!(Level::TRACE, "Key event: {key_code:?} - {state:?}");
-                        let mut inner = self.keys.write();
-                        match state {
-                            ElementState::Pressed => inner.insert(key_code),
-                            ElementState::Released => inner.remove(&key_code),
-                        };
+                        self.state.set_key(key_code, event.state);
                     }
                 }
 
                 self.delegates.send_event(InputDelegateEvent::Key(event));
             },
             InputEvent::Modifiers(modifiers) => {
-                *self.modifiers.write() = modifiers;
+                self.state.set_modifiers(modifiers);
             },
             InputEvent::MouseInput { button, state } => {
-                let mut mouse_buttons = self.mouse_buttons.write();
-                match state {
-                    ElementState::Pressed => mouse_buttons.insert(button),
-                    ElementState::Released => mouse_buttons.remove(&button),
-                };
+                self.state.set_mouse_button(button, state);
 
                 self.delegates.send_event(InputDelegateEvent::MouseButton(MouseButtonEvent {
                     button,
                     state,
-                    position: self.mouse_position.read().clone(),
+                    position: self.state.mouse_position(),
                 }))
             },
             InputEvent::CursorMoved(position) => {
-                *self.mouse_position.write() = position;
+                self.state.set_mouse_position(position);
             },
             InputEvent::MouseMotion(motion) => {
                 self.delegates.send_event(InputDelegateEvent::MouseMotion(motion.clone()))
@@ -408,36 +517,30 @@ impl InputState {
     pub fn is_locked_by_delegate(&self) -> bool {
         self.delegates.is_locked()
     }
+}
 
-    /// Query whether the given key is pressed.
-    ///
-    /// A [ModifierState] can optionally be specified. If it is None, then this will return true if
-    /// the given key is pressed, regardless of modifiers. If it is Some, then this will only return
-    /// true if the given key is pressed AND the _exact_ set of modifiers are also pressed.
-    pub fn is_key_pressed(&self, key: KeyCode, modifiers: Option<ModifiersState>) -> bool {
+impl InputStateLayer for InputState {
+    #[inline]
+    fn is_key_pressed(&self, key: KeyCode, modifiers: Option<ModifiersState>) -> Option<bool> {
         if self.delegates.is_locked() {
-            false
+            None
         } else {
-            match modifiers {
-                Some(modifiers)
-                => modifiers == *self.modifiers.read() && self.keys.read().contains(&key),
-                None => self.keys.read().contains(&key),
-            }
+            Some(self.state.is_key_pressed(key, modifiers))
         }
     }
 
-    /// Query whether the given mouse button is pressed.
     #[inline]
-    pub fn is_mouse_pressed(&self, button: MouseButton) -> bool {
-        !self.delegates.is_locked() && self.mouse_buttons.read().contains(&button)
+    fn is_mouse_pressed(&self, button: MouseButton) -> Option<bool> {
+        if self.delegates.is_locked() {
+            None
+        } else {
+            Some(self.state.is_mouse_pressed(button))
+        }
     }
 
-    /// Get the current position of the mouse cursor in the window.
-    ///
-    /// (0, 0) is top-left of the window.
     #[inline]
-    pub fn mouse_position(&self) -> glm::TVec2<f64> {
-        self.mouse_position.read().clone()
+    fn mouse_position(&self) -> glm::TVec2<f64> {
+        self.state.mouse_position()
     }
 }
 
@@ -484,47 +587,47 @@ mod tests {
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Pressed);
         do_key_input(&input, KeyCode::KeyY, ElementState::Released);
-        assert!(input.is_key_pressed(KeyCode::KeyX, None));
-        assert!(!input.is_key_pressed(KeyCode::KeyY, None));
-        assert!(!input.is_key_pressed(KeyCode::KeyZ, None));
+        assert!(input.is_key_pressed(KeyCode::KeyX, None).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyY, None).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyZ, None).unwrap());
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Pressed);
-        assert!(input.is_key_pressed(KeyCode::KeyX, None));
+        assert!(input.is_key_pressed(KeyCode::KeyX, None).unwrap());
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Released);
-        assert!(!input.is_key_pressed(KeyCode::KeyX, None));
+        assert!(!input.is_key_pressed(KeyCode::KeyX, None).unwrap());
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Released);
-        assert!(!input.is_key_pressed(KeyCode::KeyX, None));
+        assert!(!input.is_key_pressed(KeyCode::KeyX, None).unwrap());
     }
 
     #[test]
     fn test_key_pressed_modifiers() {
         let input = InputState::default();
 
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)));
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)).unwrap());
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Pressed);
-        assert!(input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)));
+        assert!(input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)).unwrap());
 
         do_modifiers(&input, ModifiersState::SHIFT);
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())));
-        assert!(input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)));
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())).unwrap());
+        assert!(input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)).unwrap());
 
         do_modifiers(&input, ModifiersState::SHIFT | ModifiersState::ALT);
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)));
-        assert!(input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)));
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)).unwrap());
+        assert!(input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)).unwrap());
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Released);
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)));
-        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)));
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::empty())).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT)).unwrap());
+        assert!(!input.is_key_pressed(KeyCode::KeyX, Some(ModifiersState::SHIFT | ModifiersState::ALT)).unwrap());
     }
 
     #[test]
@@ -533,30 +636,30 @@ mod tests {
         let delegate = input.create_delegate();
 
         do_key_input(&input, KeyCode::KeyX, ElementState::Pressed);
-        assert!(input.is_key_pressed(KeyCode::KeyX, None));
+        assert!(input.is_key_pressed(KeyCode::KeyX, None).unwrap());
 
         let lock = delegate.lock(10);
-        assert!(!input.is_key_pressed(KeyCode::KeyX, None));
+        assert!(input.is_key_pressed(KeyCode::KeyX, None).is_none());
 
         // Unlocking should once again allow the state to be queried
         drop(lock);
-        assert!(input.is_key_pressed(KeyCode::KeyX, None));
+        assert!(input.is_key_pressed(KeyCode::KeyX, None).unwrap());
     }
 
     #[test]
     fn test_mouse_pressed() {
         let input = InputState::default();
 
-        assert!(!input.is_mouse_pressed(MouseButton::Left));
-        assert!(!input.is_mouse_pressed(MouseButton::Right));
+        assert!(!input.is_mouse_pressed(MouseButton::Left).unwrap());
+        assert!(!input.is_mouse_pressed(MouseButton::Right).unwrap());
 
         do_mouse_input(&input, MouseButton::Left, ElementState::Pressed);
-        assert!(input.is_mouse_pressed(MouseButton::Left));
-        assert!(!input.is_mouse_pressed(MouseButton::Right));
+        assert!(input.is_mouse_pressed(MouseButton::Left).unwrap());
+        assert!(!input.is_mouse_pressed(MouseButton::Right).unwrap());
 
         do_mouse_input(&input, MouseButton::Left, ElementState::Released);
-        assert!(!input.is_mouse_pressed(MouseButton::Left));
-        assert!(!input.is_mouse_pressed(MouseButton::Right));
+        assert!(!input.is_mouse_pressed(MouseButton::Left).unwrap());
+        assert!(!input.is_mouse_pressed(MouseButton::Right).unwrap());
     }
 
     #[test]
@@ -565,14 +668,14 @@ mod tests {
         let delegate = input.create_delegate();
 
         do_mouse_input(&input, MouseButton::Left, ElementState::Pressed);
-        assert!(input.is_mouse_pressed(MouseButton::Left));
+        assert!(input.is_mouse_pressed(MouseButton::Left).unwrap());
 
         let lock = delegate.lock(10);
-        assert!(!input.is_mouse_pressed(MouseButton::Left));
+        assert!(input.is_mouse_pressed(MouseButton::Left).is_none());
 
         // Unlocking should once again allow the state to be queried
         drop(lock);
-        assert!(input.is_mouse_pressed(MouseButton::Left));
+        assert!(input.is_mouse_pressed(MouseButton::Left).unwrap());
     }
 
     #[test]
@@ -731,13 +834,26 @@ mod tests {
     }
 
     #[test]
+    fn test_delegate_queries() {
+        let input = InputState::default();
+        let delegate_1 = input.create_delegate();
+        let delegate_2 = input.create_delegate();
+
+        do_key_input(&input, KeyCode::KeyA, ElementState::Pressed);
+        assert!(delegate_1.is_key_pressed(KeyCode::KeyA, None).unwrap());
+        assert!(!delegate_1.is_key_pressed(KeyCode::KeyS, None).unwrap());
+        assert!(delegate_2.is_key_pressed(KeyCode::KeyA, None).unwrap());
+        assert!(!delegate_2.is_key_pressed(KeyCode::KeyS, None).unwrap());
+    }
+
+    #[test]
     fn test_locked_delegate_events() {
         let input = InputState::default();
         let delegate_1 = input.create_delegate();
         let delegate_2 = input.create_delegate();
         let delegate_3 = input.create_delegate();
 
-        let lock_2 = delegate_2.lock(10);
+        let _lock_2 = delegate_2.lock(10);
         let lock_3 = delegate_3.lock(99);
 
         do_key_input(&input, KeyCode::Escape, ElementState::Pressed);
@@ -761,5 +877,33 @@ mod tests {
         ]);
         let events_3 = delegate_3.events().collect::<Vec<_>>();
         assert!(events_3.is_empty());
+    }
+
+    #[test]
+    fn test_locked_delegate_queries() {
+        let input = InputState::default();
+        let delegate_1 = input.create_delegate();
+        let delegate_2 = input.create_delegate();
+        let delegate_3 = input.create_delegate();
+
+        let _lock_2 = delegate_2.lock(10);
+        let lock_3 = delegate_3.lock(99);
+
+        do_key_input(&input, KeyCode::KeyA, ElementState::Pressed);
+        assert!(delegate_1.is_key_pressed(KeyCode::KeyA, None).is_none());
+        assert!(delegate_1.is_key_pressed(KeyCode::KeyS, None).is_none());
+        assert!(delegate_2.is_key_pressed(KeyCode::KeyA, None).is_none());
+        assert!(delegate_2.is_key_pressed(KeyCode::KeyS, None).is_none());
+        assert!(delegate_3.is_key_pressed(KeyCode::KeyA, None).unwrap());
+        assert!(!delegate_3.is_key_pressed(KeyCode::KeyS, None).unwrap());
+
+        // Dropping lock_3 should revert to delegate_2 being able to query
+        drop(lock_3);
+        assert!(delegate_1.is_key_pressed(KeyCode::KeyA, None).is_none());
+        assert!(delegate_1.is_key_pressed(KeyCode::KeyS, None).is_none());
+        assert!(delegate_2.is_key_pressed(KeyCode::KeyA, None).unwrap());
+        assert!(!delegate_2.is_key_pressed(KeyCode::KeyS, None).unwrap());
+        assert!(delegate_3.is_key_pressed(KeyCode::KeyA, None).is_none());
+        assert!(delegate_3.is_key_pressed(KeyCode::KeyS, None).is_none());
     }
 }
