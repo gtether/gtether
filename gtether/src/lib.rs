@@ -1,5 +1,6 @@
 #[cfg(test)] #[macro_use]
 extern crate assert_matches;
+extern crate nalgebra_glm as glm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -61,7 +62,7 @@ impl<A: Application> Engine<A> {
     pub fn metadata(&self) -> &EngineMetadata { &self.metadata }
 
     #[inline]
-    pub fn game(&self) -> &A { &self.app }
+    pub fn app(&self) -> &A { &self.app }
 
     #[inline]
     pub fn state(&self) -> EngineState { self.state }

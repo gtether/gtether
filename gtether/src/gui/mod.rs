@@ -12,6 +12,7 @@ use crate::{Application, Engine, EngineState, Registry};
 use crate::gui::window::{CreateWindowInfo, WindowHandle};
 
 pub mod window;
+pub mod input;
 
 pub struct WindowRegistry<'a> {
     event_loop: &'a ActiveEventLoop,
@@ -39,17 +40,21 @@ impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         match (cause, self.engine.state) {
             (StartCause::Poll, EngineState::Running) => {
-                let tick_start = Instant::now();
-
+                // Always run bookkeeping
                 self.manager.tick(event_loop);
-
-                self.engine.app.tick(&self.engine, tick_start - self.last_tick);
-
                 if self.engine.should_exit.load(Ordering::Relaxed) {
                     event_loop.exit();
                 }
 
-                self.last_tick = tick_start;
+                // TODO: May want to move this after other event processing, in order to process input first
+                let tick_start = Instant::now();
+                let delta = tick_start - self.last_tick;
+                // Try to tick ~60 times a second
+                // TODO: Make this configurable
+                if delta.as_secs_f32() > 1.0 / 60.0 {
+                    self.engine.app.tick(&self.engine, delta);
+                    self.last_tick = tick_start;
+                }
             },
             _ => {},
         }
@@ -67,7 +72,7 @@ impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
                     window,
                 };
 
-                self.engine.game().init(&self.engine, &mut registry);
+                self.engine.app.init(&self.engine, &mut registry);
 
                 self.engine.state = EngineState::Running;
             },
@@ -79,8 +84,8 @@ impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
         self.manager.window_event(window_id, event, event_loop);
     }
 
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, _event: DeviceEvent) {
-        // TODO
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, event: DeviceEvent) {
+        self.manager.device_event(event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
