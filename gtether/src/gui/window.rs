@@ -280,12 +280,23 @@ impl Window {
         }
     }
 
+    fn map_ump_error(error: Error<()>) -> () {
+        match error {
+            Error::ClientsDisappeared => (),
+            Error::ServerDisappeared => (),
+            error => {
+                event!(Level::WARN, "Window endpoint failure, closing; {error:?}");
+            }
+        }
+    }
+
     fn tick(&mut self) -> Result<(), ()> {
         let mut status = Ok(());
 
         self.renderer.render();
 
-        while let Some((modify_request, rctx)) = self.endpoint_modify.try_pop().unwrap() {
+        while let Some((modify_request, rctx))
+                = self.endpoint_modify.try_pop().map_err(Self::map_ump_error)? {
             if let Some(render_pass) = modify_request.render_pass {
                 self.renderer.set_render_pass(render_pass);
             }
@@ -298,7 +309,8 @@ impl Window {
             rctx.reply(()).unwrap();
         }
 
-        while let Some((event, rctx)) = self.endpoint_event.try_pop().unwrap() {
+        while let Some((event, rctx))
+                = self.endpoint_event.try_pop().map_err(Self::map_ump_error)? {
             let window_id = self.target.winit_window().id();
             match event {
                 WindowEventRequest::Window(event) => match event {
