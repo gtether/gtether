@@ -1,11 +1,14 @@
 extern crate nalgebra_glm as glm;
 
 use std::cell::{OnceCell, RefCell};
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 
 use glm::identity;
 use tracing::{event, Level};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
@@ -13,6 +16,7 @@ use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentSt
 use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
 use gtether::console::{Console, ConsoleStdinReader};
 use gtether::console::command::{Command, CommandError, CommandRegistry, CommandTree, ParamCountCheck};
+use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::render_pass::EngineRenderPassBuilder;
@@ -130,6 +134,40 @@ impl Command for PointLightAddCommand {
     }
 }
 
+struct ConsoleDumpCommand {
+    log: Arc<ConsoleLog>,
+}
+
+impl Debug for ConsoleDumpCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleDumpCommand").finish_non_exhaustive()
+    }
+}
+
+impl Command for ConsoleDumpCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::OneOf(vec![
+            ParamCountCheck::Equal(0),
+            ParamCountCheck::Equal(1),
+        ]).check(parameters.len() as u32)?;
+
+        let count: usize = if parameters.len() == 1 {
+            parameters[0].parse()
+                .map_err(|e| CommandError::CommandFailure(Box::new(e)))?
+        } else {
+            10
+        };
+
+        self.log.iter()
+            .rev()
+            .take(count)
+            .rev()
+            .for_each(|log_entry| println!("{log_entry}"));
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Camera {
     pos: glm::TVec3<f32>,
@@ -164,7 +202,8 @@ impl Camera {
     }
 }
 
-struct AppCore {
+struct WindowsApp {
+    console: Arc<Console>,
     window: OnceCell<WindowHandle>,
     mn: OnceCell<Arc<Uniform<MN>>>,
     vp: OnceCell<Arc<Uniform<VP>>>,
@@ -172,9 +211,16 @@ struct AppCore {
     input: OnceCell<InputDelegate>,
 }
 
-impl AppCore {
+impl WindowsApp {
     fn new() -> Self {
+        let console = Arc::new(Console::builder()
+            .log(ConsoleLog::new(10))
+            .build());
+
+        ConsoleStdinReader::start(&console);
+
         Self {
+            console,
             window: OnceCell::new(),
             mn: OnceCell::new(),
             vp: OnceCell::new(),
@@ -184,9 +230,9 @@ impl AppCore {
     }
 }
 
-impl Application for AppCore {
+impl Application for WindowsApp {
     fn init(&self, _engine: &Engine<Self>, registry: &mut Registry) {
-        let mut console = Console::default();
+        let mut cmd_registry = self.console.registry();
 
         let mut model = identity();
         model = glm::translate(&model, &glm::vec3(0.0, 0.0, -5.0));
@@ -212,7 +258,7 @@ impl Application for AppCore {
 
         let ambient_renderer = AmbientRenderer::new(window.render_target());
         let ambient_light = ambient_renderer.light().clone();
-        console.register_command("ambient", Box::new(AmbientLightCommand {
+        cmd_registry.register_command("ambient", Box::new(AmbientLightCommand {
             ambient_light,
         })).unwrap();
 
@@ -239,7 +285,7 @@ impl Application for AppCore {
             point_lights: point_lights.clone()
         })).unwrap();
         point_light_subcommands.register_alias("a", "add").unwrap();
-        console
+        cmd_registry
             .register_command("point", Box::new(point_light_subcommands)).unwrap()
             .register_alias("points", "point").unwrap();
 
@@ -282,13 +328,14 @@ impl Application for AppCore {
             .build();
         window.set_render_pass(render_pass);
 
+        cmd_registry.register_command("dump", Box::new(ConsoleDumpCommand {
+            log: self.console.log().clone(),
+        })).unwrap();
+
         self.input.set(window.input_state().create_delegate()).unwrap();
         self.window.set(window).unwrap();
         self.mn.set(mn).unwrap();
         self.vp.set(vp).unwrap();
-
-        let console = Arc::new(console);
-        ConsoleStdinReader::start(&console);
     }
 
     fn tick(&self, engine: &Engine<Self>, delta: Duration) {
@@ -366,16 +413,20 @@ impl Application for AppCore {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    let app = WindowsApp::new();
 
-    let core = AppCore::new();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .finish()
+        .with(ConsoleLogLayer::new(app.console.log()))
+        .init();
 
     EngineBuilder::new()
         .metadata(EngineMetadata {
             application_name: Some(String::from("gTether Example - windows")),
             ..Default::default()
         })
-        .app(core)
+        .app(app)
         .build()
         .start();
 }
