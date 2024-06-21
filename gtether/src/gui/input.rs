@@ -54,7 +54,7 @@ impl Default for StateManager {
 
 impl StateManager {
     fn set_key(&self, key_code: KeyCode, state: ElementState) {
-        event!(Level::TRACE, "Key state change: {key_code:?} - {state:?}");
+        event!(Level::TRACE, ?key_code, ?state, "Key state change");
         let mut inner = self.keys.write();
         match state {
             ElementState::Pressed => inner.insert(key_code),
@@ -63,12 +63,12 @@ impl StateManager {
     }
 
     fn set_modifiers(&self, modifiers: ModifiersState) {
-        event!(Level::TRACE, "Modifiers state change: {modifiers:?}");
+        event!(Level::TRACE, ?modifiers, "Modifiers state change");
         *self.modifiers.write() = modifiers;
     }
 
     fn set_mouse_button(&self, button: MouseButton, state: ElementState) {
-        event!(Level::TRACE, "Mouse button state change: {button:?} - {state:?}");
+        event!(Level::TRACE, ?button, ?state, "Mouse button state change");
         let mut mouse_buttons = self.mouse_buttons.write();
         match state {
             ElementState::Pressed => mouse_buttons.insert(button),
