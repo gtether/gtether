@@ -1,13 +1,15 @@
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use vulkano::VulkanLibrary;
-use vulkano::swapchain::Surface;
-use vulkano::instance::{Instance, InstanceCreateInfo};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-use window::WindowManager;
+
+use vulkano::instance::InstanceExtensions;
+use vulkano::swapchain::Surface;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
-use std::sync::atomic::Ordering;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
+
+use window::WindowManager;
+
 use crate::{Application, Engine, EngineState, Registry};
 use crate::gui::window::{CreateWindowInfo, WindowHandle};
 
@@ -30,13 +32,13 @@ impl WindowRegistry<'_> {
     }
 }
 
-pub(crate) struct WindowAppHandler<A: Application> {
+pub(crate) struct WindowOrchestrator<A: Application> {
     engine: Engine<A>,
     manager: WindowManager,
     last_tick: Instant,
 }
 
-impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
+impl<A: Application> ApplicationHandler for WindowOrchestrator<A> {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         match (cause, self.engine.state) {
             (StartCause::Poll, EngineState::Running) => {
@@ -93,28 +95,12 @@ impl<A: Application> ApplicationHandler for WindowAppHandler<A> {
     }
 }
 
-impl<A: Application> WindowAppHandler<A> {
-    pub(crate) fn start(engine: Engine<A>) {
-        let event_loop = EventLoop::builder()
-            .build().unwrap();
-        event_loop.set_control_flow(ControlFlow::Poll);
-
-        // TODO: extract library + instance if they are required somewhere besides windowing
-        let library = VulkanLibrary::new()
-            .expect("Failed to load Vulkan library/DLL");
-
-        let required_extensions = Surface::required_extensions(&event_loop);
-
-        let vulkan_instance = Instance::new(library, InstanceCreateInfo {
-            application_name: engine.metadata().application_name.clone(),
-            engine_name: Some("gTether".to_owned()),
-            // TODO: Engine version
-            // engine_version: ,
-            enabled_extensions: required_extensions,
-            ..Default::default()
-        }).expect("Failed to create instance");
-
-        let manager = WindowManager::new(engine.metadata().clone(), vulkan_instance);
+impl<A: Application> WindowOrchestrator<A> {
+    pub(crate) fn start(engine: Engine<A>, event_loop: EventLoop<()>) {
+        let manager = WindowManager::new(
+            engine.metadata().clone(),
+            engine.render_instance().clone(),
+        );
 
         let mut handler = Self {
             engine,
@@ -124,5 +110,29 @@ impl<A: Application> WindowAppHandler<A> {
 
         event_loop.run_app(&mut handler)
             .expect("Failed to run winit loop");
+    }
+}
+
+pub(crate) struct WindowOrchestratorStarter {
+    event_loop: EventLoop<()>,
+}
+
+impl WindowOrchestratorStarter {
+    pub(crate) fn new() -> Self {
+        let event_loop = EventLoop::builder()
+            .build().unwrap();
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        Self {
+            event_loop,
+        }
+    }
+
+    pub(crate) fn render_extensions(&self) -> InstanceExtensions {
+        Surface::required_extensions(&self.event_loop)
+    }
+
+    pub(crate) fn start<A: Application>(self, engine: Engine<A>) {
+        WindowOrchestrator::start(engine, self.event_loop)
     }
 }

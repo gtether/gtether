@@ -4,7 +4,6 @@ use std::{fmt, thread};
 use tracing::{event, Level};
 
 use ump::Error;
-use vulkano::instance::Instance;
 use vulkano::swapchain::Surface;
 use winit::dpi::PhysicalSize;
 use winit::error::ExternalError;
@@ -14,7 +13,7 @@ use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
 use crate::{EngineMetadata, NonExhaustive};
 use crate::gui::input::{InputEvent, InputState};
-use crate::render::{Device, Dimensions, RenderTarget};
+use crate::render::{Device, Dimensions, Instance, RenderTarget};
 use crate::render::render_pass::{EngineRenderPass, EngineRenderPassBuilder};
 use crate::render::Renderer;
 
@@ -29,7 +28,7 @@ struct WindowRenderTarget {
 impl WindowRenderTarget {
     fn new(winit_window: Arc<WinitWindow>, instance: Arc<Instance>) -> Self {
         let surface = Surface::from_window(
-            instance.clone(),
+            instance.vk_instance().clone(),
             winit_window.clone(),
         ).unwrap();
 
@@ -359,15 +358,15 @@ struct WindowEntry {
 
 pub(in crate::gui) struct WindowManager {
     engine_metadata: EngineMetadata,
-    vulkan_instance: Arc<Instance>,
+    render_instance: Arc<Instance>,
     windows: HashMap<WindowId, WindowEntry>,
 }
 
 impl WindowManager {
-    pub(in crate::gui) fn new(engine_metadata: EngineMetadata, vulkan_instance: Arc<Instance>) -> Self {
+    pub(in crate::gui) fn new(engine_metadata: EngineMetadata, render_instance: Arc<Instance>) -> Self {
         Self {
             engine_metadata,
-            vulkan_instance,
+            render_instance,
             windows: HashMap::new(),
         }
     }
@@ -380,7 +379,7 @@ impl WindowManager {
         let (handle, join_handle) = Window::new(
             create_info.attributes,
             event_loop,
-            &self.vulkan_instance,
+            &self.render_instance,
             &self.engine_metadata,
         );
         self.windows.insert(handle.id(), WindowEntry {

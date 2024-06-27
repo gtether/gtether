@@ -1,25 +1,62 @@
 use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
+use std::ops::Deref;
 use std::sync::Arc;
 use tracing::{event, Level};
 
-use vulkano::{Validated, VulkanError};
+use vulkano::{Validated, VulkanError, VulkanLibrary};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::device::{Device as VKDevice, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::format::Format;
-use vulkano::instance::Instance;
+use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::swapchain::{Surface, SurfaceCapabilities};
 use vulkano::sync::GpuFuture;
-
+use crate::EngineMetadata;
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::swapchain::Swapchain;
 
 pub mod render_pass;
 pub mod swapchain;
+mod text;
+
+pub struct Instance {
+    inner: Arc<VKInstance>,
+}
+
+impl Instance {
+    pub(crate) fn new(engine_metadata: &EngineMetadata, extensions: InstanceExtensions) -> Self {
+        let library = VulkanLibrary::new()
+            .expect("Failed to load Vulkan library/DLL");
+
+        let inner = VKInstance::new(library, InstanceCreateInfo {
+            application_name: engine_metadata.application_name.clone(),
+            engine_name: Some("gTether".to_owned()),
+            // TODO: Engine version
+            // engine_version: ,
+            enabled_extensions: extensions,
+            ..Default::default()
+        }).expect("Failed to create instance");
+
+        Self {
+            inner,
+        }
+    }
+
+    #[inline]
+    pub fn vk_instance(&self) -> &Arc<VKInstance> { &self.inner }
+}
+
+impl Deref for Instance {
+    type Target = Arc<VKInstance>;
+
+    fn deref(&self) -> &Self::Target {
+        self.vk_instance()
+    }
+}
 
 /// Collection of Vulkano structs that together represent a rendering device.
 ///
@@ -125,6 +162,14 @@ impl Device {
     /// The [vulkano::device::Queue] used for this device.
     #[inline]
     pub fn queue(&self) -> &Arc<Queue> { &self.queue }
+}
+
+impl Deref for Device {
+    type Target = Arc<VKDevice>;
+
+    fn deref(&self) -> &Self::Target {
+        self.vk_device()
+    }
 }
 
 /// Wrapper around an array of two u32s, that is used to represent width/height dimensions.
