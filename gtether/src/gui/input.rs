@@ -226,7 +226,8 @@ impl InputDelegate {
     /// The loop will block and wait for new events when done handling current events, and does not
     /// operate at a consistent interval. If consistent intervals are required (such as 60 "ticks"
     /// per second), it may be more suitable to use a custom loop that calls [Self::events()].
-    pub fn start(self, handler: impl Fn(&InputDelegate, InputDelegateEvent)) -> ! {
+    // TODO: Is 'mut handler' and 'FnMut' correct here?
+    pub fn start(self, mut handler: impl FnMut(&InputDelegate, InputDelegateEvent)) -> ! {
         loop {
             // TODO: Possibly break the loop if an error occurred? As that means the sender was disconnected
             let event = self.receiver.recv().unwrap();
@@ -338,6 +339,8 @@ impl DelegateManager {
             id,
             priority,
         });
+
+        event!(Level::TRACE, id, priority, "Locked input delegate");
     }
 
     fn unlock(&self, id: usize) {
@@ -345,7 +348,9 @@ impl DelegateManager {
             panic!("Tried to unlock input delegate (id=={id}) that doesn't exist in this manager {self:?}");
         }
 
-        self.locks.write().retain(|lock| lock.id != id)
+        self.locks.write().retain(|lock| lock.id != id);
+
+        event!(Level::TRACE, id, "Unlocked input delegate");
     }
 
     fn is_locked(&self) -> bool {
