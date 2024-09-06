@@ -128,12 +128,12 @@ impl ConsoleBuilder {
 /// # struct MyCommand {}
 /// #
 /// # impl Command for MyCommand {
-/// #     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> { todo!() }
-/// #     fn options(&self, parameters: &[String]) -> Vec<String> { todo!() }
+/// #     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> { Ok(()) }
+/// #     fn options(&self, parameters: &[String]) -> Vec<String> { Vec::new() }
 /// # }
 /// #
 /// # impl MyCommand {
-/// #     fn new() -> Self { todo!() }
+/// #     fn new() -> Self { Self {} }
 /// # }
 /// #
 /// # let console = Console::builder().build();
@@ -177,7 +177,7 @@ impl CommandRegistry for ConsoleCommandRegistry<'_> {
 /// use std::sync::Arc;
 /// use gtether::console::{Console, ConsoleStdinReader};
 ///
-/// let console = Console::default();
+/// let console = Console::builder().build();
 /// // Configure the console...
 ///
 /// let console = Arc::new(console);
