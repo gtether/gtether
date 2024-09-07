@@ -16,6 +16,7 @@ use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentSt
 use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
 use gtether::console::{Console, ConsoleStdinReader};
 use gtether::console::command::{Command, CommandError, CommandRegistry, CommandTree, ParamCountCheck};
+use gtether::console::gui::{ConsoleGui, ConsoleGuiCreateInfo};
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
@@ -214,7 +215,7 @@ struct WindowsApp {
 impl WindowsApp {
     fn new() -> Self {
         let console = Arc::new(Console::builder()
-            .log(ConsoleLog::new(10))
+            .log(ConsoleLog::new(1000))
             .build());
 
         ConsoleStdinReader::start(&console);
@@ -289,6 +290,12 @@ impl Application for WindowsApp {
             .register_command("point", Box::new(point_light_subcommands)).unwrap()
             .register_alias("points", "point").unwrap();
 
+        let (_, console_renderer) = ConsoleGui::new(
+            self.console.clone(),
+            &window,
+            ConsoleGuiCreateInfo::default(),
+        );
+
         let render_pass = EngineRenderPassBuilder::new(window.render_target())
             .attachment("color".into(), AttachmentDescription {
                 format: Format::A2B10G10R10_UNORM_PACK32,
@@ -324,6 +331,7 @@ impl Application for WindowsApp {
             .color_attachment("final_color".into())
             .handler(Box::new(ambient_renderer))
             .handler(Box::new(directional_renderer))
+            .handler(console_renderer)
             .end_subpass()
             .build();
         window.set_render_pass(render_pass);
@@ -382,19 +390,19 @@ impl Application for WindowsApp {
             }
         }
 
-        if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap_or(false) {
             camera.pos += orient * distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap_or(false) {
             camera.pos += orient * -distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap_or(false) {
             camera.pos += right * distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap_or(false) {
             camera.pos += right * -distance;
             changed = true;
         }
@@ -406,7 +414,7 @@ impl Application for WindowsApp {
             vp_uniform.set(vp);
         }
 
-        if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap_or(false) {
             engine.request_exit();
         }
     }
