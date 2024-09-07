@@ -1,25 +1,173 @@
 extern crate nalgebra_glm as glm;
 
 use std::cell::{OnceCell, RefCell};
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 
 use glm::identity;
+use tracing::{event, Level};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
-use gtether::{Engine, EngineBuilder, EngineMetadata, Application, Registry};
+use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
+use gtether::console::{Console, ConsoleStdinReader};
+use gtether::console::command::{Command, CommandError, CommandRegistry, CommandTree, ParamCountCheck};
+use gtether::console::gui::{ConsoleGui, ConsoleGuiCreateInfo};
+use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
-use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
+use gtether::render::render_pass::EngineRenderPassBuilder;
 
-use crate::render::{MN, Uniform, VP};
-use crate::render::ambient::AmbientRenderer;
+use crate::render::{MN, Uniform, UniformSet, VP};
+use crate::render::ambient::{AmbientLight, AmbientRenderer};
 use crate::render::cube::CubeRenderer;
 use crate::render::directional::{DirectionalRenderer, PointLight};
 
 mod render;
+
+#[derive(Debug)]
+struct AmbientLightCommand {
+    ambient_light: Arc<Uniform<AmbientLight>>,
+}
+
+impl Command for AmbientLightCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::Equal(3).check(parameters.len() as u32)?;
+
+        let r: f32 = parameters[0].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+        let g: f32 = parameters[1].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+        let b: f32 = parameters[2].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+
+        self.ambient_light.set(AmbientLight::new(r, g, b, 1.0));
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PointLightListCommand {
+    point_lights: Arc<UniformSet<PointLight>>,
+}
+
+impl Command for PointLightListCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
+
+        for (idx, point_light) in self.point_lights.get().into_iter().enumerate() {
+            event!(Level::INFO, "{idx}: {point_light:?}");
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PointLightDeleteCommand {
+    point_lights: Arc<UniformSet<PointLight>>,
+}
+
+impl Command for PointLightDeleteCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::Equal(1).check(parameters.len() as u32)?;
+
+        let mut point_lights = self.point_lights.get();
+
+        let idx: usize = parameters[0].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+
+        if idx >= point_lights.len() {
+            return Err(CommandError::CommandFailure(format!("Index out of bounds: {idx}").as_str().into()))
+        }
+
+        point_lights.remove(idx);
+        self.point_lights.set(point_lights);
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PointLightAddCommand {
+    point_lights: Arc<UniformSet<PointLight>>,
+}
+
+impl Command for PointLightAddCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::OneOf(vec![
+            ParamCountCheck::Equal(3),
+            ParamCountCheck::Equal(6),
+        ]).check(parameters.len() as u32)?;
+
+        let x: f32 = parameters[0].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+        let y: f32 = parameters[1].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+        let z: f32 = parameters[2].parse()
+            .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+
+        let mut r: f32 = 1.0;
+        let mut g: f32 = 1.0;
+        let mut b: f32 = 1.0;
+        if parameters.len() == 6 {
+            r = parameters[3].parse()
+                .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+            g = parameters[4].parse()
+                .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+            b = parameters[5].parse()
+                .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
+        }
+
+        let mut point_lights = self.point_lights.get();
+        point_lights.push(PointLight {
+            position: [x, y, z, 1.0],
+            color: [r, g, b],
+        });
+        self.point_lights.set(point_lights);
+
+        Ok(())
+    }
+}
+
+struct ConsoleDumpCommand {
+    log: Arc<ConsoleLog>,
+}
+
+impl Debug for ConsoleDumpCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleDumpCommand").finish_non_exhaustive()
+    }
+}
+
+impl Command for ConsoleDumpCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::OneOf(vec![
+            ParamCountCheck::Equal(0),
+            ParamCountCheck::Equal(1),
+        ]).check(parameters.len() as u32)?;
+
+        let count: usize = if parameters.len() == 1 {
+            parameters[0].parse()
+                .map_err(|e| CommandError::CommandFailure(Box::new(e)))?
+        } else {
+            10
+        };
+
+        self.log.iter()
+            .rev()
+            .take(count)
+            .rev()
+            .for_each(|log_entry| println!("{log_entry}"));
+
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Camera {
@@ -55,7 +203,8 @@ impl Camera {
     }
 }
 
-struct AppCore {
+struct WindowsApp {
+    console: Arc<Console>,
     window: OnceCell<WindowHandle>,
     mn: OnceCell<Arc<Uniform<MN>>>,
     vp: OnceCell<Arc<Uniform<VP>>>,
@@ -63,9 +212,16 @@ struct AppCore {
     input: OnceCell<InputDelegate>,
 }
 
-impl AppCore {
+impl WindowsApp {
     fn new() -> Self {
+        let console = Arc::new(Console::builder()
+            .log(ConsoleLog::new(1000))
+            .build());
+
+        ConsoleStdinReader::start(&console);
+
         Self {
+            console,
             window: OnceCell::new(),
             mn: OnceCell::new(),
             vp: OnceCell::new(),
@@ -75,8 +231,10 @@ impl AppCore {
     }
 }
 
-impl Application for AppCore {
+impl Application for WindowsApp {
     fn init(&self, _engine: &Engine<Self>, registry: &mut Registry) {
+        let mut cmd_registry = self.console.registry();
+
         let mut model = identity();
         model = glm::translate(&model, &glm::vec3(0.0, 0.0, -5.0));
         model = glm::rotate_normalized_axis(&model, 1.0, &glm::vec3(0.0, 1.0, 0.0));
@@ -100,16 +258,43 @@ impl Application for AppCore {
         });
 
         let ambient_renderer = AmbientRenderer::new(window.render_target());
-        // let ambient_light = ambient_renderer.light().clone();
+        let ambient_light = ambient_renderer.light().clone();
+        cmd_registry.register_command("ambient", Box::new(AmbientLightCommand {
+            ambient_light,
+        })).unwrap();
 
         let directional_renderer = DirectionalRenderer::new(window.render_target());
         let point_lights = directional_renderer.lights().clone();
         point_lights.set(vec![
             PointLight {
                 position: [-4.0, -4.0, 0.0, 1.0],
-                color: [1.0, 1.0, 1.0],
+                color: [0.8, 0.8, 0.8],
             },
         ]);
+
+        let mut point_light_subcommands = CommandTree::default();
+        point_light_subcommands.register_command("list", Box::new(PointLightListCommand {
+            point_lights: point_lights.clone()
+        })).unwrap();
+        point_light_subcommands.register_alias("l", "list").unwrap();
+        point_light_subcommands.register_command("delete", Box::new(PointLightDeleteCommand {
+            point_lights: point_lights.clone()
+        })).unwrap();
+        point_light_subcommands.register_alias("del", "delete").unwrap();
+        point_light_subcommands.register_alias("d", "delete").unwrap();
+        point_light_subcommands.register_command("add", Box::new(PointLightAddCommand {
+            point_lights: point_lights.clone()
+        })).unwrap();
+        point_light_subcommands.register_alias("a", "add").unwrap();
+        cmd_registry
+            .register_command("point", Box::new(point_light_subcommands)).unwrap()
+            .register_alias("points", "point").unwrap();
+
+        let (_, console_renderer) = ConsoleGui::new(
+            self.console.clone(),
+            &window,
+            ConsoleGuiCreateInfo::default(),
+        );
 
         let render_pass = EngineRenderPassBuilder::new(window.render_target())
             .attachment("color".into(), AttachmentDescription {
@@ -146,9 +331,14 @@ impl Application for AppCore {
             .color_attachment("final_color".into())
             .handler(Box::new(ambient_renderer))
             .handler(Box::new(directional_renderer))
+            .handler(console_renderer)
             .end_subpass()
             .build();
         window.set_render_pass(render_pass);
+
+        cmd_registry.register_command("dump", Box::new(ConsoleDumpCommand {
+            log: self.console.log().clone(),
+        })).unwrap();
 
         self.input.set(window.input_state().create_delegate()).unwrap();
         self.window.set(window).unwrap();
@@ -200,19 +390,19 @@ impl Application for AppCore {
             }
         }
 
-        if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap_or(false) {
             camera.pos += orient * distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap_or(false) {
             camera.pos += orient * -distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap_or(false) {
             camera.pos += right * distance;
             changed = true;
         }
-        if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap_or(false) {
             camera.pos += right * -distance;
             changed = true;
         }
@@ -224,23 +414,27 @@ impl Application for AppCore {
             vp_uniform.set(vp);
         }
 
-        if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap() {
+        if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap_or(false) {
             engine.request_exit();
         }
     }
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    let app = WindowsApp::new();
 
-    let core = AppCore::new();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .finish()
+        .with(ConsoleLogLayer::new(app.console.log()))
+        .init();
 
     EngineBuilder::new()
         .metadata(EngineMetadata {
             application_name: Some(String::from("gTether Example - windows")),
             ..Default::default()
         })
-        .app(core)
+        .app(app)
         .build()
         .start();
 }

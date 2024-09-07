@@ -56,7 +56,7 @@ pub struct CubeRenderer {
 
 impl CubeRenderer {
     pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
-        let color = [1.0, 0.35, 0.137];
+        let color = [1.0, 1.0, 1.0];
 
         let vertices = [
             // Front

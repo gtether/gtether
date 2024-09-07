@@ -121,6 +121,7 @@ impl<T: Clone + BufferContents> Uniform<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct UniformSet<T: Clone + BufferContents> {
     inner: RwLock<Vec<UniformData<T>>>,
     refs: RwLock<UniformRefs>,

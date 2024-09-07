@@ -1,25 +1,64 @@
 use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
+use std::ops::Deref;
 use std::sync::Arc;
 use tracing::{event, Level};
 
-use vulkano::{Validated, VulkanError};
+use vulkano::{Validated, VulkanError, VulkanLibrary};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::device::{Device as VKDevice, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::format::Format;
-use vulkano::instance::Instance;
-use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::swapchain::{Surface, SurfaceCapabilities};
 use vulkano::sync::GpuFuture;
-
+use crate::EngineMetadata;
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::swapchain::Swapchain;
 
 pub mod render_pass;
 pub mod swapchain;
+pub mod font;
+
+pub struct Instance {
+    inner: Arc<VKInstance>,
+}
+
+impl Instance {
+    pub(crate) fn new(engine_metadata: &EngineMetadata, extensions: InstanceExtensions) -> Self {
+        let library = VulkanLibrary::new()
+            .expect("Failed to load Vulkan library/DLL");
+
+        let inner = VKInstance::new(library, InstanceCreateInfo {
+            application_name: engine_metadata.application_name.clone(),
+            engine_name: Some("gTether".to_owned()),
+            // TODO: Engine version
+            // engine_version: ,
+            enabled_extensions: extensions,
+            ..Default::default()
+        }).expect("Failed to create instance");
+
+        Self {
+            inner,
+        }
+    }
+
+    #[inline]
+    pub fn vk_instance(&self) -> &Arc<VKInstance> { &self.inner }
+}
+
+impl Deref for Instance {
+    type Target = Arc<VKInstance>;
+
+    fn deref(&self) -> &Self::Target {
+        self.vk_instance()
+    }
+}
 
 /// Collection of Vulkano structs that together represent a rendering device.
 ///
@@ -127,6 +166,15 @@ impl Device {
     pub fn queue(&self) -> &Arc<Queue> { &self.queue }
 }
 
+impl Deref for Device {
+    type Target = Arc<VKDevice>;
+
+    fn deref(&self) -> &Self::Target {
+        self.vk_device()
+    }
+}
+
+// TODO: Replace with glm
 /// Wrapper around an array of two u32s, that is used to represent width/height dimensions.
 pub struct Dimensions(pub [u32; 2]);
 
@@ -136,6 +184,12 @@ impl Dimensions {
     pub fn aspect_ratio(&self) -> f32 {
         self.0[0] as f32 / self.0[1] as f32
     }
+
+    #[inline]
+    pub fn width(&self) -> u32 { self.0[0] }
+
+    #[inline]
+    pub fn height(&self) -> u32 { self.0[1] }
 }
 
 impl From<Dimensions> for [u32; 2] {
@@ -153,6 +207,16 @@ impl From<Dimensions> for [f32; 2] {
     fn from(dimensions: Dimensions) -> [f32; 2] { dimensions.0.map(|v| v as f32) }
 }
 
+impl From<Dimensions> for glm::TVec2<u32> {
+    #[inline]
+    fn from(dimensions: Dimensions) -> Self { glm::vec2(dimensions.0[0], dimensions.0[1]) }
+}
+
+impl From<Dimensions> for glm::TVec2<f32> {
+    #[inline]
+    fn from(dimensions: Dimensions) -> Self { glm::vec2(dimensions.0[0] as f32, dimensions.0[1] as f32) }
+}
+
 /// Represents a target for rendering to.
 ///
 /// Custom render targets can be created by implementing this trait, but the gTether engine library
@@ -162,6 +226,8 @@ pub trait RenderTarget: Debug + Send + Sync + 'static {
     fn surface(&self) -> &Arc<Surface>;
     /// The [Dimensions] of the surface that is being rendered to.
     fn dimensions(&self) -> Dimensions;
+    /// The scale factor that should be applied to the surface for e.g. text rendering.
+    fn scale_factor(&self) -> f64;
     /// The [Device] for accessing device-specific structures.
     fn device(&self) -> &Arc<Device>;
 
@@ -285,5 +351,49 @@ impl Renderer {
     #[inline]
     pub fn mark_stale(&self) {
         self.stale.set(true);
+    }
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct FlatVertex {
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
+}
+
+impl FlatVertex {
+    pub fn rect(min: glm::TVec2<f32>, max: glm::TVec2<f32>) -> [FlatVertex; 6] {
+        [
+            FlatVertex { position: [ min.x, min.y ]},
+            FlatVertex { position: [ min.x, max.y ]},
+            FlatVertex { position: [ max.x, max.y ]},
+            FlatVertex { position: [ min.x, min.y ]},
+            FlatVertex { position: [ max.x, max.y ]},
+            FlatVertex { position: [ max.x, min.y ]},
+        ]
+    }
+
+    pub fn buffer(
+        alloc: Arc<dyn MemoryAllocator>,
+        min: glm::TVec2<f32>,
+        max: glm::TVec2<f32>,
+    ) -> Subbuffer<[Self]> {
+        Buffer::from_iter(
+            alloc,
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            Self::rect(min, max),
+        ).unwrap()
+    }
+
+    #[inline]
+    pub fn screen_buffer(alloc: Arc<dyn MemoryAllocator>) -> Subbuffer<[Self]> {
+        Self::buffer(alloc, glm::vec2(-1.0, -1.0), glm::vec2(1.0, 1.0))
     }
 }

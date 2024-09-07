@@ -4,7 +4,6 @@ use std::{fmt, thread};
 use tracing::{event, Level};
 
 use ump::Error;
-use vulkano::instance::Instance;
 use vulkano::swapchain::Surface;
 use winit::dpi::PhysicalSize;
 use winit::error::ExternalError;
@@ -14,7 +13,7 @@ use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
 use crate::{EngineMetadata, NonExhaustive};
 use crate::gui::input::{InputEvent, InputState};
-use crate::render::{Device, Dimensions, RenderTarget};
+use crate::render::{Device, Dimensions, Instance, RenderTarget};
 use crate::render::render_pass::{EngineRenderPass, EngineRenderPassBuilder};
 use crate::render::Renderer;
 
@@ -29,7 +28,7 @@ struct WindowRenderTarget {
 impl WindowRenderTarget {
     fn new(winit_window: Arc<WinitWindow>, instance: Arc<Instance>) -> Self {
         let surface = Surface::from_window(
-            instance.clone(),
+            instance.vk_instance().clone(),
             winit_window.clone(),
         ).unwrap();
 
@@ -68,6 +67,9 @@ impl RenderTarget for WindowRenderTarget {
 
     #[inline]
     fn dimensions(&self) -> Dimensions { self.winit_window.inner_size().into() }
+
+    #[inline]
+    fn scale_factor(&self) -> f64 { self.winit_window.scale_factor() }
 
     #[inline]
     fn device(&self) -> &Arc<Device> { &self.device }
@@ -280,12 +282,23 @@ impl Window {
         }
     }
 
+    fn map_ump_error(error: Error<()>) -> () {
+        match error {
+            Error::ClientsDisappeared => (),
+            Error::ServerDisappeared => (),
+            error => {
+                event!(Level::WARN, "Window endpoint failure, closing; {error:?}");
+            }
+        }
+    }
+
     fn tick(&mut self) -> Result<(), ()> {
         let mut status = Ok(());
 
         self.renderer.render();
 
-        while let Some((modify_request, rctx)) = self.endpoint_modify.try_pop().unwrap() {
+        while let Some((modify_request, rctx))
+                = self.endpoint_modify.try_pop().map_err(Self::map_ump_error)? {
             if let Some(render_pass) = modify_request.render_pass {
                 self.renderer.set_render_pass(render_pass);
             }
@@ -298,7 +311,8 @@ impl Window {
             rctx.reply(()).unwrap();
         }
 
-        while let Some((event, rctx)) = self.endpoint_event.try_pop().unwrap() {
+        while let Some((event, rctx))
+                = self.endpoint_event.try_pop().map_err(Self::map_ump_error)? {
             let window_id = self.target.winit_window().id();
             match event {
                 WindowEventRequest::Window(event) => match event {
@@ -347,15 +361,15 @@ struct WindowEntry {
 
 pub(in crate::gui) struct WindowManager {
     engine_metadata: EngineMetadata,
-    vulkan_instance: Arc<Instance>,
+    render_instance: Arc<Instance>,
     windows: HashMap<WindowId, WindowEntry>,
 }
 
 impl WindowManager {
-    pub(in crate::gui) fn new(engine_metadata: EngineMetadata, vulkan_instance: Arc<Instance>) -> Self {
+    pub(in crate::gui) fn new(engine_metadata: EngineMetadata, render_instance: Arc<Instance>) -> Self {
         Self {
             engine_metadata,
-            vulkan_instance,
+            render_instance,
             windows: HashMap::new(),
         }
     }
@@ -368,7 +382,7 @@ impl WindowManager {
         let (handle, join_handle) = Window::new(
             create_info.attributes,
             event_loop,
-            &self.vulkan_instance,
+            &self.render_instance,
             &self.engine_metadata,
         );
         self.windows.insert(handle.id(), WindowEntry {

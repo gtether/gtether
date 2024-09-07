@@ -54,7 +54,7 @@ impl Default for StateManager {
 
 impl StateManager {
     fn set_key(&self, key_code: KeyCode, state: ElementState) {
-        event!(Level::TRACE, "Key state change: {key_code:?} - {state:?}");
+        event!(Level::TRACE, ?key_code, ?state, "Key state change");
         let mut inner = self.keys.write();
         match state {
             ElementState::Pressed => inner.insert(key_code),
@@ -63,12 +63,12 @@ impl StateManager {
     }
 
     fn set_modifiers(&self, modifiers: ModifiersState) {
-        event!(Level::TRACE, "Modifiers state change: {modifiers:?}");
+        event!(Level::TRACE, ?modifiers, "Modifiers state change");
         *self.modifiers.write() = modifiers;
     }
 
     fn set_mouse_button(&self, button: MouseButton, state: ElementState) {
-        event!(Level::TRACE, "Mouse button state change: {button:?} - {state:?}");
+        event!(Level::TRACE, ?button, ?state, "Mouse button state change");
         let mut mouse_buttons = self.mouse_buttons.write();
         match state {
             ElementState::Pressed => mouse_buttons.insert(button),
@@ -226,7 +226,8 @@ impl InputDelegate {
     /// The loop will block and wait for new events when done handling current events, and does not
     /// operate at a consistent interval. If consistent intervals are required (such as 60 "ticks"
     /// per second), it may be more suitable to use a custom loop that calls [Self::events()].
-    pub fn start(self, handler: impl Fn(&InputDelegate, InputDelegateEvent)) -> ! {
+    // TODO: Is 'mut handler' and 'FnMut' correct here?
+    pub fn start(self, mut handler: impl FnMut(&InputDelegate, InputDelegateEvent)) -> ! {
         loop {
             // TODO: Possibly break the loop if an error occurred? As that means the sender was disconnected
             let event = self.receiver.recv().unwrap();
@@ -338,6 +339,8 @@ impl DelegateManager {
             id,
             priority,
         });
+
+        event!(Level::TRACE, id, priority, "Locked input delegate");
     }
 
     fn unlock(&self, id: usize) {
@@ -345,7 +348,9 @@ impl DelegateManager {
             panic!("Tried to unlock input delegate (id=={id}) that doesn't exist in this manager {self:?}");
         }
 
-        self.locks.write().retain(|lock| lock.id != id)
+        self.locks.write().retain(|lock| lock.id != id);
+
+        event!(Level::TRACE, id, "Unlocked input delegate");
     }
 
     fn is_locked(&self) -> bool {

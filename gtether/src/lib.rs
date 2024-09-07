@@ -1,5 +1,8 @@
+#[cfg(test)] #[macro_use]
+extern crate assert_matches;
 extern crate nalgebra_glm as glm;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -7,6 +10,7 @@ use std::time::Duration;
 pub mod gui;
 #[cfg(feature = "graphics")]
 pub mod render;
+pub mod console;
 
 pub struct Registry<'a> {
     #[cfg(feature = "gui")]
@@ -52,6 +56,10 @@ pub struct Engine<A: Application> {
     state: EngineState,
     app: A,
     pub(crate) should_exit: AtomicBool,
+    #[cfg(feature = "graphics")]
+    render_instance: Arc<render::Instance>,
+    #[cfg(feature = "gui")]
+    window_starter: Option<gui::WindowOrchestratorStarter>,
 }
 
 impl<A: Application> Engine<A> {
@@ -64,9 +72,15 @@ impl<A: Application> Engine<A> {
     #[inline]
     pub fn state(&self) -> EngineState { self.state }
 
+    #[cfg(feature = "graphics")]
+    #[inline]
+    pub fn render_instance(&self) -> &Arc<render::Instance> { &self.render_instance }
+
     #[cfg(feature = "gui")]
     pub fn start(self) {
-        gui::WindowAppHandler::start(self);
+        let mut engine = self;
+        let starter = engine.window_starter.take().unwrap();
+        starter.start(engine);
     }
 
     #[cfg(not(feature = "gui"))]
@@ -108,6 +122,8 @@ impl<A: Application> Engine<A> {
 pub struct EngineBuilder<A: Application> {
     metadata: Option<EngineMetadata>,
     app: Option<A>,
+    #[cfg(feature = "graphics")]
+    render_extensions: vulkano::instance::InstanceExtensions,
 }
 
 impl<A: Application> EngineBuilder<A> {
@@ -115,6 +131,7 @@ impl<A: Application> EngineBuilder<A> {
         Self {
             metadata: None,
             app: None,
+            render_extensions: vulkano::instance::InstanceExtensions::default(),
         }
     }
 
@@ -128,6 +145,12 @@ impl<A: Application> EngineBuilder<A> {
         self
     }
 
+    #[cfg(feature = "graphics")]
+    pub fn render_extensions(mut self, extensions: vulkano::instance::InstanceExtensions) -> Self {
+        self.render_extensions |= extensions;
+        self
+    }
+
     pub fn build(self) -> Engine<A> {
         let metadata = self.metadata
             .expect(".metadata() is required");
@@ -135,11 +158,28 @@ impl<A: Application> EngineBuilder<A> {
         let app = self.app
             .expect(".app() is required");
 
+        #[cfg(feature = "gui")]
+        let window_starter = gui::WindowOrchestratorStarter::new();
+
+        #[cfg(feature = "graphics")]
+        let render_instance = {
+            let mut render_extensions = self.render_extensions;
+
+            #[cfg(feature = "gui")]
+            { render_extensions |= window_starter.render_extensions(); }
+
+            Arc::new(render::Instance::new(&metadata, render_extensions))
+        };
+
         Engine {
             metadata,
             state: EngineState::Init,
             app,
             should_exit: AtomicBool::new(false),
+            #[cfg(feature = "graphics")]
+            render_instance,
+            #[cfg(feature = "gui")]
+            window_starter: Some(window_starter),
         }
     }
 }
