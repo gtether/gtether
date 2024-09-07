@@ -12,7 +12,9 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
+ab_glyph = "0.2"
 chrono = "0.4"
+image = "0.25"
 nalgebra-glm = { version = "0.18.0", features = ["convert-bytemuck"]}
 parking_lot = "0.12"
 ringbuf = "0.4"

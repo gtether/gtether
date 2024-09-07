@@ -69,6 +69,9 @@ impl RenderTarget for WindowRenderTarget {
     fn dimensions(&self) -> Dimensions { self.winit_window.inner_size().into() }
 
     #[inline]
+    fn scale_factor(&self) -> f64 { self.winit_window.scale_factor() }
+
+    #[inline]
     fn device(&self) -> &Arc<Device> { &self.device }
 }
 

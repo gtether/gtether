@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::{event, Level};
 
 use vulkano::{Validated, VulkanError, VulkanLibrary};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
@@ -12,7 +13,8 @@ use vulkano::device::{Device as VKDevice, DeviceCreateInfo, DeviceExtensions, Qu
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::format::Format;
 use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
-use vulkano::memory::allocator::StandardMemoryAllocator;
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::swapchain::{Surface, SurfaceCapabilities};
 use vulkano::sync::GpuFuture;
 use crate::EngineMetadata;
@@ -21,7 +23,7 @@ use crate::render::swapchain::Swapchain;
 
 pub mod render_pass;
 pub mod swapchain;
-mod text;
+pub mod font;
 
 pub struct Instance {
     inner: Arc<VKInstance>,
@@ -172,6 +174,7 @@ impl Deref for Device {
     }
 }
 
+// TODO: Replace with glm
 /// Wrapper around an array of two u32s, that is used to represent width/height dimensions.
 pub struct Dimensions(pub [u32; 2]);
 
@@ -181,6 +184,12 @@ impl Dimensions {
     pub fn aspect_ratio(&self) -> f32 {
         self.0[0] as f32 / self.0[1] as f32
     }
+
+    #[inline]
+    pub fn width(&self) -> u32 { self.0[0] }
+
+    #[inline]
+    pub fn height(&self) -> u32 { self.0[1] }
 }
 
 impl From<Dimensions> for [u32; 2] {
@@ -198,6 +207,16 @@ impl From<Dimensions> for [f32; 2] {
     fn from(dimensions: Dimensions) -> [f32; 2] { dimensions.0.map(|v| v as f32) }
 }
 
+impl From<Dimensions> for glm::TVec2<u32> {
+    #[inline]
+    fn from(dimensions: Dimensions) -> Self { glm::vec2(dimensions.0[0], dimensions.0[1]) }
+}
+
+impl From<Dimensions> for glm::TVec2<f32> {
+    #[inline]
+    fn from(dimensions: Dimensions) -> Self { glm::vec2(dimensions.0[0] as f32, dimensions.0[1] as f32) }
+}
+
 /// Represents a target for rendering to.
 ///
 /// Custom render targets can be created by implementing this trait, but the gTether engine library
@@ -207,6 +226,8 @@ pub trait RenderTarget: Debug + Send + Sync + 'static {
     fn surface(&self) -> &Arc<Surface>;
     /// The [Dimensions] of the surface that is being rendered to.
     fn dimensions(&self) -> Dimensions;
+    /// The scale factor that should be applied to the surface for e.g. text rendering.
+    fn scale_factor(&self) -> f64;
     /// The [Device] for accessing device-specific structures.
     fn device(&self) -> &Arc<Device>;
 
@@ -330,5 +351,49 @@ impl Renderer {
     #[inline]
     pub fn mark_stale(&self) {
         self.stale.set(true);
+    }
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct FlatVertex {
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
+}
+
+impl FlatVertex {
+    pub fn rect(min: glm::TVec2<f32>, max: glm::TVec2<f32>) -> [FlatVertex; 6] {
+        [
+            FlatVertex { position: [ min.x, min.y ]},
+            FlatVertex { position: [ min.x, max.y ]},
+            FlatVertex { position: [ max.x, max.y ]},
+            FlatVertex { position: [ min.x, min.y ]},
+            FlatVertex { position: [ max.x, max.y ]},
+            FlatVertex { position: [ max.x, min.y ]},
+        ]
+    }
+
+    pub fn buffer(
+        alloc: Arc<dyn MemoryAllocator>,
+        min: glm::TVec2<f32>,
+        max: glm::TVec2<f32>,
+    ) -> Subbuffer<[Self]> {
+        Buffer::from_iter(
+            alloc,
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            Self::rect(min, max),
+        ).unwrap()
+    }
+
+    #[inline]
+    pub fn screen_buffer(alloc: Arc<dyn MemoryAllocator>) -> Subbuffer<[Self]> {
+        Self::buffer(alloc, glm::vec2(-1.0, -1.0), glm::vec2(1.0, 1.0))
     }
 }
