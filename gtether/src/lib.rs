@@ -11,6 +11,7 @@ pub mod gui;
 #[cfg(feature = "graphics")]
 pub mod render;
 pub mod console;
+pub mod resource;
 
 pub struct Registry<'a> {
     #[cfg(feature = "gui")]
