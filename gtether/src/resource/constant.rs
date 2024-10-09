@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::resource::manager::{ResourceSink, ResourceSource};
+use crate::resource::manager::{ResourceSource, ResourceWatcher};
 use crate::resource::path::ResourcePath;
 use crate::resource::ResourceLoadError;
 
@@ -30,7 +30,7 @@ impl ResourceSource for ConstantResourceSource {
         }
     }
 
-    fn watch(&self, _id: ResourcePath, _sink: ResourceSink) {
+    fn watch(&self, _id: ResourcePath, _watcher: ResourceWatcher) {
         // Noop because constant data can't change
     }
 

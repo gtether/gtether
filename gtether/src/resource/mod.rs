@@ -14,6 +14,7 @@ pub mod path;
 pub type ResourceLock<'a, T> = RwLockReadGuard<'a, T>;
 pub type ResourceMutLock<'a, T> = RwLockWriteGuard<'a, T>;
 
+#[derive(Debug)]
 pub struct Resource<T: Send + Sync + 'static> {
     value: RwLock<T>,
 }
@@ -79,20 +80,20 @@ impl<T: Send + Sync + 'static> ResourceMut<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ResourceLoadError {
     NotFound(ResourcePath),
     TypeMismatch{
         requested: TypeId,
         actual: TypeId,
     },
-    ReadError(Box<dyn Error>),
+    ReadError(Arc<dyn Error + Send + Sync + 'static>),
 }
 
 impl ResourceLoadError {
     #[inline]
-    pub fn from_error(e: impl Error + 'static) -> Self {
-        Self::ReadError(Box::new(e))
+    pub fn from_error(e: impl Error + Send + Sync + 'static) -> Self {
+        Self::ReadError(Arc::new(e))
     }
 }
 
@@ -111,7 +112,7 @@ impl Display for ResourceLoadError {
 
 impl Error for ResourceLoadError {}
 
-pub trait ResourceLoader<T: Send + Sync + 'static> {
+pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
     fn load(&self, data: Box<dyn Read>) -> Result<T, ResourceLoadError>;
 
     fn update(&self, resource: ResourceMut<T>, data: Box<dyn Read>)
