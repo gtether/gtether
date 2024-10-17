@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::io::Read;
 
-use crate::resource::manager::{ResourceSource, ResourceWatcher};
+use crate::resource::manager::ResourceWatcher;
 use crate::resource::path::ResourcePath;
 use crate::resource::ResourceLoadError;
+use crate::resource::source::{ResourceSource, ResourceSubDataResult, SourceIndex};
 
 pub struct ConstantResourceSource {
     raw: HashMap<ResourcePath, &'static [u8]>,
@@ -22,15 +22,15 @@ impl ConstantResourceSource {
 }
 
 impl ResourceSource for ConstantResourceSource {
-    fn load(&self, id: &ResourcePath) -> Result<Box<dyn Read>, ResourceLoadError> {
+    fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
         if let Some(data) = self.raw.get(id) {
-            Ok(Box::new(*data))
+            Ok(Box::new(*data).into())
         } else {
             Err(ResourceLoadError::NotFound(id.clone()))
         }
     }
 
-    fn watch(&self, _id: ResourcePath, _watcher: ResourceWatcher) {
+    fn watch(&self, _id: ResourcePath, _watcher: ResourceWatcher, _sub_idx: Option<SourceIndex>) {
         // Noop because constant data can't change
     }
 

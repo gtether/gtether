@@ -10,6 +10,7 @@ use crate::resource::path::ResourcePath;
 pub mod constant;
 pub mod manager;
 pub mod path;
+pub mod source;
 
 pub type ResourceLock<'a, T> = RwLockReadGuard<'a, T>;
 pub type ResourceMutLock<'a, T> = RwLockWriteGuard<'a, T>;

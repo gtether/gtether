@@ -1,6 +1,7 @@
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::io::Read;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Weak};
@@ -9,31 +10,29 @@ use std::thread::JoinHandle;
 use tracing::{event, Level};
 
 use crate::resource::path::ResourcePath;
+use crate::resource::source::{ResourceDataResult, ResourceSource, SourceIndex};
 use crate::resource::{Resource, ResourceLoadError, ResourceLoader, ResourceMut};
 
-pub trait ResourceSource: Send + Sync + 'static {
-    fn load(&self, id: &ResourcePath) -> Result<Box<dyn Read>, ResourceLoadError>;
-    fn watch(&self, id: ResourcePath, watcher: ResourceWatcher);
-    fn unwatch(&self, id: &ResourcePath);
-}
-
-impl<S: ResourceSource> From<S> for Box<dyn ResourceSource> {
-    #[inline]
-    fn from(value: S) -> Self {
-        Box::new(value)
-    }
-}
-
+#[derive(Debug, Clone)]
 pub struct ResourceWatcher {
     manager: Weak<ResourceManager>,
-    idx: usize,
+    idx: SourceIndex,
 }
 
 impl ResourceWatcher {
     #[inline]
     pub fn notify_update(&self, id: &ResourcePath) {
         if let Some(manager) = self.manager.upgrade() {
-            manager.notify_update(id.clone(), self.idx);
+            manager.notify_update(id.clone(), self.idx.clone());
+        }
+    }
+
+    #[inline]
+    pub fn clone_with_sub_index(&self, sub_idx: impl Into<SourceIndex>) -> Self {
+        let sub_idx = sub_idx.into();
+        Self {
+            manager: self.manager.clone(),
+            idx: self.idx.clone().with_sub_idx(Some(sub_idx)),
         }
     }
 }
@@ -91,6 +90,7 @@ enum CacheEntry {
     Loading(Arc<dyn Any + Send + Sync>),
     CachedValue {
         value: Weak<dyn Any + Send + Sync>,
+        source_idx: SourceIndex,
         update: Box<dyn (Fn(Box<dyn Read>) -> Result<(), ResourceLoadError>) + Send + Sync>,
     },
     CachedError(ResourceLoadError),
@@ -104,7 +104,12 @@ impl CacheEntry {
         Self::Loading(Arc::new(result))
     }
 
-    fn for_resource<T, L>(id: &ResourcePath, resource: Arc<Resource<T>>, loader: L) -> Self
+    fn for_resource<T, L>(
+        id: &ResourcePath,
+        resource: Arc<Resource<T>>,
+        loader: L,
+        source_idx: SourceIndex,
+    ) -> Self
     where
         T: Send + Sync + 'static,
         L: ResourceLoader<T> + 'static,
@@ -125,6 +130,7 @@ impl CacheEntry {
                     Ok(())
                 }
             }),
+            source_idx,
         }
     }
 
@@ -132,14 +138,19 @@ impl CacheEntry {
         Self::CachedError(load_error)
     }
 
-    fn for_load_result<T, L>(id: &ResourcePath, load_result: Result<Arc<Resource<T>>, ResourceLoadError>, loader: L) -> Self
+    fn for_load_result<T, L>(
+        id: &ResourcePath,
+        load_result: Result<Arc<Resource<T>>, ResourceLoadError>,
+        loader: L,
+        source_idx: SourceIndex,
+    ) -> Self
     where
         T: Send + Sync + 'static,
         L: ResourceLoader<T> + 'static,
     {
         match load_result {
             Ok(resource) => {
-                Self::for_resource(id, resource, loader)
+                Self::for_resource(id, resource, loader, source_idx)
             },
             Err(error) => {
                 Self::for_load_error(error)
@@ -164,7 +175,7 @@ impl CacheEntry {
                     )))
                 }
             },
-            CacheEntry::CachedValue { value, update: _ } => {
+            CacheEntry::CachedValue { value, .. } => {
                 if let Some(strong) = value.upgrade() {
                     let result = match strong.downcast::<Resource<T>>() {
                         Ok(resource) => Ok(resource),
@@ -183,6 +194,15 @@ impl CacheEntry {
             },
         }
     }
+
+    fn set_source_idx(&mut self, new_idx: SourceIndex) {
+        match self {
+            CacheEntry::CachedValue { source_idx, .. } => {
+                *source_idx = new_idx;
+            },
+            _ => {},
+        }
+    }
 }
 
 struct ResourceCache {
@@ -198,12 +218,17 @@ impl Default for ResourceCache {
 }
 
 impl ResourceCache {
-    fn insert<T, L>(&self, id: ResourcePath, load_result: ResourceLoadResult<T>, loader: L)
-    where
+    fn insert<T, L>(
+        &self,
+        id: ResourcePath,
+        load_result: ResourceLoadResult<T>,
+        loader: L,
+        source_idx: SourceIndex,
+    ) where
         T: Send + Sync + 'static,
         L: ResourceLoader<T> + 'static,
     {
-        let entry = CacheEntry::for_load_result(&id, load_result, loader);
+        let entry = CacheEntry::for_load_result(&id, load_result, loader, source_idx);
         self.inner.write().insert(id, entry);
     }
 
@@ -256,31 +281,39 @@ impl ResourceCache {
         }
     }
 
-    fn update(&self, id: &ResourcePath, source: &Box<dyn ResourceSource>)
-        -> Result<(), ResourceLoadError>
+    fn update(&self, id: &ResourcePath, source: &Box<dyn ResourceSource>, new_idx: &SourceIndex)
+              -> Result<(), ResourceLoadError>
     {
         let mut read = self.inner.upgradable_read();
         if let Some(entry) = read.get(id) {
             match entry {
                 CacheEntry::Loading(_) => {
                     event!(Level::WARN, %id, "Tried to update currently loading Resource");
-                    Ok(())
                 },
-                CacheEntry::CachedValue { value: _, update } => {
-                    let data = source.load(id)?;
-                    update(data)
+                CacheEntry::CachedValue { source_idx, update, .. } => {
+                    if new_idx <= source_idx {
+                        let data = match new_idx.sub_idx() {
+                            Some(sub_idx) => source.sub_load(id, sub_idx),
+                            None => source.load(id),
+                        }?.seal(new_idx.idx());
+                        update(data.data)?;
+                        read.with_upgraded(|write| {
+                            write.get_mut(id).unwrap().set_source_idx(data.source_idx);
+                        });
+                    } else {
+                        event!(Level::WARN, %id, %new_idx, %source_idx, "Tried to update Resource from lower priority source");
+                    }
                 },
                 CacheEntry::CachedError { .. } => {
                     read.with_upgraded(|write| {
                         write.remove(id);
                     });
-                    Ok(())
                 }
             }
         } else {
             event!(Level::WARN, %id, "Tried to update expired Resource");
-            Ok(())
         }
+        Ok(())
     }
 }
 
@@ -288,7 +321,7 @@ enum ManagerMessage {
     LoadTask(Box<dyn FnOnce() + Send>),
     UpdateTask {
         id: ResourcePath,
-        source_idx: usize,
+        source_idx: SourceIndex,
     },
     Stop,
 }
@@ -313,7 +346,7 @@ impl ResourceManager {
                         ManagerMessage::UpdateTask { id, source_idx } => {
                             let manager = task_weak.upgrade()
                                 .expect("ResourceManager background thread weak self-ref should not be broken");
-                            if let Err(err) = manager.update(&id, source_idx) {
+                            if let Err(err) = manager.update(&id, source_idx.clone()) {
                                 event!(Level::WARN, %id, %source_idx, %err, "Failed to update resource from source");
                             }
                         },
@@ -337,44 +370,42 @@ impl ResourceManager {
         ResourceManagerBuilder::default()
     }
 
-    fn watch_n(&self, id: &ResourcePath, n: usize) {
+    fn watch_n(&self, id: &ResourcePath, source_idx: &SourceIndex) {
         for (idx, source) in self.sources.iter().enumerate() {
-            if idx <= n {
+            if idx <= source_idx.idx() {
                 source.watch(id.clone(), ResourceWatcher {
                     manager: self.weak.clone(),
-                    idx,
-                });
+                    idx: SourceIndex::new(idx),
+                }, source_idx.sub_idx().map(|inner| inner.clone()));
             } else {
                 source.unwatch(id);
             }
         }
     }
 
-    // TODO: Replace source indices with more opaque sortable key that sources can generate
-    // TODO: Reject if update comes from source with lower priority
-    fn update(&self, id: &ResourcePath, source_idx: usize) -> Result<(), ResourceLoadError> {
-        if let Some(source) = self.sources.get(source_idx) {
-            self.cache.update(id, &source)?;
-            self.watch_n(id, source_idx);
+    fn update(&self, id: &ResourcePath, source_idx: SourceIndex) -> Result<(), ResourceLoadError> {
+        if let Some(source) = self.sources.get(source_idx.idx()) {
+            self.cache.update(id, &source, &source_idx)?;
+            self.watch_n(id, &source_idx);
         } else {
             event!(Level::WARN, %id, %source_idx, "Tried to update from non-existent source");
         }
         Ok(())
     }
 
-    fn notify_update(&self, id: ResourcePath, source_idx: usize) {
+    fn notify_update(&self, id: ResourcePath, source_idx: SourceIndex) {
         self.tx.send(ManagerMessage::UpdateTask { id, source_idx })
             .expect("ResourceManager background thread should be running");
     }
 
-    fn find_data(&self, id: &ResourcePath) -> Result<Option<(usize, Box<dyn Read>)>, ResourceLoadError> {
+    fn find_data(&self, id: &ResourcePath) -> Option<ResourceDataResult> {
         self.sources.iter().enumerate().find_map(|(idx, source)| {
             match source.load(id) {
-                Ok(data) => Some(Ok(Some((idx, data)))),
+                Ok(data) => Some(Ok(data.seal(idx))),
                 Err(ResourceLoadError::NotFound(_)) => None,
                 Err(e) => Some(Err(e)),
             }
-        }).unwrap_or(Ok(None))
+        })
     }
 
     fn load<T, L>(&self, id: ResourcePath, loader: L) -> ResourceLoadResult<T>
@@ -382,10 +413,12 @@ impl ResourceManager {
         T: Send + Sync + 'static,
         L: ResourceLoader<T> + 'static,
     {
-        if let Some((source_idx, data)) = self.find_data(&id)? {
-            let load_result = loader.load(data).map(|value| Arc::new(Resource::new(value)));
-            self.cache.insert(id.clone(), load_result.clone(), loader);
-            self.watch_n(&id, source_idx);
+        if let Some(result) = self.find_data(&id) {
+            let data = result?;
+            let load_result = loader.load(data.data)
+                .map(|value| Arc::new(Resource::new(value)));
+            self.cache.insert(id.clone(), load_result.clone(), loader, data.source_idx.clone());
+            self.watch_n(&id, &data.source_idx);
             load_result
         } else {
             Err(ResourceLoadError::NotFound(id))
@@ -467,13 +500,15 @@ impl ResourceManagerBuilder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::resource) mod tests {
     use super::*;
 
-    struct SyncReqContext(ump::WaitReply<(), ()>);
+    use crate::resource::source::ResourceSubDataResult;
+
+    pub struct SyncReqContext(ump::WaitReply<(), ()>);
 
     impl SyncReqContext {
-        fn wait(self) {
+        pub fn wait(self) {
             self.0.wait().unwrap();
         }
     }
@@ -484,7 +519,7 @@ mod tests {
         }
     }
 
-    struct SyncReplyContext(Option<ump::ReplyContext<(), ()>>);
+    pub struct SyncReplyContext(Option<ump::ReplyContext<(), ()>>);
 
     impl Drop for SyncReplyContext {
         fn drop(&mut self) {
@@ -499,7 +534,7 @@ mod tests {
         }
     }
 
-    struct LoaderSync {
+    pub struct LoaderSync {
         load_server: ump::Server<(), (), ()>,
         load_client: ump::Client<(), (), ()>,
         update_server: ump::Server<(), (), ()>,
@@ -507,7 +542,7 @@ mod tests {
     }
 
     impl LoaderSync {
-        fn new() -> Self {
+        pub fn new() -> Self {
             let (load_server, load_client) = ump::channel();
             let (update_server, update_client) = ump::channel();
             Self {
@@ -518,33 +553,33 @@ mod tests {
             }
         }
 
-        fn wait_load(&self) -> SyncReplyContext {
+        pub fn wait_load(&self) -> SyncReplyContext {
             let (_, ctx) = self.load_server.wait().unwrap();
             ctx.into()
         }
 
-        fn notify_load(&self) -> SyncReqContext {
+        pub fn notify_load(&self) -> SyncReqContext {
             // TODO: Add a timeout
             self.load_client.req_async(()).unwrap().into()
         }
 
-        fn wait_update(&self) -> SyncReplyContext {
+        pub fn wait_update(&self) -> SyncReplyContext {
             let (_, ctx) = self.update_server.wait().unwrap();
             ctx.into()
         }
 
-        fn notify_update(&self) -> SyncReqContext {
+        pub fn notify_update(&self) -> SyncReqContext {
             // TODO: Add a timeout
             self.update_client.req_async(()).unwrap().into()
         }
     }
 
-    struct TestResourceLoader {
+    pub struct TestResourceLoader {
         sync: Arc<LoaderSync>,
     }
 
     impl TestResourceLoader {
-        fn new() -> (Self, Arc<LoaderSync>) {
+        pub fn new() -> (Self, Arc<LoaderSync>) {
             let loader = Self {
                 sync: Arc::new(LoaderSync::new()),
             };
@@ -572,13 +607,13 @@ mod tests {
         }
     }
 
-    struct ResourceDataMap {
+    pub struct ResourceDataMap {
         raw: RwLock<HashMap<ResourcePath, &'static [u8]>>,
         watch_list: RwLock<HashMap<ResourcePath, ResourceWatcher>>,
     }
 
     impl ResourceDataMap {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 raw: RwLock::new(HashMap::new()),
                 watch_list: RwLock::new(HashMap::new()),
@@ -589,7 +624,7 @@ mod tests {
             self.raw.read().get(id).map(|r| *r)
         }
 
-        fn insert(&self, id: impl Into<ResourcePath>, data: &'static [u8]) {
+        pub fn insert(&self, id: impl Into<ResourcePath>, data: &'static [u8]) {
             let id = id.into();
             self.raw.write().insert(id.clone(), data);
             if let Some(watcher) = self.watch_list.read().get(&id) {
@@ -606,28 +641,30 @@ mod tests {
         }
     }
     
-    struct TestResourceSource {
+    pub struct TestResourceSource {
         inner: Arc<ResourceDataMap>,
     }
 
     impl TestResourceSource {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 inner: Arc::new(ResourceDataMap::new()),
             }
         }
+
+        pub fn data_map(&self) -> &Arc<ResourceDataMap> { &self.inner }
     }
     
     impl ResourceSource for TestResourceSource {
-        fn load(&self, id: &ResourcePath) -> Result<Box<dyn Read>, ResourceLoadError> {
+        fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
             if let Some(data) = self.inner.get(id) {
-                Ok(Box::new(data))
+                Ok(Box::new(data).into())
             } else {
                 Err(ResourceLoadError::NotFound(id.clone()))
             }
         }
 
-        fn watch(&self, id: ResourcePath, watcher: ResourceWatcher) {
+        fn watch(&self, id: ResourcePath, watcher: ResourceWatcher, _sub_idx: Option<SourceIndex>) {
             self.inner.watch(id, watcher);
         }
 
@@ -636,13 +673,24 @@ mod tests {
         }
     }
 
-    fn create_resource_manager() -> (Arc<ResourceManager>, Arc<ResourceDataMap>) {
+    pub fn create_resource_manager() -> (Arc<ResourceManager>, Arc<ResourceDataMap>) {
         let source = TestResourceSource::new();
-        let data_map = source.inner.clone();
+        let data_map = source.data_map().clone();
         let manager = ResourceManager::builder()
             .source(source)
             .build();
         (manager, data_map)
+    }
+
+    pub fn create_multi_resource_manager<const N: usize>() -> (Arc<ResourceManager>, [Arc<ResourceDataMap>; N]) {
+        let sources = core::array::from_fn::<_, N, _>(|_| TestResourceSource::new());
+        let data_maps = core::array::from_fn(|i| sources[i].data_map().clone());
+        let mut builder = ResourceManager::builder();
+        for source in sources {
+            builder = builder.source(source);
+        }
+        let manager = builder.build();
+        (manager, data_maps)
     }
 
     #[test]
@@ -720,7 +768,7 @@ mod tests {
         data_map.insert("key", b"new_value");
         assert_eq!(*value.read(), "value".to_owned());
         sync.notify_update().wait();
-        assert_eq!(*value.read(), "new_value");
+        assert_eq!(*value.read(), "new_value".to_owned());
     }
 
     #[test]
@@ -764,5 +812,41 @@ mod tests {
         let value = result.unwrap()
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "new_value".to_owned());
+    }
+
+    #[test]
+    fn test_resource_manager_priorities() {
+        let (manager, data_maps) = create_multi_resource_manager::<3>();
+        data_maps[1].insert("key", b"value_1");
+        data_maps[2].insert("key", b"value_2");
+
+        // Load should retrieve "value_1", as it's earlier in the priority chain
+        let (loader, sync) = TestResourceLoader::new();
+        let result = manager.get_or_load("key", loader);
+        sync.notify_load().wait();
+        let value = result.unwrap()
+            .expect("Resource should load for 'key'");
+        assert_eq!(*value.read(), "value_1".to_owned());
+
+        // Updating lower priority shouldn't change the value
+        data_maps[2].insert("key", b"new_value_2");
+        // TODO: Need some way to wait for "possible" update - may need to add test-only sync logic
+        //  in the actual data structures
+        assert_eq!(*value.read(), "value_1".to_owned());
+
+        // Updating same priority *should* change the value
+        data_maps[1].insert("key", b"new_value_1");
+        sync.notify_update().wait();
+        assert_eq!(*value.read(), "new_value_1");
+
+        // Updating higher priority *should* change the value
+        data_maps[0].insert("key", b"new_value_0");
+        sync.notify_update().wait();
+        assert_eq!(*value.read(), "new_value_0");
+
+        // Updating previously watched source shouldn't change the value
+        data_maps[1].insert("key", b"new_new_value_1");
+        // TODO: sync
+        assert_eq!(*value.read(), "new_value_0");
     }
 }
