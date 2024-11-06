@@ -1,8 +1,10 @@
+use async_trait::async_trait;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use smol::io::AsyncRead;
 use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
-use std::io::Read;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::resource::path::ResourcePath;
@@ -93,6 +95,11 @@ pub enum ResourceLoadError {
 
 impl ResourceLoadError {
     #[inline]
+    pub fn from_mismatch<T: Send + Sync + 'static>(actual: TypeId) -> Self {
+        Self::TypeMismatch { actual, requested: TypeId::of::<T>() }
+    }
+
+    #[inline]
     pub fn from_error(e: impl Error + Send + Sync + 'static) -> Self {
         Self::ReadError(Arc::new(e))
     }
@@ -113,13 +120,16 @@ impl Display for ResourceLoadError {
 
 impl Error for ResourceLoadError {}
 
-pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
-    fn load(&self, data: Box<dyn Read>) -> Result<T, ResourceLoadError>;
+pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 
-    fn update(&self, resource: ResourceMut<T>, data: Box<dyn Read>)
+#[async_trait]
+pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
+    async fn load(&self, data: ResourceReadData) -> Result<T, ResourceLoadError>;
+
+    async fn update(&self, resource: ResourceMut<T>, data: ResourceReadData)
         -> Result<(), ResourceLoadError>
     {
-        *resource.write() = self.load(data)?;
+        *resource.write() = self.load(data).await?;
         Ok(())
     }
 }

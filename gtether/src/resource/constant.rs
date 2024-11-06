@@ -1,9 +1,10 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 
-use crate::resource::manager::ResourceWatcher;
 use crate::resource::path::ResourcePath;
-use crate::resource::ResourceLoadError;
+use crate::resource::source::ResourceWatcher;
 use crate::resource::source::{ResourceSource, ResourceSubDataResult, SourceIndex};
+use crate::resource::ResourceLoadError;
 
 pub struct ConstantResourceSource {
     raw: HashMap<ResourcePath, &'static [u8]>,
@@ -21,8 +22,9 @@ impl ConstantResourceSource {
     }
 }
 
+#[async_trait]
 impl ResourceSource for ConstantResourceSource {
-    fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+    async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
         if let Some(data) = self.raw.get(id) {
             Ok(Box::new(*data).into())
         } else {
@@ -30,7 +32,7 @@ impl ResourceSource for ConstantResourceSource {
         }
     }
 
-    fn watch(&self, _id: ResourcePath, _watcher: ResourceWatcher, _sub_idx: Option<SourceIndex>) {
+    fn watch(&self, _id: ResourcePath, _watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
         // Noop because constant data can't change
     }
 

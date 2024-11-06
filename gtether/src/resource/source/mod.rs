@@ -1,20 +1,37 @@
+use async_trait::async_trait;
+use smol::io::AsyncRead;
 use std::cmp::Ordering;
-use std::fmt::{Display, Formatter};
-use std::io::Read;
+use std::fmt::{Debug, Display, Formatter};
 
-use crate::resource::manager::ResourceWatcher;
 use crate::resource::path::ResourcePath;
-use crate::resource::ResourceLoadError;
+use crate::resource::{ResourceLoadError, ResourceReadData};
 
 pub mod list;
 
 #[derive(Debug, Clone, Eq)]
 pub struct SourceIndex {
     idx: usize,
+    // TODO: Represent as enum with options for Min/Max for absolute comparison
     sub_idx: Option<Box<SourceIndex>>,
 }
 
 impl SourceIndex {
+    #[inline]
+    pub fn min() -> Self {
+        Self {
+            idx: usize::MIN,
+            sub_idx: None,
+        }
+    }
+
+    #[inline]
+    pub fn max() -> Self {
+        Self {
+            idx: usize::MAX,
+            sub_idx: None,
+        }
+    }
+
     #[inline]
     pub fn new(idx: usize) -> Self {
         Self {
@@ -89,13 +106,13 @@ impl PartialOrd for SourceIndex {
 }
 
 pub struct ResourceData {
-    pub data: Box<dyn Read>,
+    pub data: ResourceReadData,
     pub source_idx: SourceIndex,
 }
 
 pub enum ResourceSubData {
     SubIndex(ResourceData),
-    NoIndex(Box<dyn Read>),
+    NoIndex(ResourceReadData),
 }
 
 impl ResourceSubData {
@@ -118,22 +135,28 @@ impl ResourceSubData {
     }
 }
 
-impl<R: Read + 'static> From<Box<R>> for ResourceSubData {
+impl<R: AsyncRead + Unpin + Send + 'static> From<Box<R>> for ResourceSubData {
     #[inline]
     fn from(value: Box<R>) -> Self {
-        Self::NoIndex(value)
+        Self::NoIndex(Box::pin(value))
     }
 }
 
 pub type ResourceSubDataResult = Result<ResourceSubData, ResourceLoadError>;
 pub type ResourceDataResult = Result<ResourceData, ResourceLoadError>;
 
+pub trait ResourceWatcher: Debug + Send + Sync + 'static {
+    fn notify_update(&self, id: &ResourcePath);
+    fn clone_with_sub_index(&self, sub_idx: SourceIndex) -> Box<dyn ResourceWatcher>;
+}
+
+#[async_trait]
 pub trait ResourceSource: Send + Sync + 'static {
-    fn load(&self, id: &ResourcePath) -> ResourceSubDataResult;
-    fn sub_load(&self, id: &ResourcePath, _sub_idx: &SourceIndex) -> ResourceSubDataResult {
-        self.load(id)
+    async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult;
+    async fn sub_load(&self, id: &ResourcePath, _sub_idx: &SourceIndex) -> ResourceSubDataResult {
+        self.load(id).await
     }
-    fn watch(&self, id: ResourcePath, watcher: ResourceWatcher, sub_idx: Option<SourceIndex>);
+    fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>);
     fn unwatch(&self, id: &ResourcePath);
 }
 
