@@ -222,12 +222,19 @@ use crate::resource::{ResourceLoadError, ResourceReadData};
 pub mod list;
 pub mod constant;
 
+#[derive(Debug, Clone)]
+enum SubIndex {
+    None,
+    Some(Box<SourceIndex>),
+    Min,
+    Max,
+}
+
 /// Multi-layered index type that can be used to represent nested [ResourceSources][rs].
 ///
 /// Comparable index type that can nest sub-indices. SourceIndices that have the same index will
 /// check their sub-indices for further comparison, if they have one. If only one SourceIndex has
-/// a sub-index, comparison fails (meaning SourceIndex only implements [PartialOrd], and not
-/// [Ord][ord]).
+/// a sub-index, the SourceIndex without a sub-index takes priority (is ordered first).
 ///
 /// # Examples
 /// ```
@@ -250,13 +257,11 @@ pub mod constant;
 /// let total_index = total_index.with_sub_idx(None);
 /// ```
 ///
-/// [rs]: ResourceSource]
-/// [ord]: Ord
-#[derive(Debug, Clone, Eq)]
+/// [rs]: ResourceSource
+#[derive(Debug, Clone)]
 pub struct SourceIndex {
     idx: usize,
-    // TODO: Represent as enum with options for Min/Max for absolute comparison
-    sub_idx: Option<Box<SourceIndex>>,
+    sub_idx: SubIndex,
 }
 
 impl SourceIndex {
@@ -265,7 +270,7 @@ impl SourceIndex {
     pub fn min() -> Self {
         Self {
             idx: usize::MIN,
-            sub_idx: None,
+            sub_idx: SubIndex::Min,
         }
     }
 
@@ -274,7 +279,7 @@ impl SourceIndex {
     pub fn max() -> Self {
         Self {
             idx: usize::MAX,
-            sub_idx: None,
+            sub_idx: SubIndex::Max,
         }
     }
 
@@ -285,7 +290,7 @@ impl SourceIndex {
     pub fn new(idx: usize) -> Self {
         Self {
             idx,
-            sub_idx: None,
+            sub_idx: SubIndex::None,
         }
     }
 
@@ -294,7 +299,10 @@ impl SourceIndex {
     /// Can erase the sub-index by specifying None.
     #[inline]
     pub fn with_sub_idx(mut self, sub_idx: Option<impl Into<SourceIndex>>) -> Self {
-        self.sub_idx = sub_idx.map(|inner| Box::new(inner.into()));
+        self.sub_idx = match sub_idx {
+            Some(sub_idx) => SubIndex::Some(Box::new(sub_idx.into())),
+            None => SubIndex::None,
+        };
         self
     }
 
@@ -305,17 +313,23 @@ impl SourceIndex {
     /// Get the sub-index of this SourceIndex, if any.
     #[inline]
     pub fn sub_idx(&self) -> Option<&SourceIndex> {
-        self.sub_idx.as_ref().map(|inner| Box::as_ref(inner))
+        match &self.sub_idx {
+            SubIndex::Some(sub_idx) => Some(Box::as_ref(sub_idx)),
+            _ => None,
+        }
     }
 }
 
 impl Display for SourceIndex {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if let Some(sub_idx) = &self.sub_idx {
-            write!(f, "{}:", self.idx)?;
-            Display::fmt(&sub_idx, f)
-        } else {
-            write!(f, "{}", self.idx)
+        match &self.sub_idx {
+            SubIndex::Some(sub_idx) => {
+                write!(f, "{}:", self.idx)?;
+                Display::fmt(sub_idx, f)
+            },
+            SubIndex::None => write!(f, "{}", self.idx),
+            SubIndex::Min => write!(f, "{}:MIN", self.idx),
+            SubIndex::Max => write!(f, "{}:MAX", self.idx),
         }
     }
 }
@@ -330,10 +344,12 @@ impl PartialEq for SourceIndex {
     fn eq(&self, other: &Self) -> bool {
         if self.idx == other.idx {
             match (&self.sub_idx, &other.sub_idx) {
-                (Some(sub_a), Some(sub_b)) => {
+                (SubIndex::Some(sub_a), SubIndex::Some(sub_b)) => {
                     sub_a == sub_b
                 },
-                (None, None) => true,
+                (SubIndex::Min, SubIndex::Min) => true,
+                (SubIndex::Max, SubIndex::Max) => true,
+                (SubIndex::None, SubIndex::None) => true,
                 _ => false,
             }
         } else {
@@ -342,20 +358,33 @@ impl PartialEq for SourceIndex {
     }
 }
 
-impl PartialOrd for SourceIndex {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl Eq for SourceIndex {}
+
+impl Ord for SourceIndex {
+    fn cmp(&self, other: &Self) -> Ordering {
         match self.idx.cmp(&other.idx) {
             Ordering::Equal => {
                 match (&self.sub_idx, &other.sub_idx) {
-                    (Some(sub_a), Some(sub_b)) => {
-                        sub_a.partial_cmp(sub_b)
+                    (SubIndex::Some(sub_a), SubIndex::Some(sub_b)) => {
+                        sub_a.cmp(sub_b)
                     },
-                    (None, None) => Some(Ordering::Equal),
-                    _ => None,
+                    (SubIndex::Min, SubIndex::Min) => Ordering::Equal,
+                    (SubIndex::Max, SubIndex::Max) => Ordering::Equal,
+                    (SubIndex::Min, _) | (_, SubIndex::Max) => Ordering::Less,
+                    (_, SubIndex::Min) | (SubIndex::Max, _) => Ordering::Greater,
+                    (SubIndex::None, SubIndex::None) => Ordering::Equal,
+                    (SubIndex::None, SubIndex::Some(_)) => Ordering::Less,
+                    (SubIndex::Some(_), SubIndex::None) => Ordering::Greater,
                 }
             },
-            order => Some(order),
+            order => order,
         }
+    }
+}
+
+impl PartialOrd for SourceIndex {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -482,5 +511,56 @@ impl<S: ResourceSource> From<S> for Box<dyn ResourceSource> {
     #[inline]
     fn from(value: S) -> Self {
         Box::new(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sub_idx_cmp() {
+        assert_eq!(SourceIndex::new(0), SourceIndex::new(0));
+        assert_eq!(SourceIndex::new(42), SourceIndex::new(42));
+        assert_eq!(SourceIndex::new(1).with_sub_idx(Some(2)), SourceIndex::new(1).with_sub_idx(Some(2)));
+
+        assert!(SourceIndex::new(3) < SourceIndex::new(5));
+        assert!(SourceIndex::new(5) > SourceIndex::new(3));
+        assert!(SourceIndex::new(4) < SourceIndex::new(4).with_sub_idx(Some(42)));
+        assert!(SourceIndex::new(4).with_sub_idx(Some(42)) > SourceIndex::new(4));
+    }
+
+    #[test]
+    fn test_sub_idx_cmp_min() {
+        assert_eq!(SourceIndex::min(), SourceIndex::min());
+
+        assert!(SourceIndex::min() < SourceIndex::new(usize::MIN));
+        assert!(SourceIndex::min() < SourceIndex::new(1));
+        assert!(SourceIndex::min() < SourceIndex::new(0).with_sub_idx(Some(0)));
+        assert!(SourceIndex::min() < SourceIndex::new(0).with_sub_idx(Some(SourceIndex::min())));
+        assert!(SourceIndex::min() < SourceIndex::max());
+
+        assert!(SourceIndex::new(usize::MIN) > SourceIndex::min());
+        assert!(SourceIndex::new(1) > SourceIndex::min());
+        assert!(SourceIndex::new(0).with_sub_idx(Some(0)) > SourceIndex::min());
+        assert!(SourceIndex::new(0).with_sub_idx(Some(SourceIndex::min())) > SourceIndex::min());
+        assert!(SourceIndex::max() > SourceIndex::min());
+    }
+
+    #[test]
+    fn test_sub_idx_cmp_max() {
+        assert_eq!(SourceIndex::max(), SourceIndex::max());
+
+        assert!(SourceIndex::max() > SourceIndex::new(usize::MAX));
+        assert!(SourceIndex::max() > SourceIndex::new(1));
+        assert!(SourceIndex::max() > SourceIndex::new(0).with_sub_idx(Some(0)));
+        assert!(SourceIndex::max() > SourceIndex::new(0).with_sub_idx(Some(SourceIndex::max())));
+        assert!(SourceIndex::max() > SourceIndex::min());
+
+        assert!(SourceIndex::new(usize::MAX) < SourceIndex::max());
+        assert!(SourceIndex::new(1) < SourceIndex::max());
+        assert!(SourceIndex::new(0).with_sub_idx(Some(0)) < SourceIndex::max());
+        assert!(SourceIndex::new(0).with_sub_idx(Some(SourceIndex::max())) < SourceIndex::max());
+        assert!(SourceIndex::min() < SourceIndex::max());
     }
 }
