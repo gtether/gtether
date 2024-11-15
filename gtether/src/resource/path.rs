@@ -1,12 +1,18 @@
 use std::fmt::{Display, Formatter};
 use std::ops::{Add, AddAssign, Deref};
 
+/// String-based identifier for [Resources][res].
+///
+/// Generally functions similar to a String, but may have additional functionality.
+///
+/// [res]: super::Resource
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourcePath {
     inner: String,
 }
 
 impl ResourcePath {
+    /// Create a new ResourcePath from something that can be turned into a String.
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             inner: value.into(),

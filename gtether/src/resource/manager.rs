@@ -1,3 +1,69 @@
+//! The [ResourceManager] and any supporting logic.
+//!
+//! The [ResourceManager] can be considered the central system that ties all components of
+//! [Resources][res] together.
+//!
+//! [Resources][res] managed in the [ResourceManager] are cached using weak references - if any
+//! given [id][rp] is requested from the [ResourceManager] more than once, further requests will
+//! yield a reference to the originally loaded [Resource][res], as long as at least one strong
+//! reference to said [Resource][res] is maintained outside the [ResourceManager].
+//!
+//! When an [id][rp] is requested from the [ResourceManager], an asynchronous [handle][rf] is
+//! returned instead of a direct reference to a [Resource][res]. This [handle][rf] can be used to
+//! await the loading of a [Resource][res] if it has not finished loading yet, or will simply yield
+//! a cached [Resource][res] reference.
+//!
+//! # Examples
+//! Load a [Resource][res]
+//! ```
+//! use gtether::resource::manager::LoadPriority;
+//! # use gtether::resource::manager::ResourceManager;
+//! # use gtether::resource::ResourceLoader;
+//!
+//! # fn wrapper<T: Send + Sync + 'static>(manager: &ResourceManager, loader1: impl ResourceLoader<T>, loader2: impl ResourceLoader<T>) {
+//! // Poll whether the resource is ready
+//! let res_handle = manager.get_or_load("key1", loader1, LoadPriority::Immediate);
+//! match res_handle.poll() {
+//!     Ok(res_result) => { /* do something with the load result */ },
+//!     Err(res_handle) => { /* do something with the unready handle */ },
+//! }
+//!
+//! // Wait for the resource to be ready
+//! let res_handle = manager.get_or_load("key2", loader2, LoadPriority::Immediate);
+//! // Or .wait().await if within an async context
+//! let res_result = res_handle.wait_blocking();
+//! # }
+//! ```
+//!
+//! Multiple handles to one resource
+//! ```
+//! use std::sync::Arc;
+//! use gtether::resource::manager::LoadPriority;
+//! # use gtether::resource::manager::ResourceManager;
+//! # use gtether::resource::ResourceLoader;
+//!
+//! # async fn wrapper<T, R>(manager: &ResourceManager, loader1: R, loader2: R, loader3: R)
+//! # where T: Send + Sync + 'static, R: ResourceLoader<T> {
+//! let handle1 = manager.get_or_load("key", loader1, LoadPriority::Immediate);
+//! let handle2 = manager.get_or_load("key", loader2, LoadPriority::Immediate);
+//! let handle3 = manager.get_or_load("key", loader3, LoadPriority::Immediate);
+//!
+//! // Multiple handles should refer to same resource
+//! let res1 = handle1.wait().await.unwrap();
+//! let res2 = handle2.wait().await.unwrap();
+//! assert!(Arc::ptr_eq(&res1, &res2));
+//!
+//! // Dropping all strong references should cause remaining handles to trigger reloads
+//! drop(res1);
+//! drop(res2);
+//! // This should trigger a new load
+//! let res3 = handle3.wait().await.unwrap();
+//! # }
+//! ```
+//!
+//! [res]: Resource
+//! [rp]: ResourcePath
+//! [rf]: ResourceFuture
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use smol::prelude::*;
 use smol::{future, Executor, Task};
@@ -16,7 +82,7 @@ use crate::resource::source::{ResourceDataResult, ResourceSource, ResourceWatche
 use crate::resource::{Resource, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 
 #[derive(Debug, Clone)]
-pub struct ManagerResourceWatcher {
+struct ManagerResourceWatcher {
     manager: Weak<ResourceManager>,
     idx: SourceIndex,
 }
@@ -40,9 +106,14 @@ impl ResourceWatcher for ManagerResourceWatcher {
 
 pub type ResourceLoadResult<T> = Result<Arc<Resource<T>>, ResourceLoadError>;
 
+/// Priority for resource loading tasks.
+///
+/// Higher priorities will be chosen first when the internal async executor picks tasks to execute.
 #[derive(Debug, Clone, Copy)]
 pub enum LoadPriority {
+    /// Load this resource as soon as possible.
     Immediate,
+    /// This resource is not needed immediately, so load it when there is time.
     Delayed,
 }
 
@@ -157,6 +228,22 @@ enum ResourceFutureState<T: Send + Sync + 'static> {
     },
 }
 
+/// Handle for retrieving results when loading a [Resource][res].
+///
+/// Note that ResourceFutures are not Futures in terms of the async trait, but rather are just
+/// handles to an async task that loads a [Resource][res], or an already cached [Resource][res].
+///
+/// Two (or more) handles can be created that refer to the same load task / cached [Resource][res],
+/// simply by asking the [ResourceManager][rm] for the same [id][rp] multiple times. In this case, if
+/// one handle resolves to a [Resource][res], and then drops that [Resource][res], the [Resource][res]
+/// may be dropped in the [ResourceManager's][rm] cache. Any other handles that then try to resolve
+/// will trigger a reload of said [Resource][res], using the [ResourceLoader][rl] provided when that
+/// handle was generated.
+///
+/// [res]: Resource
+/// [id]: ResourcePath
+/// [rl]: ResourceLoader
+/// [rm]: ResourceManager
 pub struct ResourceFuture<T: Send + Sync + 'static> {
     state: ResourceFutureState<T>,
 }
@@ -224,6 +311,12 @@ impl<T: Send + Sync + 'static> ResourceFuture<T> {
         }
     }
 
+    /// Synchronously check whether this handle's [Resource][res] is done loading.
+    ///
+    /// If this handle's load task is complete, this yields the result of that load task. If the
+    /// load task is not yet complete, yield the handle back.
+    ///
+    /// [res]: Resource
     pub fn poll(self) -> Result<ResourceLoadResult<T>, Self> {
         match self.state {
             ResourceFutureState::Immediate(inner) => Ok(inner),
@@ -243,6 +336,11 @@ impl<T: Send + Sync + 'static> ResourceFuture<T> {
         }
     }
 
+    /// Asynchronously wait for this handle's [Resource][res] to be done loading.
+    ///
+    /// Will asynchronously await this handle's load task, and yield the result once it is complete.
+    ///
+    ///[res]: Resource
     pub async fn wait(self) -> ResourceLoadResult<T> {
         match self.state {
             ResourceFutureState::Immediate(inner) => inner,
@@ -261,6 +359,7 @@ impl<T: Send + Sync + 'static> ResourceFuture<T> {
         }
     }
 
+    /// Convenience method that wraps [ResourceFuture::wait()] in a synchronous block.
     #[inline]
     pub fn wait_blocking(self) -> ResourceLoadResult<T> {
         future::block_on(self.wait())
@@ -559,6 +658,37 @@ impl CacheEntry {
     }
 }
 
+/// Centralized management of resource loading and caching.
+///
+/// See [module-level documentation][mod] for more.
+///
+/// ResourceManagers are comprised of multiple [sources][src], and when loading new [Resources][res],
+/// they will be searched through them in the order those sources were given to the ResourceManager
+/// on construction.
+///
+/// ResourceManagers also contain an internal async executor, which runs its own thread/s. This
+/// async executor will be spun up when the ResourceManager is created, and stopped when the
+/// ResourceManager is dropped. Each ResourceManager would contain its own executor, so for that
+/// and for caching reasons, it is recommended to have one global ResourceManager, usually owned
+/// by the [Engine][eng] itself.
+///
+/// # Examples
+/// ```
+/// use gtether::resource::manager::ResourceManager;
+/// # use gtether::resource::source::ResourceSource;
+///
+/// # fn wrapper(source1: Box<dyn ResourceSource>, source2: Box<dyn ResourceSource>) {
+/// let manager = ResourceManager::builder()
+///     .source(source1)
+///     .source(source2)
+///     .build();
+/// # }
+/// ```
+///
+/// [res]: Resource
+/// [src]: ResourceSource
+/// [eng]: crate::Engine
+/// [mod]: super::manager
 pub struct ResourceManager {
     executor: Arc<ManagerExecutor>,
     sources: Vec<Box<dyn ResourceSource>>,
@@ -582,11 +712,21 @@ impl ResourceManager {
         })
     }
 
+    /// Create a [ResourceManagerBuilder].
+    ///
+    /// This is the preferred way to create a ResourceManager.
     #[inline]
     pub fn builder() -> ResourceManagerBuilder {
         ResourceManagerBuilder::default()
     }
 
+    /// Get access to the [TestContext][tc].
+    ///
+    /// This is available when building with `cfg(test)` for unit tests, and can be used to validate
+    /// behaviour in regards to either the ResourceManager itself or user-defined [sources][src].
+    ///
+    /// [tc]: tests::ResourceManagerTestContext
+    /// [src]: ResourceSource
     #[cfg(test)]
     #[inline]
     pub fn test_ctx(&self) -> &tests::ResourceManagerTestContext { &self.test_ctx }
@@ -703,7 +843,7 @@ impl ResourceManager {
         ResourceFuture::from_cache_entry(weak_entry, strong_self, id, loader, load_priority)
     }
 
-    pub fn get_or_load_impl<T>(
+    fn get_or_load_impl<T>(
         &self,
         id: ResourcePath,
         loader: Arc<dyn ResourceLoader<T>>,
@@ -737,6 +877,23 @@ impl ResourceManager {
         }
     }
 
+    /// Get an existing [Resource][res], or load a new one.
+    ///
+    /// If no [Resource][res] is already cached for the given [id][rp], the given [loader][rl] will
+    /// be used to load and cache a new [Resource][res]. Loading is handled asynchronously, so an
+    /// async task is enqueued to load the [Resource][res] from a separate thread. In the meantime,
+    /// a [handle][rf] will be returned synchronously from this function. This [handle][rf] can be
+    /// used to synchronously poll or asynchronously await the load result.
+    ///
+    /// If a [Resource][res] has already been loaded and cached, it will instead be returned
+    /// (wrapped in a [handle][rf]). The given [loader][rl] will be attached to the [handle][rf],
+    /// so that if the cached [Resource][res] is expired and evicted before the [handle][rf] is
+    /// resolved, it will trigger a new load using the given [loader][rl].
+    ///
+    /// [res]: Resource
+    /// [rp]: ResourcePath
+    /// [rl]: ResourceLoader
+    /// [rf]: ResourceFuture
     pub fn get_or_load<T>(
         &self,
         id: impl Into<ResourcePath>,
@@ -750,12 +907,22 @@ impl ResourceManager {
     }
 }
 
+/// Builder pattern for [ResourceManager].
+///
+/// Recommended way to create is via [ResourceManager::builder()].
 #[derive(Default)]
 pub struct ResourceManagerBuilder {
     sources: Vec<Box<dyn ResourceSource>>,
 }
 
 impl ResourceManagerBuilder {
+    /// Add a [source][src].
+    ///
+    /// [Sources][src] added will be prioritized by the built [ResourceManager] in chronological
+    /// order; [sources][src] added first will have higher priority for retrieving resource data
+    /// from than [sources][src] added later.
+    ///
+    /// [src]: ResourceSource
     #[inline]
     pub fn source(mut self, source: impl Into<Box<dyn ResourceSource>>) -> Self {
         self.sources.push(source.into());

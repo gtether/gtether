@@ -5,11 +5,18 @@ use crate::resource::source::ResourceWatcher;
 use crate::resource::source::{ResourceSource, ResourceSubDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
+/// [ResourceSource][rs] that wraps multiple sub-sources.
+///
+/// This source simply contains a collection of sub-sources, to wrap many sub-sources under a single
+/// top-layer source, which can be useful for structuring many nested layers of sources and adapters.
+///
+/// [rs]: ResourceSource
 pub struct ResourceSourceList {
     inner: Vec<Box<dyn ResourceSource>>,
 }
 
 impl ResourceSourceList {
+    /// Create a new ResourceSourceList from a collection of sub-sources.
     pub fn new(sources: impl IntoIterator<Item=Box<dyn ResourceSource>>) -> Self {
         Self {
             inner: sources.into_iter().collect(),

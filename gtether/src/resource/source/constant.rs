@@ -6,16 +6,29 @@ use crate::resource::source::ResourceWatcher;
 use crate::resource::source::{ResourceSource, ResourceSubDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
+/// [ResourceSource][rs] that contains static global data.
+///
+/// This source contains static byte data references, that never change. This is useful for
+/// embedding resource data in built binaries, and can often be used for defaults or error-condition
+/// resources if proper resource data can't be found or loaded.
+///
+/// [rs]: ResourceSource
 pub struct ConstantResourceSource {
     raw: HashMap<ResourcePath, &'static [u8]>,
 }
 
 impl ConstantResourceSource {
+    /// Create a new ConstantResourceSource from a pre-built hashmap of static data.
+    ///
+    /// It is recommended to instead use [Self::builder()] to create new ConstantResourceSources.
     #[inline]
     pub fn new(raw: HashMap<ResourcePath, &'static [u8]>) -> Self {
         Self { raw }
     }
 
+    /// Create a ConstantResourceSourceBuilder, used to build a ConstantResourceSource.
+    ///
+    /// This is the recommended way to create ConstantResourceSources.
     #[inline]
     pub fn builder() -> ConstantResourceSourceBuilder {
         ConstantResourceSourceBuilder::new()
@@ -41,11 +54,20 @@ impl ResourceSource for ConstantResourceSource {
     }
 }
 
+/// Builder pattern for [ConstantResourceSources][crs].
+///
+/// This builder allows defining static data for individual resources at a time, using
+/// [ConstantResourceSource::resource()].
+///
+/// [crs]: ConstantResourceSource
 pub struct ConstantResourceSourceBuilder {
     raw: HashMap<ResourcePath, &'static [u8]>,
 }
 
 impl ConstantResourceSourceBuilder {
+    /// Create a new builder.
+    ///
+    /// The recommended way to create new builders is to use [ConstantResourceSource::builder()].
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -53,12 +75,14 @@ impl ConstantResourceSourceBuilder {
         }
     }
 
+    /// Define an individual resource's static data.
     #[inline]
     pub fn resource(mut self, id: impl Into<ResourcePath>, data: &'static [u8]) -> Self {
         self.raw.insert(id.into(), data);
         self
     }
 
+    /// Build the [ConstantResourceSource].
     #[inline]
     pub fn build(self) -> ConstantResourceSource {
         ConstantResourceSource::new(self.raw)
