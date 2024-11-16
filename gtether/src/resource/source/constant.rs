@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::resource::path::ResourcePath;
 use crate::resource::source::ResourceWatcher;
-use crate::resource::source::{ResourceSource, ResourceSubDataResult, SourceIndex};
+use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
 /// [ResourceSource][rs] that contains static global data.
@@ -37,7 +37,7 @@ impl ConstantResourceSource {
 
 #[async_trait]
 impl ResourceSource for ConstantResourceSource {
-    async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+    async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
         if let Some(data) = self.raw.get(id) {
             Ok(Box::new(*data).into())
         } else {

@@ -78,7 +78,7 @@ use strum::EnumCount;
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::resource::path::ResourcePath;
-use crate::resource::source::{ResourceDataResult, ResourceSource, ResourceWatcher, SourceIndex};
+use crate::resource::source::{SealedResourceDataResult, ResourceSource, ResourceWatcher, SourceIndex};
 use crate::resource::{Resource, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 
 #[derive(Debug, Clone)]
@@ -790,7 +790,7 @@ impl ResourceManager {
         }.instrument(info_span!("resource_update", %id, %source_idx))).detach();
     }
 
-    async fn find_data(&self, id: &ResourcePath) -> Option<ResourceDataResult> {
+    async fn find_data(&self, id: &ResourcePath) -> Option<SealedResourceDataResult> {
         for (idx, source) in self.sources.iter().enumerate() {
             match source.load(id).await {
                 Ok(data) => return Some(Ok(data.seal(idx))),
@@ -943,7 +943,7 @@ pub(in crate::resource) mod tests {
     use smol::Timer;
     use std::time::Duration;
 
-    use crate::resource::source::ResourceSubDataResult;
+    use crate::resource::source::ResourceDataResult;
 
     pub async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -1094,7 +1094,7 @@ pub(in crate::resource) mod tests {
 
     #[async_trait]
     impl ResourceSource for TestResourceSource {
-        async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+        async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
             if let Some(data) = self.inner.get(id) {
                 Ok(Box::new(data).into())
             } else {

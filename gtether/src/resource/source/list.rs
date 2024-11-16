@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::resource::path::ResourcePath;
 use crate::resource::source::ResourceWatcher;
-use crate::resource::source::{ResourceSource, ResourceSubDataResult, SourceIndex};
+use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
 /// [ResourceSource][rs] that wraps multiple sub-sources.
@@ -26,7 +26,7 @@ impl ResourceSourceList {
 
 #[async_trait]
 impl ResourceSource for ResourceSourceList {
-    async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+    async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
         for (idx, source) in self.inner.iter().enumerate() {
             match source.load(id).await {
                 Ok(data) => return Ok(data.wrap(idx)),
@@ -37,7 +37,7 @@ impl ResourceSource for ResourceSourceList {
         Err(ResourceLoadError::NotFound(id.clone()))
     }
 
-    async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceSubDataResult {
+    async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceDataResult {
         if let Some(source) = self.inner.get(sub_idx.idx) {
             match sub_idx.sub_idx() {
                 Some(sub_idx) => source.sub_load(id, sub_idx).await,

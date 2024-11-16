@@ -19,7 +19,7 @@
 //!
 //! All custom sources need to implement the async [ResourceSource::load()] method, which accepts
 //! an [id][rp] and outputs a result possibly containing [raw data][rd] in the form of
-//! [ResourceSubData]. [ResourceSubData] implements `From<Box<dyn AsyncRead>>`, so an
+//! [ResourceData]. [ResourceData] implements `From<Box<dyn AsyncRead>>`, so an
 //! implementation only needs to get a `Box<dyn AsyncRead>`, and then use `.into()`.
 //!
 //! If a given source does not have data for a given [id][rp], it is expected to output an `Err`
@@ -29,13 +29,13 @@
 //! ```
 //! use async_trait::async_trait;
 //! use gtether::resource::path::ResourcePath;
-//! use gtether::resource::source::{ResourceSource, ResourceSubDataResult, ResourceWatcher, SourceIndex};
+//! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex};
 //!
 //! struct ReflectingSource {}
 //!
 //! #[async_trait]
 //! impl ResourceSource for ReflectingSource {
-//!     async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
 //!         Ok(Box::new(id.as_bytes()).into())
 //!     }
 //!
@@ -64,7 +64,7 @@
 //! use std::sync::Mutex;
 //! use async_trait::async_trait;
 //! use gtether::resource::path::ResourcePath;
-//! use gtether::resource::source::{ResourceSource, ResourceSubDataResult, ResourceWatcher, SourceIndex};
+//! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex};
 //!
 //! struct ChangingSource {
 //!     watchers: Mutex<HashMap<ResourcePath, Box<dyn ResourceWatcher>>>,
@@ -76,7 +76,7 @@
 //!
 //! #[async_trait]
 //! impl ResourceSource for ChangingSource {
-//!     async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
 //!         todo!("Some custom load operation")
 //!     }
 //!
@@ -105,7 +105,7 @@
 //! ```
 //! use async_trait::async_trait;
 //! use gtether::resource::path::ResourcePath;
-//! use gtether::resource::source::{ResourceSource, ResourceSubDataResult, ResourceWatcher, SourceIndex};
+//! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex};
 //!
 //! struct WrapperSource<S: ResourceSource> {
 //!     inner: S,
@@ -113,14 +113,14 @@
 //!
 //! #[async_trait]
 //! impl<S: ResourceSource> ResourceSource for WrapperSource<S> {
-//!     async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
 //!         // Do any custom wrapper logic
 //!         let result = self.inner.load(id).await;
 //!         // Possibly modify result if necessary
 //!         result
 //!     }
 //!
-//!     async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceSubDataResult {
+//!     async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceDataResult {
 //!         // Do any custom wrapper logic
 //!         let result = self.inner.sub_load(id, sub_idx).await;
 //!         // Possibly modify result if necessary
@@ -146,7 +146,7 @@
 //! use async_trait::async_trait;
 //! use gtether::resource::path::ResourcePath;
 //! use gtether::resource::ResourceLoadError;
-//! use gtether::resource::source::{ResourceSource, ResourceSubData, ResourceSubDataResult, ResourceWatcher, SourceIndex};
+//! use gtether::resource::source::{ResourceSource, ResourceData, ResourceDataResult, ResourceWatcher, SourceIndex};
 //!
 //! struct MultiSource { /* inner bits */ }
 //!
@@ -159,20 +159,20 @@
 //!         todo!("Yield a sub-source")
 //!     }
 //!
-//!     fn find_sub_data(&self, id: &ResourcePath) -> Result<(usize, ResourceSubData), ResourceLoadError> {
+//!     fn find_sub_data(&self, id: &ResourcePath) -> Result<(usize, ResourceData), ResourceLoadError> {
 //!         todo!("Yield data from a particular sub-source, as well as the sub-source's index")
 //!     }
 //! }
 //!
 //! #[async_trait]
 //! impl ResourceSource for MultiSource {
-//!     async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult {
+//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
 //!         let (idx, data) = self.find_sub_data(id)?;
 //!         // The inner sub-data must be wrapped with its sub-sources index
 //!         Ok(data.wrap(idx))
 //!     }
 //!
-//!     async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceSubDataResult {
+//!     async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceDataResult {
 //!         let source = self.get_sub_source(sub_idx)?;
 //!         match sub_idx.sub_idx() {
 //!             Some(sub_idx) => source.sub_load(id, sub_idx).await,
@@ -388,46 +388,63 @@ impl PartialOrd for SourceIndex {
     }
 }
 
-// TODO: Refactor this such that the "sealed" data isn't public
-pub struct ResourceData {
+pub(in crate::resource) struct SealedResourceData {
     pub data: ResourceReadData,
     pub source_idx: SourceIndex,
 }
 
-pub enum ResourceSubData {
-    SubIndex(ResourceData),
-    NoIndex(ResourceReadData),
+/// Struct bundling raw resource data and the [SourceIndex] it came from.
+pub struct ResourceData {
+    data: ResourceReadData,
+    source_idx: Option<SourceIndex>,
 }
 
-impl ResourceSubData {
-    pub fn seal(self, idx: usize) -> ResourceData {
-        match self {
-            ResourceSubData::SubIndex(r_data) => ResourceData {
-                data: r_data.data,
-                source_idx: SourceIndex::new(idx).with_sub_idx(Some(r_data.source_idx)),
-            },
-            ResourceSubData::NoIndex(r_data) => ResourceData {
-                data: r_data,
-                source_idx: SourceIndex::new(idx),
-            },
+impl ResourceData {
+    /// Create ResourceData from raw data.
+    ///
+    /// Recommended way to do this is with `.into()` instead.
+    pub fn new<R: AsyncRead + Unpin + Send + 'static>(data: Box<R>) -> Self {
+        Self {
+            data: Box::pin(data),
+            source_idx: None,
         }
     }
 
+    pub(in crate::resource) fn seal(self, idx: usize) -> SealedResourceData {
+        match self.source_idx {
+            Some(source_idx) => SealedResourceData {
+                data: self.data,
+                source_idx: SourceIndex::new(idx).with_sub_idx(Some(source_idx)),
+            },
+            None => SealedResourceData {
+                data: self.data,
+                source_idx: SourceIndex::new(idx),
+            }
+        }
+    }
+
+    /// Wrap this ResourceData with another index.
+    ///
+    /// The resulting ResourceData will use the given index as its top-level index in [SourceIndex].
     #[inline]
-    pub fn wrap(self, idx: usize) -> Self {
-        ResourceSubData::SubIndex(self.seal(idx))
+    pub fn wrap(mut self, idx: usize) -> Self {
+        self.source_idx = Some(match self.source_idx {
+            Some(source_idx) => SourceIndex::new(idx).with_sub_idx(Some(source_idx)),
+            None => SourceIndex::new(idx),
+        });
+        self
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + 'static> From<Box<R>> for ResourceSubData {
+impl<R: AsyncRead + Unpin + Send + 'static> From<Box<R>> for ResourceData {
     #[inline]
     fn from(value: Box<R>) -> Self {
-        Self::NoIndex(Box::pin(value))
+        Self::new(value)
     }
 }
 
-pub type ResourceSubDataResult = Result<ResourceSubData, ResourceLoadError>;
 pub type ResourceDataResult = Result<ResourceData, ResourceLoadError>;
+pub(in crate::resource) type SealedResourceDataResult = Result<SealedResourceData, ResourceLoadError>;
 
 /// Watcher context to notify upstream managers of [raw data][rd] changes.
 ///
@@ -468,7 +485,7 @@ pub trait ResourceSource: Send + Sync + 'static {
     ///
     /// [rp]: ResourcePath
     /// [rd]: ResourceReadData
-    async fn load(&self, id: &ResourcePath) -> ResourceSubDataResult;
+    async fn load(&self, id: &ResourcePath) -> ResourceDataResult;
 
     /// Given an [id][rp] and [sub-idx][si], attempt to retrieve the [raw data][rd] associated with it.
     ///
@@ -482,7 +499,7 @@ pub trait ResourceSource: Send + Sync + 'static {
     /// [si]: SourceIndex
     /// [rd]: ResourceReadData
     /// [rs]: ResourceSource
-    async fn sub_load(&self, id: &ResourcePath, _sub_idx: &SourceIndex) -> ResourceSubDataResult {
+    async fn sub_load(&self, id: &ResourcePath, _sub_idx: &SourceIndex) -> ResourceDataResult {
         self.load(id).await
     }
 
