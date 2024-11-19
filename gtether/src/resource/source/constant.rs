@@ -1,8 +1,9 @@
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use sha2::{Sha256, Digest};
 use std::collections::HashMap;
-
 use crate::resource::path::ResourcePath;
-use crate::resource::source::ResourceWatcher;
+use crate::resource::source::{ResourceData, ResourceWatcher};
 use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
@@ -14,15 +15,20 @@ use crate::resource::ResourceLoadError;
 ///
 /// [rs]: ResourceSource
 pub struct ConstantResourceSource {
-    raw: HashMap<ResourcePath, &'static [u8]>,
+    raw: HashMap<ResourcePath, (&'static [u8], String)>,
 }
 
 impl ConstantResourceSource {
     /// Create a new ConstantResourceSource from a pre-built hashmap of static data.
     ///
+    /// The values of the hashmap are expected to be pairs of static data references and string
+    /// hashes. See the [source module-level documentation][smod] for more info on hashing.
+    ///
     /// It is recommended to instead use [Self::builder()] to create new ConstantResourceSources.
+    ///
+    /// [smod]: super#data-hashing
     #[inline]
-    pub fn new(raw: HashMap<ResourcePath, &'static [u8]>) -> Self {
+    pub fn new(raw: HashMap<ResourcePath, (&'static [u8], String)>) -> Self {
         Self { raw }
     }
 
@@ -38,8 +44,8 @@ impl ConstantResourceSource {
 #[async_trait]
 impl ResourceSource for ConstantResourceSource {
     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
-        if let Some(data) = self.raw.get(id) {
-            Ok(Box::new(*data).into())
+        if let Some((data, hash)) = self.raw.get(id) {
+            Ok(ResourceData::new(Box::new(*data), hash.clone()))
         } else {
             Err(ResourceLoadError::NotFound(id.clone()))
         }
@@ -61,7 +67,7 @@ impl ResourceSource for ConstantResourceSource {
 ///
 /// [crs]: ConstantResourceSource
 pub struct ConstantResourceSourceBuilder {
-    raw: HashMap<ResourcePath, &'static [u8]>,
+    raw: HashMap<ResourcePath, (&'static [u8], String)>,
 }
 
 impl ConstantResourceSourceBuilder {
@@ -78,7 +84,8 @@ impl ConstantResourceSourceBuilder {
     /// Define an individual resource's static data.
     #[inline]
     pub fn resource(mut self, id: impl Into<ResourcePath>, data: &'static [u8]) -> Self {
-        self.raw.insert(id.into(), data);
+        let hash = STANDARD.encode(&Sha256::digest(data));
+        self.raw.insert(id.into(), (data, hash));
         self
     }
 

@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn test_list_resource_manager_found() {
         let (manager, data_maps) = create_list_resource_manager::<1>();
-        data_maps[0].insert("key", b"value");
+        data_maps[0].insert("key", b"value", "h_value");
 
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
         let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_list_resource_manager_update() {
         let (manager, data_maps) = create_list_resource_manager::<1>();
-        data_maps[0].insert("key", b"value");
+        data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
@@ -117,7 +117,7 @@ mod tests {
 
         {
             let _lock = future::block_on(manager.test_ctx().sync_update.block(Some(Duration::from_secs(1))));
-            data_maps[0].insert("key", b"new_value");
+            data_maps[0].insert("key", b"new_value", "h_new_value");
             assert_eq!(*value.read(), "value".to_owned());
         }
 
@@ -129,8 +129,8 @@ mod tests {
     #[test]
     fn test_list_resource_manager_priorities() {
         let (manager, data_maps) = create_list_resource_manager::<3>();
-        data_maps[1].insert("key", b"value_1");
-        data_maps[2].insert("key", b"value_2");
+        data_maps[1].insert("key", b"value_1", "h_value_1");
+        data_maps[2].insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
@@ -143,7 +143,7 @@ mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating lower priority shouldn't change the value
-        data_maps[2].insert("key", b"new_value_2");
+        data_maps[2].insert("key", b"new_value_2", "h_new_value_2");
         // This shouldn't even trigger a watch, so there is no mechanism to wait on, unfortunately
         assert_eq!(*value.read(), "value_1".to_owned());
         manager.test_ctx().sync_update.assert_count(0);
@@ -152,7 +152,7 @@ mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating same priority *should* change the value
-        data_maps[1].insert("key", b"new_value_1");
+        data_maps[1].insert("key", b"new_value_1", "h_new_value_1");
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
         assert_eq!(*value.read(), "new_value_1");
         data_maps[0].assert_watch("key", true);
@@ -160,7 +160,7 @@ mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating higher priority *should* change the value - and also what watchers are active
-        data_maps[0].insert("key", b"new_value_0");
+        data_maps[0].insert("key", b"new_value_0", "h_new_value_0");
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(2), Duration::from_secs(1)));
         assert_eq!(*value.read(), "new_value_0");
         data_maps[0].assert_watch("key", true);
@@ -168,7 +168,7 @@ mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating previously watched source shouldn't change the value
-        data_maps[1].insert("key", b"new_new_value_1");
+        data_maps[1].insert("key", b"new_new_value_1", "h_new_new_value_1");
         // This shouldn't even trigger a watch, so there is no mechanism to wait on, unfortunately
         assert_eq!(*value.read(), "new_value_0");
         data_maps[0].assert_watch("key", true);

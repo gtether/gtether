@@ -29,14 +29,18 @@
 //! ```
 //! use async_trait::async_trait;
 //! use gtether::resource::path::ResourcePath;
-//! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex};
+//! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex, ResourceData};
 //!
 //! struct ReflectingSource {}
 //!
 //! #[async_trait]
 //! impl ResourceSource for ReflectingSource {
 //!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
-//!         Ok(Box::new(id.as_bytes()).into())
+//!         Ok(ResourceData::new(
+//!             Box::new(id.as_bytes()),
+//!             // The hash can simply be the ID, since the value won't change for the same ID
+//!             id.to_string().clone(),
+//!         ))
 //!     }
 //!
 //!     fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) { /* noop */ }
@@ -203,6 +207,24 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Data Hashing
+//!
+//! Resource management uses hashing to identify raw data in a compact way. These hashes are used
+//! for many parts of the resource management lifecycle, including determining if a notified update
+//! can be ignored (i.e. if hashes match), or even for middleware caching (e.g. for a middleware
+//! source that caches remote data on-disk to prevent repeated downloads).
+//!
+//! It is highly recommended that a consistent hashing scheme is kept across all sources that are
+//! used. If two sources use a different hashing scheme for the same data, then that data will be
+//! treated as two separate sets of data, one from each source, which can cause caching to not
+//! function as well as it should.
+//!
+//! All pre-provided sources that this module provides use SHA256 hashing, encoded using base64 to
+//! turn it into a String. At this point in time, there are no ways to tell these sources to use a
+//! different hashing scheme, so it is recommended that all user-defined sources also use SHA256
+//! with base64 encoding, unless all of your sources are custom and you can ensure they use the
+//! same hashing scheme.
 //!
 //! [rs]: ResourceSource
 //! [rsw]: ResourceSource::watch()
@@ -390,22 +412,28 @@ impl PartialOrd for SourceIndex {
 
 pub(in crate::resource) struct SealedResourceData {
     pub data: ResourceReadData,
+    pub hash: String,
     pub source_idx: SourceIndex,
 }
 
 /// Struct bundling raw resource data and the [SourceIndex] it came from.
 pub struct ResourceData {
     data: ResourceReadData,
+    hash: String,
     source_idx: Option<SourceIndex>,
 }
 
 impl ResourceData {
     /// Create ResourceData from raw data.
     ///
-    /// Recommended way to do this is with `.into()` instead.
-    pub fn new<R: AsyncRead + Unpin + Send + 'static>(data: Box<R>) -> Self {
+    /// It is recommended to use a SHA256 hash of the data as the hash. See
+    /// [module-level documentation][mod] for more.
+    ///
+    /// [more]: super::source#data-hashing
+    pub fn new<R: AsyncRead + Unpin + Send + 'static>(data: Box<R>, hash: String) -> Self {
         Self {
             data: Box::pin(data),
+            hash,
             source_idx: None,
         }
     }
@@ -414,10 +442,12 @@ impl ResourceData {
         match self.source_idx {
             Some(source_idx) => SealedResourceData {
                 data: self.data,
+                hash: self.hash,
                 source_idx: SourceIndex::new(idx).with_sub_idx(Some(source_idx)),
             },
             None => SealedResourceData {
                 data: self.data,
+                hash: self.hash,
                 source_idx: SourceIndex::new(idx),
             }
         }
@@ -433,13 +463,6 @@ impl ResourceData {
             None => SourceIndex::new(idx),
         });
         self
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + 'static> From<Box<R>> for ResourceData {
-    #[inline]
-    fn from(value: Box<R>) -> Self {
-        Self::new(value)
     }
 }
 
@@ -459,9 +482,12 @@ pub(in crate::resource) type SealedResourceDataResult = Result<SealedResourceDat
 pub trait ResourceWatcher: Debug + Send + Sync + 'static {
     /// [ResourceSources][rs] call this when their data changes for a specific [id][rp].
     ///
+    /// See [module-level documentation][mod] for more information on the expected hash.
+    ///
     /// [rs]: ResourceSource
     /// [rp]: ResourcePath
-    fn notify_update(&self, id: &ResourcePath);
+    /// [mod]: super::source#data-hashing
+    fn notify_update(&self, id: &ResourcePath, hash: String);
 
     /// Clone this ResourceWatcher with the context of a specific sub-index.
     ///

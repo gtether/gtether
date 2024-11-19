@@ -89,9 +89,9 @@ struct ManagerResourceWatcher {
 
 impl ResourceWatcher for ManagerResourceWatcher {
     #[inline]
-    fn notify_update(&self, id: &ResourcePath) {
+    fn notify_update(&self, id: &ResourcePath, hash: String) {
         if let Some(manager) = self.manager.upgrade() {
-            manager.update(id.clone(), self.idx.clone());
+            manager.update(id.clone(), self.idx.clone(), hash);
         }
     }
 
@@ -215,7 +215,7 @@ impl Drop for ManagerExecutor {
 
 struct ResourceTaskData<T: Send + Sync + 'static> {
     id: ResourcePath,
-    result: ResourceLoadResult<T>,
+    result: Result<(Arc<Resource<T>>, String), ResourceLoadError>,
     source_idx: SourceIndex,
     loader: Arc<dyn ResourceLoader<T>>,
 }
@@ -372,11 +372,11 @@ enum CacheEntryGetResult<T: Send + Sync + 'static> {
     Err(ResourceLoadError),
 }
 
-impl<T: Send + Sync + 'static> From<ResourceLoadResult<T>> for CacheEntryGetResult<T> {
+impl<T: Send + Sync + 'static> From<Result<(Arc<Resource<T>>, String), ResourceLoadError>> for CacheEntryGetResult<T> {
     #[inline]
-    fn from(value: ResourceLoadResult<T>) -> Self {
+    fn from(value: Result<(Arc<Resource<T>>, String), ResourceLoadError>) -> Self {
         match value {
-            Ok(r) => CacheEntryGetResult::Ok(r),
+            Ok((r, _)) => CacheEntryGetResult::Ok(r),
             Err(e) => CacheEntryGetResult::Err(e),
         }
     }
@@ -410,6 +410,7 @@ enum CacheEntryState {
     CachedValue {
         value: Weak<dyn Any + Send + Sync>, // Weak<Resource<T>>
         resource_type: TypeId,
+        hash: String,
         source_idx: SourceIndex,
         update: CacheEntryStateUpdateFn,
     },
@@ -554,6 +555,16 @@ impl CacheEntryState {
                 panic!("Found uninit state in inner CacheEntry"),
         }
     }
+
+    fn hash(&self) -> Option<String> {
+        match self {
+            CacheEntryState::Loading { .. } => None,
+            CacheEntryState::CachedValue { hash, .. } => Some(hash.clone()),
+            CacheEntryState::CachedError(_) => None,
+            CacheEntryState::Uninit =>
+                panic!("Found uninit state in inner CacheEntry"),
+        }
+    }
 }
 
 impl<T> From<ResourceTaskData<T>> for CacheEntryState
@@ -562,7 +573,7 @@ where
 {
     fn from(value: ResourceTaskData<T>) -> Self {
         match value.result {
-            Ok(resource) => {
+            Ok((resource, hash)) => {
                 let weak = Arc::downgrade(&resource);
                 let id = value.id;
                 let loader = value.loader;
@@ -571,6 +582,7 @@ where
                 Self::CachedValue {
                     value: weak.clone(),
                     resource_type: TypeId::of::<T>(),
+                    hash,
                     source_idx,
                     update: Box::new(move |data| Box::new({
                         let async_weak = weak.clone();
@@ -655,6 +667,11 @@ impl CacheEntry {
     async fn update(&self, source: &Box<dyn ResourceSource>, new_idx: &SourceIndex)
                     -> CacheEntryUpdateResult {
         self.state.lock().await.update(&self.id, source, new_idx).await
+    }
+
+    #[inline]
+    async fn hash(&self) -> Option<String> {
+        self.state.lock().await.hash()
     }
 }
 
@@ -751,7 +768,7 @@ impl ResourceManager {
         }
     }
 
-    fn update(&self, id: ResourcePath, source_idx: SourceIndex) {
+    fn update(&self, id: ResourcePath, source_idx: SourceIndex, hash: String) {
         let task_self = self.weak.upgrade()
             .expect("ResourceManager cyclic reference should not be broken");
         let task_id = id.clone();
@@ -759,33 +776,51 @@ impl ResourceManager {
         self.executor.spawn(TaskPriority::Update, async move {
             #[cfg(test)]
             let _test_ctx_lock = task_self.test_ctx.sync_update.run().await;
-            if let Some(source) = task_self.sources.get(task_source_idx.idx()) {
-                let maybe_entry = task_self.cache.lock().get(&task_id).map(|e| e.clone());
-                if let Some(before_entry) = maybe_entry {
-                    let update_result = before_entry.update(source, &task_source_idx).await;
-                    let mut cache = task_self.cache.lock();
-                    if let Some(after_entry) = cache.get(&task_id) {
-                        if Arc::ptr_eq(after_entry, &before_entry) {
-                            match update_result {
-                                CacheEntryUpdateResult::Ok => task_self.watch_n(&task_id, &task_source_idx),
-                                CacheEntryUpdateResult::Err(e)
-                                    => warn!(id = %task_id, source_idx = %task_source_idx, %e, "Failed to update resource from source"),
-                                CacheEntryUpdateResult::Expired => {
-                                    debug!(id = %task_id, "Cache entry expired before resource update completed");
-                                    task_self.remove(&mut cache, &task_id);
-                                },
-                            }
-                        } else {
-                            debug!(id = %task_id, "Cache entry changed before resource update completed");
-                        }
-                    } else {
-                        debug!(id = %task_id, "Cache entry evicted before resource update completed");
-                    }
-                } else {
+
+            let before_entry = match task_self.cache.lock().get(&task_id) {
+                Some(entry) => entry.clone(),
+                None => {
                     debug!(id = %task_id, "Tried to update non-existent resource");
+                    return;
+                }
+            };
+
+            if Some(&hash) == before_entry.hash().await.as_ref() {
+                debug!(id = %task_id, hash, "Ignoring update as hashes match");
+                return;
+            }
+
+            let source = match task_self.sources.get(task_source_idx.idx()) {
+                Some(source) => source,
+                None => {
+                    warn!(id = %task_id, source_idx = %task_source_idx, "Tried to update from non-existent source");
+                    return;
+                }
+            };
+
+            let update_result = before_entry.update(source, &task_source_idx).await;
+
+            let mut cache = task_self.cache.lock();
+            let after_entry = match cache.get(&task_id) {
+                Some(entry) => entry,
+                None => {
+                    debug!(id = %task_id, "Cache entry evicted before resource update completed");
+                    return;
+                }
+            };
+
+            if Arc::ptr_eq(after_entry, &before_entry) {
+                match update_result {
+                    CacheEntryUpdateResult::Ok => task_self.watch_n(&task_id, &task_source_idx),
+                    CacheEntryUpdateResult::Err(e)
+                        => warn!(id = %task_id, source_idx = %task_source_idx, %e, "Failed to update resource from source"),
+                    CacheEntryUpdateResult::Expired => {
+                        debug!(id = %task_id, "Cache entry expired before resource update completed");
+                        task_self.remove(&mut cache, &task_id);
+                    },
                 }
             } else {
-                warn!(id = %task_id, source_idx = %task_source_idx, "Tried to update from non-existent source");
+                debug!(id = %task_id, "Cache entry changed before resource update completed");
             }
         }.instrument(info_span!("resource_update", %id, %source_idx))).detach();
     }
@@ -822,7 +857,7 @@ impl ResourceManager {
             let (result, source_idx) = match task_self.find_data(&task_id).await {
                 Some(Ok(data)) => {
                     match task_loader.load(data.data).await {
-                        Ok(v) => (Ok(Arc::new(Resource::new(v))), data.source_idx),
+                        Ok(v) => (Ok((Arc::new(Resource::new(v)), data.hash)), data.source_idx),
                         Err(e) => (Err(e), data.source_idx),
                     }
                 },
@@ -943,7 +978,7 @@ pub(in crate::resource) mod tests {
     use smol::Timer;
     use std::time::Duration;
 
-    use crate::resource::source::ResourceDataResult;
+    use crate::resource::source::{ResourceData, ResourceDataResult};
 
     pub async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -1045,21 +1080,24 @@ pub(in crate::resource) mod tests {
 
     #[derive(Default)]
     pub struct ResourceDataMap {
-        raw: RwLock<HashMap<ResourcePath, &'static [u8]>>,
+        raw: RwLock<HashMap<ResourcePath, (&'static [u8], String)>>,
         watch_list: RwLock<HashMap<ResourcePath, Box<dyn ResourceWatcher>>>,
     }
 
     impl ResourceDataMap {
-        fn get(&self, id: &ResourcePath) -> Option<&'static [u8]> {
-            self.raw.read().get(id).map(|r| *r)
+        fn get(&self, id: &ResourcePath) -> Option<(&'static [u8], String)> {
+            self.raw.read().get(id).map(|(r, h)| (*r, h.clone()))
         }
 
-        pub fn insert(&self, id: impl Into<ResourcePath>, data: &'static [u8]) {
-            let id = id.into();
-            self.raw.write().insert(id.clone(), data);
+        fn insert_impl(&self, id: ResourcePath, data: &'static [u8], hash: String) {
+            self.raw.write().insert(id.clone(), (data, hash.clone()));
             if let Some(watcher) = self.watch_list.read().get(&id) {
-                watcher.notify_update(&id);
+                watcher.notify_update(&id, hash);
             }
+        }
+
+        pub fn insert(&self, id: impl Into<ResourcePath>, data: &'static [u8], hash: impl Into<String>) {
+            self.insert_impl(id.into(), data, hash.into())
         }
 
         fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>) {
@@ -1095,8 +1133,8 @@ pub(in crate::resource) mod tests {
     #[async_trait]
     impl ResourceSource for TestResourceSource {
         async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
-            if let Some(data) = self.inner.get(id) {
-                Ok(Box::new(data).into())
+            if let Some((data, hash)) = self.inner.get(id) {
+                Ok(ResourceData::new(Box::new(data), hash))
             } else {
                 Err(ResourceLoadError::NotFound(id.clone()))
             }
@@ -1149,7 +1187,7 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_load_error() {
         let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("invalid", b"\xC0");
+        data_maps[0].insert("invalid", b"\xC0", "h_invalid");
 
         let fut = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
@@ -1175,7 +1213,7 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_found() {
         let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value");
+        data_maps[0].insert("key", b"value", "h_value");
 
         let fut = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
@@ -1201,7 +1239,7 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_drop_first_should_reload_second() {
         let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value");
+        data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
         let (fut1, fut2) = {
@@ -1228,7 +1266,7 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_update_value_to_value() {
         let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value");
+        data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
@@ -1239,7 +1277,7 @@ pub(in crate::resource) mod tests {
 
         {
             let _lock = manager.test_ctx().sync_update.block(Some(Duration::from_secs(1)));
-            data_maps[0].insert("key", b"new_value");
+            data_maps[0].insert("key", b"new_value", "h_new_value");
             assert_eq!(*value.read(), "value".to_owned());
         }
 
@@ -1251,7 +1289,7 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_update_value_to_error() {
         let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value");
+        data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
@@ -1262,7 +1300,7 @@ pub(in crate::resource) mod tests {
 
         {
             let _lock = future::block_on(manager.test_ctx().sync_update.block(Some(Duration::from_secs(1))));
-            data_maps[0].insert("key", b"\xC0");
+            data_maps[0].insert("key", b"\xC0", "h_invalid");
             assert_eq!(*value.read(), "value".to_owned());
         }
 
@@ -1274,7 +1312,7 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_update_error_to_value() {
         let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"\xC0");
+        data_maps[0].insert("key", b"\xC0", "h_invalid");
 
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
         let error = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
@@ -1285,7 +1323,7 @@ pub(in crate::resource) mod tests {
 
         {
             let _lock = future::block_on(manager.test_ctx().sync_update.block(Some(Duration::from_secs(1))));
-            data_maps[0].insert("key", b"new_value");
+            data_maps[0].insert("key", b"new_value", "h_new_value");
         }
 
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
@@ -1299,8 +1337,8 @@ pub(in crate::resource) mod tests {
     #[test]
     fn test_resource_manager_source_priorities() {
         let (manager, data_maps) = create_resource_manager::<3>();
-        data_maps[1].insert("key", b"value_1");
-        data_maps[2].insert("key", b"value_2");
+        data_maps[1].insert("key", b"value_1", "h_value_1");
+        data_maps[2].insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
         let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
@@ -1313,7 +1351,7 @@ pub(in crate::resource) mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating lower priority shouldn't change the value
-        data_maps[2].insert("key", b"new_value_2");
+        data_maps[2].insert("key", b"new_value_2", "h_new_value_2");
         // This shouldn't even trigger a watch, so there is no mechanism to wait on, unfortunately
         assert_eq!(*value.read(), "value_1".to_owned());
         manager.test_ctx().sync_update.assert_count(0);
@@ -1322,7 +1360,7 @@ pub(in crate::resource) mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating same priority *should* change the value
-        data_maps[1].insert("key", b"new_value_1");
+        data_maps[1].insert("key", b"new_value_1", "h_new_value_1");
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
         assert_eq!(*value.read(), "new_value_1");
         data_maps[0].assert_watch("key", true);
@@ -1330,7 +1368,7 @@ pub(in crate::resource) mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating higher priority *should* change the value - and also what watchers are active
-        data_maps[0].insert("key", b"new_value_0");
+        data_maps[0].insert("key", b"new_value_0", "h_new_value_0");
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(2), Duration::from_secs(1)));
         assert_eq!(*value.read(), "new_value_0");
         data_maps[0].assert_watch("key", true);
@@ -1338,11 +1376,32 @@ pub(in crate::resource) mod tests {
         data_maps[2].assert_watch("key", false);
 
         // Updating previously watched source shouldn't change the value
-        data_maps[1].insert("key", b"new_new_value_1");
+        data_maps[1].insert("key", b"new_new_value_1", "h_new_new_value_1");
         // This shouldn't even trigger a watch, so there is no mechanism to wait on, unfortunately
         assert_eq!(*value.read(), "new_value_0");
         data_maps[0].assert_watch("key", true);
         data_maps[1].assert_watch("key", false);
         data_maps[2].assert_watch("key", false);
+    }
+
+    #[test]
+    fn test_resource_manager_hashing() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("key", b"value", "h_value");
+
+        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+            .expect("Resource should load for 'key'");
+        assert_eq!(*value.read(), "value".to_owned());
+
+        // Same hash shouldn't cause an update
+        data_maps[0].insert("key", b"new_value", "h_value");
+        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
+        assert_eq!(*value.read(), "value".to_owned());
+
+        // Different hash *does* cause an update
+        data_maps[0].insert("key", b"new_value", "h_new_value");
+        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(2), Duration::from_secs(1)));
+        assert_eq!(*value.read(), "new_value".to_owned());
     }
 }
