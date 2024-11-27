@@ -591,8 +591,14 @@ where
                         async move {
                             // Use a weak reference here to allow the resource to be released if needed
                             if let Some(strong) = async_weak.upgrade() {
-                                let resource_mut = ResourceMut::from_resource(async_id, strong);
-                                async_loader.update(resource_mut, data).await.into()
+                                let resource_mut = ResourceMut::from_resource(async_id, &strong).await;
+                                match async_loader.update(&resource_mut, data).await {
+                                    Ok(_) => {
+                                        resource_mut.finalize().await;
+                                        CacheEntryUpdateResult::Ok
+                                    },
+                                    Err(e) => CacheEntryUpdateResult::Err(e),
+                                }
                             } else {
                                 CacheEntryUpdateResult::Expired
                             }

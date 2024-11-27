@@ -22,18 +22,71 @@
 
 use async_trait::async_trait;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use smol::future;
 use smol::io::AsyncRead;
 use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::debug;
 
+use crate::resource::manager::ResourceLoadResult;
 use crate::resource::path::ResourcePath;
 
 pub mod manager;
 pub mod path;
 pub mod source;
+
+struct SubResourceRef<P: Send + Sync + 'static> {
+    type_id: TypeId,
+    update_fn: Box<dyn (
+        Fn(ResourcePath, Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
+    ) + Send + Sync + 'static>,
+}
+
+impl<P: Send + Sync + 'static> SubResourceRef<P> {
+    fn new<T: Send + Sync + 'static>(
+        resource: &Arc<Resource<T>>,
+        loader: Arc<dyn SubResourceLoader<T, P>>,
+    ) -> Self {
+        let weak = Arc::downgrade(resource);
+        Self {
+            type_id: TypeId::of::<T>(),
+            update_fn: Box::new(move |id, parent| Box::new({
+                let async_weak = weak.clone();
+                let async_loader = loader.clone();
+                async move {
+                    if let Some(resource) = async_weak.upgrade() {
+                        // Note: This is a non-async lock, held across await boundaries. Normally
+                        // this would be VERY bad, as it can result in deadlocks. However, this is
+                        // a read lock, which doesn't prevent other reads, and the only time a write
+                        // lock is acquired is when the update lock is held, which it should be
+                        // while in this scope.
+                        let parent_value = parent.read();
+                        let resource_mut = ResourceMut::from_resource(id, &resource).await;
+                        async_loader.update(&resource_mut, &parent_value).await?;
+                        resource_mut.finalize().await;
+                    }
+                    Ok(())
+                }
+            }))
+        }
+    }
+
+    async fn update(&self, id: ResourcePath, parent: Arc<Resource<P>>) -> Result<(), ResourceLoadError> {
+        Box::into_pin((self.update_fn)(id, parent)).await
+    }
+}
+
+impl<T: Send + Sync + 'static> Debug for SubResourceRef<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubResource")
+            .field("type_id", &self.type_id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Read-only lock guard for getting [Resource] data.
 ///
@@ -84,11 +137,34 @@ pub type ResourceMutLock<'a, T> = RwLockWriteGuard<'a, T>;
 /// If some sort of synchronization is required during a Resource update, that can be achieved via
 /// the user-defined [ResourceLoader][rl] used to load Resources.
 ///
+/// # Sub-resources
+///
+/// Not all resources may be sourced from raw data; some resources may be derived from other
+/// existing resources. In this case, resources can be [attached to another resource][ar] as a
+/// "sub-resource". These sub-resources will be updated when their parent resource is updated,
+/// although they use a slightly different [loader][srl] to do so.
+///
+/// Example of attaching a sub-resource:
+/// ```
+/// # use std::sync::Arc;
+/// #
+/// # use gtether::resource::{Resource, ResourceLoadError, SubResourceLoader};
+/// #
+/// # fn wrapper(resource: Arc<Resource<String>>, sub_loader: impl SubResourceLoader<String, String>) -> Result<(), ResourceLoadError> {
+/// let sub_resource: Arc<Resource<String>> = resource.attach_sub_resource_blocking(sub_loader)?;
+/// # Ok(())
+/// # }
+/// ```
+///
 /// [rm]: manager::ResourceManager
 /// [rl]: ResourceLoader
+/// [srl]: SubResourceLoader
+/// [ar]: Resource::attach_sub_resource
 #[derive(Debug)]
 pub struct Resource<T: Send + Sync + 'static> {
     value: RwLock<T>,
+    sub_resources: smol::lock::Mutex<Vec<SubResourceRef<T>>>,
+    update_lock: smol::lock::Mutex<()>,
 }
 
 impl<T: Send + Sync + 'static> Resource<T> {
@@ -96,6 +172,8 @@ impl<T: Send + Sync + 'static> Resource<T> {
     pub(in crate::resource) fn new(value: T) -> Self {
         Self {
             value: RwLock::new(value),
+            sub_resources: smol::lock::Mutex::new(Vec::new()),
+            update_lock: smol::lock::Mutex::new(()),
         }
     }
 
@@ -105,6 +183,32 @@ impl<T: Send + Sync + 'static> Resource<T> {
     #[inline]
     pub fn read(&self) -> ResourceLock<'_, T> {
         self.value.read()
+    }
+
+    /// Create a sub-resource for this resource, which is updated when this resource is updated.
+    ///
+    /// See [sub-resources](Self#sub-resources) for more information.
+    pub async fn attach_sub_resource<S: Send + Sync + 'static>(
+        &self,
+        loader: impl SubResourceLoader<S, T>,
+    ) -> ResourceLoadResult<S> {
+        let sub_value = loader.load(&self.read()).await?;
+        let mut sub_resources = self.sub_resources.lock().await;
+        let sub_resource = Arc::new(Resource::new(sub_value));
+        sub_resources.push(SubResourceRef::new(&sub_resource, Arc::new(loader)));
+        Ok(sub_resource)
+    }
+
+    /// Create a sub-resource for this resource, which is updated when this resource is updated.
+    ///
+    /// Same as [Self::attach_sub_resource()], but blocking.
+    ///
+    /// See [sub-resources](Self#sub-resources) for more information.
+    pub fn attach_sub_resource_blocking<S: Send + Sync + 'static>(
+        &self,
+        loader: impl SubResourceLoader<S, T>,
+    ) -> ResourceLoadResult<S> {
+        future::block_on(self.attach_sub_resource(loader))
     }
 }
 
@@ -116,19 +220,33 @@ impl<T: Send + Sync + 'static> Resource<T> {
 ///
 /// [id]: ResourcePath
 /// [rm]: manager::ResourceManager
-pub struct ResourceMut<T: Send + Sync + 'static> {
+pub struct ResourceMut<'a, T: Send + Sync + 'static> {
     id: ResourcePath,
-    inner: Arc<Resource<T>>,
+    inner: &'a Arc<Resource<T>>,
+    #[allow(dead_code)] // This is simply being held for the duration of this struct
+    update_lock: smol::lock::MutexGuard<'a, ()>,
 }
 
-impl<T: Send + Sync + 'static> ResourceMut<T> {
+impl<'a, T: Send + Sync + 'static> ResourceMut<'a, T> {
     // An instance of Arc<Resource> should not be allowed to be arbitrarily mutated, so getting
     //  mutable access like this is only allowed within this module for inner mechanisms.
     #[inline]
-    pub(in crate::resource) fn from_resource(id: ResourcePath, resource: Arc<Resource<T>>) -> Self {
+    pub(in crate::resource) async fn from_resource(id: ResourcePath, resource: &'a Arc<Resource<T>>) -> Self {
         Self {
             id,
             inner: resource,
+            update_lock: resource.update_lock.lock().await,
+        }
+    }
+
+    pub(in crate::resource) async fn finalize(self) {
+        let sub_resources = self.inner.sub_resources.lock().await;
+        for sub_resource in &*sub_resources {
+            let sub_id = self.id.clone() + ":<sub-resource>";
+            match sub_resource.update(sub_id.clone(), self.inner.clone()).await {
+                Ok(_) => {},
+                Err(error) => debug!(id = %sub_id, %error, "Failed to update sub-resource"),
+            }
         }
     }
 
@@ -143,7 +261,7 @@ impl<T: Send + Sync + 'static> ResourceMut<T> {
     /// The underlying read-only [Resource] handle.
     #[inline]
     pub fn resource(&self) -> &Arc<Resource<T>> {
-        &self.inner
+        self.inner
     }
 
     /// Retrieve a read-only [lock guard][lg] for this resource.
@@ -269,10 +387,201 @@ pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
     ///
     /// [rm]: ResourceMut
     /// [rd]: ResourceReadData
-    async fn update(&self, resource: ResourceMut<T>, data: ResourceReadData)
+    async fn update(&self, resource: &ResourceMut<'_, T>, data: ResourceReadData)
         -> Result<(), ResourceLoadError>
     {
         *resource.write() = self.load(data).await?;
         Ok(())
+    }
+}
+
+/// User-defined interface for loading [Resources][res] from parent [Resources][res].
+///
+/// SubResourceLoaders are very similar to [ResourceLoaders][rl], but are designed to load/update
+/// [Resources][res] from other [Resources][res], creating parent/child like relationships.
+/// SubResourceLoaders are given to [Resources][res] via [attach_sub_resource()][asr], which will
+/// create and return the sub-resource.
+///
+/// Like normal [ResourceLoaders][rl], [attach_sub_resource()][asr] takes sole ownership of the
+/// SubResourceLoader, and both [SubResourceLoader::load()] and [SubResourceLoader::update()] may
+/// be called multiple times, so they should be idempotent.
+///
+/// See also [Resource#sub-resources].
+///
+/// # Examples
+/// ```
+/// use std::sync::Arc;
+/// use async_trait::async_trait;
+///
+/// use gtether::resource::{Resource, ResourceLoadError, SubResourceLoader};
+///
+/// #[derive(Default)]
+/// struct SubStringLoader {}
+///
+/// #[async_trait]
+/// impl SubResourceLoader<String, String> for SubStringLoader {
+///     async fn load(&self, parent: &String) -> Result<String, ResourceLoadError> {
+///         Ok(parent.clone() + "-<substring>")
+///     }
+/// }
+///
+/// fn make_substring(parent: &Arc<Resource<String>>) -> Arc<Resource<String>> {
+///     parent.attach_sub_resource_blocking(SubStringLoader::default())
+/// }
+/// ```
+///
+/// [res]: Resource
+/// [rl]: ResourceLoader
+/// [asr]: Resource::attach_sub_resource
+#[async_trait]
+pub trait SubResourceLoader<T, P>: Send + Sync + 'static
+where
+    T: Send + Sync + 'static,
+    P: Send + Sync + 'static,
+{
+    async fn load(&self, parent: &P) -> Result<T, ResourceLoadError>;
+
+    async fn update(&self, resource: &ResourceMut<'_, T>, parent: &P)
+        -> Result<(), ResourceLoadError>
+    {
+        *resource.write() = self.load(parent).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+    use crate::resource::manager::LoadPriority;
+    use super::*;
+    use super::manager::tests::*;
+
+    #[derive(Clone, Debug)]
+    enum SubStringLoaderError {
+        NoSuffix,
+        NoUpdate,
+    }
+
+    impl Display for SubStringLoaderError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            match self {
+                SubStringLoaderError::NoSuffix => f.write_str("No suffix specified"),
+                SubStringLoaderError::NoUpdate => f.write_str("Updates are not allowed"),
+            }
+        }
+    }
+
+    impl Error for SubStringLoaderError {}
+
+    struct SubStringLoader {
+        suffix: Option<String>,
+        no_update: bool,
+    }
+
+    impl SubStringLoader {
+        fn new(suffix: impl Into<String>) -> Self {
+            Self { suffix: Some(suffix.into()), no_update: false }
+        }
+
+        fn err() -> Self {
+            Self { suffix: None, no_update: true }
+        }
+
+        fn no_update(suffix: impl Into<String>) -> Self {
+            Self { suffix: Some(suffix.into()), no_update: true }
+        }
+    }
+
+    #[async_trait]
+    impl SubResourceLoader<String, String> for SubStringLoader {
+        async fn load(&self, parent: &String) -> Result<String, ResourceLoadError> {
+            match &self.suffix {
+                Some(suffix) => Ok(parent.clone() + "-" + &suffix),
+                None => Err(ResourceLoadError::from_error(SubStringLoaderError::NoSuffix)),
+            }
+        }
+
+        async fn update(&self, resource: &ResourceMut<'_, String>, parent: &String) -> Result<(), ResourceLoadError> {
+            if self.no_update {
+                Err(ResourceLoadError::from_error(SubStringLoaderError::NoUpdate))
+            } else {
+                *resource.write() = self.load(parent).await?;
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_sub_resource_load_error() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("key", b"value", "h_value");
+
+        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+            .expect("Resource should load for 'key'");
+
+        value.attach_sub_resource_blocking(SubStringLoader::err())
+            .expect_err("Sub-resource should fail to load");
+    }
+
+    #[test]
+    fn test_sub_resource_update() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("key", b"value", "h_value");
+
+        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+            .expect("Resource should load for 'key'");
+
+        let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
+            .expect("Sub-resource should load");
+        assert_eq!(*sub_value.read(), "value-subvalue".to_owned());
+
+        data_maps[0].insert("key", b"new_value", "h_new_value");
+        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
+        assert_eq!(*sub_value.read(), "new_value-subvalue");
+    }
+
+    #[test]
+    fn test_multi_sub_resource() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("key", b"value", "h_value");
+
+        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+            .expect("Resource should load for 'key'");
+
+        let sub_value_1 = value.attach_sub_resource_blocking(SubStringLoader::no_update("subvalue1"))
+            .expect("Sub-resource should load");
+        let sub_value_2 = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue2"))
+            .expect("Sub-resource should load");
+        assert_eq!(*sub_value_1.read(), "value-subvalue1".to_owned());
+        assert_eq!(*sub_value_2.read(), "value-subvalue2".to_owned());
+
+        // sub_value_1 should fail an update, but that shouldn't prevent sub_value_2 from updating
+        data_maps[0].insert("key", b"new_value", "h_new_value");
+        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
+        assert_eq!(*sub_value_1.read(), "value-subvalue1".to_owned());
+        assert_eq!(*sub_value_2.read(), "new_value-subvalue2".to_owned());
+    }
+
+    #[test]
+    fn test_chained_sub_resource() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("key", b"value", "h_value");
+
+        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+            .expect("Resource should load for 'key'");
+
+        let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
+            .expect("Sub-resource should load");
+        let sub_sub_value = sub_value.attach_sub_resource_blocking(SubStringLoader::new("subsubvalue"))
+            .expect("Sub-sub-resource should load");
+        assert_eq!(*sub_sub_value.read(), "value-subvalue-subsubvalue".to_owned());
+
+        data_maps[0].insert("key", b"new_value", "h_new_value");
+        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
+        assert_eq!(*sub_sub_value.read(), "new_value-subvalue-subsubvalue");
     }
 }
