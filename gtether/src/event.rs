@@ -14,8 +14,7 @@
 //! [et]: EventType
 
 use parking_lot::RwLock;
-use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
@@ -246,41 +245,6 @@ impl<T: EventType, D: 'static> EventSubscriber<T, D> {
     }
 }
 
-struct SubscriberEntry<T: EventType, D> {
-    subscriber: EventSubscriber<T, D>,
-    priority: usize,
-    id: usize,
-}
-
-impl<T: EventType, D: 'static> SubscriberEntry<T, D> {
-    fn handle_event(&self, event: &mut Event<T, D>) -> bool {
-        self.subscriber.handle_event(event)
-    }
-}
-
-impl<T: EventType, D> Ord for SubscriberEntry<T, D> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.priority.cmp(&other.priority) {
-            Ordering::Equal => self.id.cmp(&other.id),
-            order => order,
-        }
-    }
-}
-
-impl<T: EventType, D> PartialOrd for SubscriberEntry<T, D> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: EventType, D> PartialEq for SubscriberEntry<T, D> {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.id == other.id
-    }
-}
-
-impl<T: EventType, D> Eq for SubscriberEntry<T, D> {}
-
 /// Error types associated with [SubscriberOnceFuture].
 #[derive(Debug)]
 pub enum SubscriberOnceError {
@@ -390,6 +354,30 @@ impl<T: EventType, D: 'static> SubscriberOncePipe<T, D> {
     }
 }
 
+/// Helper type for passing parameters of [EventTypes][et].
+///
+/// Not meant to be used directly, but is used by several functions in this module to accept either
+/// a single or a collection of [EventTypes][et].
+///
+/// [et]: EventType
+#[derive(Default)]
+pub struct EventTypeList<T: EventType>(Vec<T>);
+
+impl<T: EventType> From<Vec<T>> for EventTypeList<T> {
+    #[inline]
+    fn from(value: Vec<T>) -> Self { Self(value) }
+}
+
+impl<T: EventType, const N: usize> From<[T; N]> for EventTypeList<T> {
+    #[inline]
+    fn from(value: [T; N]) -> Self { Self(value.into_iter().collect()) }
+}
+
+impl<T: EventType> From<T> for EventTypeList<T> {
+    #[inline]
+    fn from(value: T) -> Self { Self(vec![value.into()]) }
+}
+
 /// Registry for registering new [EventSubscribers][es] to.
 ///
 /// This is the public-facing part of [EventBus], where users can register additional
@@ -401,7 +389,7 @@ impl<T: EventType, D: 'static> SubscriberOncePipe<T, D> {
 /// [es]: EventSubscriber
 /// [evt]: Event
 pub struct EventBusRegistry<T: EventType, D> {
-    subscribers: RwLock<HashMap<T, BTreeSet<SubscriberEntry<T, D>>>>,
+    subscribers: RwLock<HashMap<T, Vec<EventSubscriber<T, D>>>>,
     once_pipes: RwLock<HashMap<T, SubscriberOncePipe<T, D>>>,
 }
 
@@ -410,33 +398,25 @@ impl<T: EventType, D: 'static> EventBusRegistry<T, D> {
     /// Register a new [EventSubscriber].
     ///
     /// Multiple [EventTypes][et] can be specified, and the [EventSubscriber] will be cloned for
-    /// each [EventType][et]. Priorities are ascending order, so a lower number will receive
-    /// [Events][evt] first.
+    /// each [EventType][et].
     ///
     /// [et]: EventType
     /// [evt]: Event
     pub fn register(
         &self,
-        event_types: impl IntoIterator<Item=T>,
+        event_types: impl Into<EventTypeList<T>>,
         subscriber: impl Into<EventSubscriber<T, D>>,
-        priority: usize,
     ) {
         self.register_impl(
-            event_types.into_iter().collect(),
+            event_types.into().0,
             subscriber.into(),
-            priority,
         )
     }
-    fn register_impl(&self, event_types: Vec<T>, subscriber: EventSubscriber<T, D>, priority: usize) {
+
+    fn register_impl(&self, event_types: Vec<T>, subscriber: EventSubscriber<T, D>) {
         let mut subscribers_map = self.subscribers.write();
         for event_type in event_types {
-            let subscribers = subscribers_map.entry(event_type).or_default();
-            let id = subscribers.len();
-            subscribers.insert(SubscriberEntry {
-                subscriber: subscriber.clone(),
-                priority,
-                id,
-            });
+            subscribers_map.entry(event_type).or_default().push(subscriber.clone());
         }
     }
 
@@ -449,10 +429,10 @@ impl<T: EventType, D: 'static> EventBusRegistry<T, D> {
     /// [sof]: SubscriberOnceFuture
     pub fn register_once(
         &self,
-        event_type: T,
+        event_type: impl Into<T>,
         subscriber: impl FnOnce(&mut Event<T, D>) + Send + 'static,
     ) -> SubscriberOnceFuture {
-        self.register_once_impl(event_type, Box::new(subscriber))
+        self.register_once_impl(event_type.into(), Box::new(subscriber))
     }
 
     fn register_once_impl(&self, event_type: T, subscriber: SubscriberFnOnce<T, D>) -> SubscriberOnceFuture {
@@ -478,8 +458,27 @@ impl<T: EventType, D: 'static> EventBusRegistry<T, D> {
 /// An EventBus has an [EventBusRegistry] for registering [EventSubscribers][es], that can be
 /// accessed via [EventBus::registry()].
 ///
+/// # Handler Execution Order
+///
+/// [Handlers][es] that are registered from the same thread will be guaranteed to execute (loosely)
+/// in the order that they were registered, but no guarantees about execution order are made beyond
+/// that. For example, given handlers A and B registered in that order from the same thread, a third
+/// handler C that is registered from a separate thread may or may not be executed between A and B.
+///
+/// It is recommended to plan accordingly, and design handlers to be as idempotent from each other
+/// as possible.
+///
+/// # Cancelling Events
+///
+/// [Events][evt] that are considered [cancellable][etc] may be cancelled by any [handler][es] that
+/// receives said event. This does *not* stop any further handlers from receiving that event, but
+/// the call-site that fires the event may change it's logic based on the set
+/// [cancellation flag][ec].
+///
 /// [evt]: Event
 /// [es]: EventSubscriber
+/// [etc]: EventType::is_cancellable
+/// [ec]: Event::is_cancelled
 pub struct EventBus<T: EventType, D> {
     registry: EventBusRegistry<T, D>,
 }
@@ -504,12 +503,12 @@ impl<T: EventType, D: 'static> EventBus<T, D> {
     ///
     /// Given a particular [EventType] and user-derived event data, create an [Event] and send it
     /// to any registered [EventSubscribers][es]. All standard [EventSubscribers][es] receive the
-    /// [Event] first, then any one-off handlers. If the [Event] is [cancellable][evc] and any
-    /// handler cancels the event, no further handlers will see the event, and it will be returned
-    /// as it is after cancelling handler is done with it.
+    /// [Event] first, then any one-off handlers.
     ///
     /// The [Event] will be returned after all handlers are done with it, which allows any relevant
     /// data generated from handlers to be [extracted from it][evid].
+    ///
+    /// See also: [struct-level documentation](Self)
     ///
     /// [es]: EventSubscriber
     /// [evc]: EventType::is_cancellable
@@ -517,38 +516,15 @@ impl<T: EventType, D: 'static> EventBus<T, D> {
     pub fn fire(&self, event_type: T, event_data: D) -> Event<T, D> {
         let mut event = Event::new(event_type.clone(), event_data);
 
-        let mut subscribers_map = self.registry.subscribers.upgradable_read();
+        let mut subscribers_map = self.registry.subscribers.write();
         let once_pipes_map = self.registry.once_pipes.read();
 
-        let mut expired_ids = HashSet::new();
-        if let Some(subscribers) = subscribers_map.get(&event_type) {
-            for subscriber in subscribers {
-                if !subscriber.handle_event(&mut event) {
-                    expired_ids.insert(subscriber.id);
-                }
-                if event.cancelled {
-                    break;
-                }
-            }
+        if let Some(subscribers) = subscribers_map.get_mut(&event_type) {
+            subscribers.retain(|subscriber| subscriber.handle_event(&mut event));
         }
 
-        if !expired_ids.is_empty() {
-            subscribers_map.with_upgraded(|subscribers_map| {
-                let subscribers = subscribers_map.get_mut(&event_type).unwrap();
-                subscribers.retain(|subscriber| !expired_ids.contains(&subscriber.id));
-            })
-        }
-
-        if event.cancelled {
-            return event
-        }
-
-        // Assuming the event hasn't been cancelled, also go through any queued one-off subscribers
         if let Some(once_pipe) = once_pipes_map.get(&event_type) {
             once_pipe.handle_event(&mut event);
-            if event.cancelled {
-                return event
-            }
         }
 
         event
@@ -602,9 +578,9 @@ mod tests {
     #[test]
     fn test_fire_event_one_subscriber() {
         let event_bus = EventBus::<StringEventType, u32>::default();
-        event_bus.registry().register(["inc1".into()], |event: &mut Event<StringEventType, u32>| {
+        event_bus.registry().register(StringEventType::from("inc1"), |event: &mut Event<StringEventType, u32>| {
             *event.event_data() += 1;
-        }, 0);
+        });
 
         let mut result = event_bus.fire("inc1".into(), 0);
         assert_eq!(*result.event_data(), 1);
@@ -618,9 +594,9 @@ mod tests {
     fn test_fire_event_three_subscriber() {
         let event_bus = EventBus::<StringEventType, u32>::default();
         for _ in 0..3 {
-            event_bus.registry().register(["inc3".into()], |event: &mut Event<StringEventType, u32>| {
+            event_bus.registry().register(StringEventType::from("inc3"), |event: &mut Event<StringEventType, u32>| {
                 *event.event_data() += 1;
-            }, 0);
+            });
         }
 
         let mut result = event_bus.fire("inc3".into(), 0);
@@ -639,7 +615,6 @@ mod tests {
             |event: &mut Event<StringEventType, u32>| {
                 *event.event_data() += 1;
             },
-            0,
         );
 
         for i in 1..4 {
@@ -649,33 +624,9 @@ mod tests {
     }
 
     #[test]
-    fn test_fire_event_priorities() {
-        let event_bus = EventBus::<StringEventType, Vec<u32>>::default();
-        event_bus.registry().register(["event".into()], |event: &mut Event<StringEventType, Vec<u32>>| {
-            event.event_data().push(0);
-        }, 0);
-        event_bus.registry().register(["event".into()], |event: &mut Event<StringEventType, Vec<u32>>| {
-            event.event_data().push(20);
-        }, 2);
-        event_bus.registry().register(["event".into()], |event: &mut Event<StringEventType, Vec<u32>>| {
-            event.event_data().push(10);
-        }, 1);
-        event_bus.registry().register(["event".into()], |event: &mut Event<StringEventType, Vec<u32>>| {
-            event.event_data().push(11);
-        }, 1);
-
-        let mut result = event_bus.fire("event".into(), Vec::new());
-        assert_eq!(result.event_data().as_slice(), &[0, 10, 11, 20]);
-
-        // Repeat should work
-        let mut result = event_bus.fire("event".into(), Vec::new());
-        assert_eq!(result.event_data().as_slice(), &[0, 10, 11, 20]);
-    }
-
-    #[test]
     fn test_fire_event_once_subscriber() {
         let event_bus = EventBus::<StringEventType, u32>::default();
-        let once_fut = event_bus.registry().register_once("inc".into(), |event| {
+        let once_fut = event_bus.registry().register_once(StringEventType::from("inc"), |event| {
             *event.event_data() += 1;
         });
 
@@ -692,10 +643,10 @@ mod tests {
     #[test]
     fn test_fire_event_subscriber_and_once() {
         let event_bus = EventBus::<StringEventType, u32>::default();
-        event_bus.registry().register(["inc".into()], |event: &mut Event<StringEventType, u32>| {
+        event_bus.registry().register(StringEventType::from("inc"), |event: &mut Event<StringEventType, u32>| {
             *event.event_data() += 1;
-        }, 0);
-        let once_fut = event_bus.registry().register_once("inc".into(), |event| {
+        });
+        let once_fut = event_bus.registry().register_once(StringEventType::from("inc"), |event| {
             *event.event_data() += 1;
         });
 
@@ -712,36 +663,38 @@ mod tests {
     #[test]
     fn test_fire_event_cancelled() {
         let event_bus = EventBus::<CancellableStringEventType, u32>::default();
-        event_bus.registry().register(["event".into()], |event: &mut Event<CancellableStringEventType, u32>| {
+        event_bus.registry().register(CancellableStringEventType::from("event"), |event: &mut Event<CancellableStringEventType, u32>| {
             *event.event_data() += 1;
-        }, 0);
-        event_bus.registry().register(["event".into()], |event: &mut Event<CancellableStringEventType, u32>| {
+        });
+        event_bus.registry().register(CancellableStringEventType::from("event"), |event: &mut Event<CancellableStringEventType, u32>| {
             *event.event_data() += 1;
             event.cancel();
-        }, 1);
-        event_bus.registry().register(["event".into()], |event: &mut Event<CancellableStringEventType, u32>| {
+        });
+        event_bus.registry().register(CancellableStringEventType::from("event"), |event: &mut Event<CancellableStringEventType, u32>| {
             *event.event_data() += 1;
-        }, 2);
+        });
 
         let result = event_bus.fire("event".into(), 0);
-        assert_eq!(result.into_data(), 2);
+        assert!(result.is_cancelled());
+        assert_eq!(result.into_data(), 3);
 
         // Repeat should work
         let result = event_bus.fire("event".into(), 0);
-        assert_eq!(result.into_data(), 2);
+        assert!(result.is_cancelled());
+        assert_eq!(result.into_data(), 3);
     }
 
     #[test]
     fn test_fire_event_weak() {
         let event_bus = EventBus::<StringEventType, u32>::default();
         let handler1 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(["event".into()], handler1.clone(), 0);
+        event_bus.registry().register(StringEventType::from("event"), handler1.clone());
         let handler2 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(["event".into()], handler2.clone(), 0);
+        event_bus.registry().register(StringEventType::from("event"), handler2.clone());
         let handler3 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(["event".into()], Arc::downgrade(&handler3), 0);
+        event_bus.registry().register(StringEventType::from("event"), Arc::downgrade(&handler3));
         let handler4 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(["event".into()], Arc::downgrade(&handler4), 0);
+        event_bus.registry().register(StringEventType::from("event"), Arc::downgrade(&handler4));
 
         let result = event_bus.fire("event".into(), 0);
         assert_eq!(result.into_data(), 4);
