@@ -1,42 +1,18 @@
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
 use vulkano::format::ClearValue;
-use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageUsage, SampleCount};
 use vulkano::image::view::ImageView;
+use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageUsage, SampleCount};
 use vulkano::memory::allocator::AllocationCreateInfo;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass, RenderPassCreateInfo, Subpass, SubpassDependency, SubpassDescription};
 use vulkano::sync::{AccessFlags, DependencyFlags, PipelineStages};
 
-use crate::render::RenderTarget;
+use crate::event::{Event, EventHandler};
 use crate::render::swapchain::Framebuffer;
-
-/// Represents a particular attachment for a render pass
-pub enum AttachmentBuffer {
-    /// Represents a transient attachment used within a render pass, for passing data between
-    /// subpasses.
-    Transient(Arc<ImageView>),
-
-    /// Marker that represents an attachment that is used as the output for a render pass.
-    ///
-    /// For example, the final image that gets rendered for presenting in a swapchain would use
-    /// this marker.
-    Output(),
-}
-
-/// Mapping of attachments to their friendly name.
-pub trait AttachmentMap {
-    /// Retrieves an attachment by name and framebuffer index.
-    ///
-    /// If there are no attachments associated by that name, or the framebuffer index is out of
-    /// bounds, returns None.
-    fn get_attachment(&self, name: String, frame_index: usize) -> Option<&AttachmentBuffer>;
-    /// Retrieves all attachments (in order) for a particular framebuffer index.
-    ///
-    /// If the framebuffer index is out of bounds, returns None.
-    fn get_attachments_for_frame(&self, frame_index: usize) -> Option<&Vec<AttachmentBuffer>>;
-}
+use crate::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use crate::render::attachment::{AttachmentMap, AttachmentType};
 
 /// Represents a Vulkan render pass, and all the logic associated with it.
 ///
@@ -53,12 +29,11 @@ pub trait EngineRenderPass: Send {
     ///
     /// In general, this delegates to [EngineRenderHandler]s to build specific commands.
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer);
-    /// Recreate this [EngineRenderPass] for a given [RenderTarget].
+
+    /// Initialize this EngineRenderPass for a given [RenderTarget].
     ///
-    /// This is generally called when a render target invalidates it's swapchain for one reason or
-    /// another, such as when the surface resizes. It is expected that all resources that need to be
-    /// recreated when a swapchain invalidates are done so here.
-    fn recreate(&mut self, target: &Arc<dyn RenderTarget>);
+    /// Should be called exactly once.
+    fn init(&mut self, target: &Arc<dyn RenderTarget>);
 }
 
 /// An individual render handler, used for rendering specific details of subpasses.
@@ -71,12 +46,11 @@ pub trait EngineRenderHandler: Send {
     /// Build the specific render commands used to render the part of the frame this handler is
     /// responsible for.
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer);
-    /// Recreate this [EngineRenderHandler] for a given [RenderTarget] and [Subpass].
+
+    /// Initialize this EngineRenderHandler for a given render pass's subpass.
     ///
-    /// This is generally called when a render target invalidates it's swapchain for one reason or
-    /// another, such as when the surface resizes. It is expected that all resources that need to be
-    /// recreated when a swapchain invalidates are done so here.
-    fn recreate(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>);
+    /// Should be called exactly once.
+    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>);
 }
 
 struct EngineRenderSubpass {
@@ -91,26 +65,30 @@ impl EngineRenderSubpass {
         }
     }
 
-    fn recreate(
+    fn init(
         &mut self,
         target: &Arc<dyn RenderTarget>,
         attachments: &Arc<dyn AttachmentMap>,
     ) {
         for handler in &mut self.handlers {
-            handler.recreate(target, &self.subpass, attachments);
+            handler.init(target, &self.subpass, attachments);
         }
     }
 }
 
 struct AttachmentData {
+    vk_render_pass: Arc<RenderPass>,
     // indexed by frame, and then by Vulkan index
-    buffers: Vec<Vec<AttachmentBuffer>>,
+    buffers: RwLock<Vec<Vec<AttachmentType>>>,
     name_map: HashMap<String, u32>,
 }
 
 impl AttachmentData {
-    fn new(target: &Arc<dyn RenderTarget>, render_pass: &Arc<RenderPass>, name_map: HashMap<String, u32>) -> Arc<Self> {
-        let mut create_infos = render_pass.attachments().iter()
+    fn create_buffers(
+        target: &Arc<dyn RenderTarget>,
+        vk_render_pass: &Arc<RenderPass>,
+    ) -> Vec<Vec<AttachmentType>> {
+        let mut create_infos = vk_render_pass.attachments().iter()
             .map(|atch| ImageCreateInfo {
                 extent: target.dimensions().into(),
                 format: atch.format,
@@ -118,7 +96,7 @@ impl AttachmentData {
                 ..Default::default()
             }).collect::<Vec<_>>();
 
-        for subpass in render_pass.subpasses().iter() {
+        for subpass in vk_render_pass.subpasses().iter() {
             // TODO: Need to go through *_resolve attachments?
             for color_atch in subpass.color_attachments.iter().flatten() {
                 create_infos[color_atch.attachment as usize].usage = ImageUsage::COLOR_ATTACHMENT;
@@ -131,23 +109,26 @@ impl AttachmentData {
             }
         }
 
-        let buffers = (0 .. target.framebuffer_count()).map(|_| {
+        (0 .. target.framebuffer_count()).map(|_| {
             create_infos.iter()
                 .map(|create_info|
                     if create_info.usage.contains(ImageUsage::TRANSIENT_ATTACHMENT) {
-                        AttachmentBuffer::Transient(ImageView::new_default(Image::new(
+                        AttachmentType::Transient(ImageView::new_default(Image::new(
                             target.device().memory_allocator().clone(),
                             create_info.clone(),
                             AllocationCreateInfo::default(),
                         ).unwrap()).unwrap())
                     } else {
-                        AttachmentBuffer::Output()
+                        AttachmentType::Output
                     }
                 ).collect::<Vec<_>>()
-        }).collect::<Vec<_>>();
+        }).collect::<Vec<_>>()
+    }
 
+    fn new(target: &Arc<dyn RenderTarget>, render_pass: &Arc<RenderPass>, name_map: HashMap<String, u32>) -> Arc<Self> {
         Arc::new(Self {
-            buffers,
+            vk_render_pass: render_pass.clone(),
+            buffers: RwLock::new(Self::create_buffers(target, render_pass)),
             name_map,
         })
     }
@@ -155,14 +136,21 @@ impl AttachmentData {
 
 impl AttachmentMap for AttachmentData {
     #[inline]
-    fn get_attachment(&self, name: String, frame_index: usize) -> Option<&AttachmentBuffer> {
+    fn get_attachment(&self, name: String, frame_index: usize) -> Option<AttachmentType> {
         let atch_idx = self.name_map.get(&name)?.clone();
-        self.buffers.get(frame_index)?.get(atch_idx as usize)
+        self.buffers.read().get(frame_index)?.get(atch_idx as usize).map(|v| v.clone())
     }
 
     #[inline]
-    fn get_attachments_for_frame(&self, frame_index: usize) -> Option<&Vec<AttachmentBuffer>> {
-        self.buffers.get(frame_index)
+    fn get_attachments_for_frame(&self, frame_index: usize) -> Option<Vec<AttachmentType>> {
+        self.buffers.read().get(frame_index).map(|v| v.clone())
+    }
+}
+
+impl EventHandler<RendererEventType, RendererEventData> for AttachmentData {
+    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
+        assert_eq!(event.event_type(), &RendererEventType::Stale);
+        *self.buffers.write() = Self::create_buffers(event.target(), &self.vk_render_pass);
     }
 }
 
@@ -175,13 +163,19 @@ struct StandardEngineRenderPass {
 
 impl StandardEngineRenderPass {
     fn new(
-        target: &Arc<dyn RenderTarget>,
+        renderer: &RendererHandle,
+        //target: &Arc<dyn RenderTarget>,
         render_pass: Arc<RenderPass>,
         subpasses: Vec<EngineRenderSubpass>,
         attachment_name_map: HashMap<String, u32>,
         clear_values: Vec<Option<ClearValue>>,
     ) -> Self {
-        let attachments = AttachmentData::new(target, &render_pass, attachment_name_map);
+        let attachments = AttachmentData::new(
+            renderer.target(),
+            &render_pass,
+            attachment_name_map,
+        );
+        renderer.event_bus().register(RendererEventType::Stale, attachments.clone());
 
         Self {
             render_pass,
@@ -230,18 +224,17 @@ impl EngineRenderPass for StandardEngineRenderPass {
         builder.end_render_pass(SubpassEndInfo::default()).unwrap();
     }
 
-    fn recreate(&mut self, target: &Arc<dyn RenderTarget>) {
-        self.attachments = AttachmentData::new(target, &self.render_pass, self.attachments.name_map.clone());
+    fn init(&mut self, target: &Arc<dyn RenderTarget>) {
         let attachments = self.attachment_map();
-        for subpass in self.subpasses.iter_mut() {
-            subpass.recreate(target, &attachments);
+        for subpass in &mut self.subpasses {
+            subpass.init(target, &attachments);
         }
     }
 }
 
 /// Builder pattern for creating a standard [EngineRenderPass].
 pub struct EngineRenderPassBuilder {
-    target: Arc<dyn RenderTarget>,
+    renderer: RendererHandle,
     attachments: Vec<AttachmentDescription>,
     attachment_name_map: HashMap<String, u32>,
     clear_values: Vec<Option<ClearValue>>,
@@ -251,10 +244,10 @@ pub struct EngineRenderPassBuilder {
 impl EngineRenderPassBuilder {
     /// Start a new builder.
     ///
-    /// Requires a [RenderTarget] to use as a basis for the created [EngineRenderPass].
-    pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
+    /// Requires a [RendererHandle] to use as a basis for the created [EngineRenderPass].
+    pub fn new(renderer: &RendererHandle) -> Self {
         Self {
-            target: target.clone(),
+            renderer: renderer.clone(),
             attachments: vec![],
             attachment_name_map: HashMap::new(),
             clear_values: vec![],
@@ -295,7 +288,7 @@ impl EngineRenderPassBuilder {
     /// are deduced from information gathered from the [RenderTarget].
     #[allow(unused_mut)]
     pub fn final_color_attachment(mut self, name: String, clear_value: ClearValue) -> Self {
-        let format = self.target.format();
+        let format = self.renderer.target().format();
         self.attachment(name, AttachmentDescription {
             format,
             samples: SampleCount::try_from(1).unwrap(),
@@ -312,7 +305,7 @@ impl EngineRenderPassBuilder {
 
     /// Build the [EngineRenderPass].
     pub fn build(self) -> Box<dyn EngineRenderPass> {
-        let vk_device = self.target.device().vk_device();
+        let vk_device = self.renderer.target().device().vk_device();
 
         // Ripped from the ordered_passes_renderpass() macro from Vulkano, as no changes are needed
         // to this logic
@@ -369,22 +362,12 @@ impl EngineRenderPassBuilder {
             }).collect::<Vec<_>>();
 
         Box::new(StandardEngineRenderPass::new(
-            &self.target,
+            &self.renderer,
             render_pass,
             subpasses,
             self.attachment_name_map,
             self.clear_values,
         ))
-    }
-
-    /// Create a simple NoOp [EngineRenderPass], that does nothing but render a black image.
-    pub fn noop(target: &Arc<dyn RenderTarget>) -> Box<dyn EngineRenderPass> {
-        Self::new(target)
-            .final_color_attachment("color".into(), [0.0, 0.0, 0.0, 1.0].into())
-            .begin_subpass()
-            .color_attachment("color".into())
-            .end_subpass()
-            .build()
     }
 }
 
@@ -494,4 +477,98 @@ impl EngineRenderSubpassBuilder {
         self.parent.subpass_infos.push((subpass_description, self.handlers));
         self.parent
     }
+}
+
+struct NoOpAttachmentMap {}
+
+impl AttachmentMap for NoOpAttachmentMap {
+    fn get_attachment(&self, name: String, _frame_index: usize) -> Option<AttachmentType> {
+        if name.as_str() == "color" {
+            Some(AttachmentType::Output)
+        } else {
+            None
+        }
+    }
+    fn get_attachments_for_frame(&self, _frame_index: usize) -> Option<Vec<AttachmentType>> {
+        Some(vec![AttachmentType::Output])
+    }
+}
+
+/// A simple NoOp [EngineRenderPass] that does nothing except render a black image.
+///
+/// This "NoOp" render pass is suitable for early initialization, e.g. for starting a [Renderer]
+/// with.
+///
+/// # Examples
+/// ```
+/// # use std::sync::Arc;
+/// # use gtether::render::{RenderTarget};
+/// # use gtether::render::render_pass::{EngineRenderPass};
+/// use gtether::render::Renderer;
+/// use gtether::render::render_pass::NoOpEngineRenderPass;
+///
+/// # fn wrapper(target: &Arc<dyn RenderTarget>, render_pass: Box<dyn EngineRenderPass>) {
+/// let noop_render_pass = NoOpEngineRenderPass::new(target);
+/// let (mut renderer, _) = Renderer::new(target, noop_render_pass);
+///
+/// // ... Do some work to create an actual render pass ...
+///
+/// renderer.set_render_pass(render_pass);
+/// # }
+/// ```
+pub struct NoOpEngineRenderPass {
+    vk_render_pass: Arc<RenderPass>,
+}
+
+impl NoOpEngineRenderPass {
+    /// Create a new [NoOpEngineRenderPass].
+    pub fn new(target: &Arc<dyn RenderTarget>) -> Box<dyn EngineRenderPass> {
+        let format = target.format();
+        let vk_render_pass = vulkano::single_pass_renderpass!(
+            target.device().vk_device().clone(),
+            attachments: {
+                color: {
+                    format: format,
+                    samples: 1,
+                    load_op: Clear,
+                    store_op: Store,
+                },
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {},
+            },
+        ).unwrap();
+
+        Box::new(Self {
+            vk_render_pass,
+        })
+    }
+}
+
+impl EngineRenderPass for NoOpEngineRenderPass {
+    fn render_pass(&self) -> &Arc<RenderPass> {
+        &self.vk_render_pass
+    }
+
+    fn attachment_map(&self) -> Arc<dyn AttachmentMap> {
+        Arc::new(NoOpAttachmentMap {})
+    }
+
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+        builder
+            .begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
+                    ..RenderPassBeginInfo::framebuffer(frame.buffer().clone())
+                },
+                SubpassBeginInfo {
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                },
+            ).unwrap()
+            .end_render_pass(SubpassEndInfo::default()).unwrap();
+    }
+
+    fn init(&mut self, _target: &Arc<dyn RenderTarget>) {}
 }

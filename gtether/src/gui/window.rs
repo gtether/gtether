@@ -1,3 +1,4 @@
+use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt, thread};
@@ -11,11 +12,11 @@ use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
-use crate::{EngineMetadata, NonExhaustive};
 use crate::gui::input::{InputEvent, InputState};
-use crate::render::{Device, Dimensions, Instance, RenderTarget};
-use crate::render::render_pass::{EngineRenderPass, EngineRenderPassBuilder};
+use crate::render::render_pass::NoOpEngineRenderPass;
 use crate::render::Renderer;
+use crate::render::{Device, Dimensions, Instance, RenderTarget, RendererHandle};
+use crate::{EngineMetadata, NonExhaustive};
 
 pub use winit::window::WindowAttributes;
 
@@ -100,14 +101,12 @@ impl Default for CreateWindowInfo {
 }
 
 struct WindowModifyRequest {
-    render_pass: Option<Box<dyn EngineRenderPass>>,
     cursor_visible: Option<bool>,
 }
 
 impl Default for WindowModifyRequest {
     fn default() -> Self {
         Self {
-            render_pass: None,
             cursor_visible: None,
         }
     }
@@ -124,7 +123,7 @@ enum WindowEventRequest {
 #[derive(Clone)]
 pub struct WindowHandle {
     id: WindowId,
-    target: Arc<dyn RenderTarget>,
+    renderer: RendererHandle,
     input: Arc<InputState>,
     sender_modify: ump::Client<WindowModifyRequest, (), ()>,
     sender_event: ump::Client<WindowEventRequest, (), ()>,
@@ -134,7 +133,6 @@ impl fmt::Debug for WindowHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WindowHandle")
             .field("id", &self.id)
-            .field("target", &self.target)
             .finish_non_exhaustive()
     }
 }
@@ -144,30 +142,15 @@ impl WindowHandle {
     #[inline]
     pub fn id(&self) -> WindowId { self.id }
 
-    /// The [RenderTarget] for this window.
+    /// The [handle][rh] for this window's [Renderer].
+    ///
+    /// [rh]: RendererHandle
     #[inline]
-    pub fn render_target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+    pub fn renderer(&self) -> &RendererHandle { &self.renderer }
 
     /// The current [InputState] for this window.
     #[inline]
     pub fn input_state(&self) -> &Arc<InputState> { &self.input }
-
-    /// Replace this window's [RenderTarget] with a new one.
-    ///
-    /// Sends the new [RenderTarget] to the window's main thread, and blocks until a response has
-    /// been received which indicates the [RenderTarget] was successfully replaced.
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the window's main thread has stopped or is otherwise unresponsive.
-    pub fn set_render_pass(&self, render_pass: Box<dyn EngineRenderPass>) {
-        let modify_request = WindowModifyRequest {
-            render_pass: Some(render_pass),
-            ..Default::default()
-        };
-
-        self.sender_modify.req(modify_request).unwrap();
-    }
 
     pub fn set_cursor_visible(&self, visible: bool) {
         let modify_request = WindowModifyRequest {
@@ -230,29 +213,40 @@ impl Window {
             instance.clone(),
         ));
 
-        let input = Arc::new(InputState::default());
-
-        let window_handle = WindowHandle {
-            id: window_id,
-            target: target.clone(),
-            input: input.clone(),
-            sender_modify,
-            sender_event,
-        };
+        let pair: Arc<(Mutex<Option<WindowHandle>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
+        let thread_pair = pair.clone();
 
         let join_handle = thread::Builder::new().name(title).spawn(move || {
+            let &(ref lock, ref cvar) = &*thread_pair;
+
             let dyn_target: Arc<dyn RenderTarget> = target.clone();
-            let render_pass = EngineRenderPassBuilder::noop(&dyn_target);
-            let renderer = Renderer::new(&dyn_target, render_pass);
+            let render_pass = NoOpEngineRenderPass::new(&dyn_target);
+            let (renderer, renderer_handle) = Renderer::new(&dyn_target, render_pass);
+
+            let input = Arc::new(InputState::default());
 
             let mut window = Self {
                 target,
                 renderer,
-                input,
+                input: input.clone(),
                 cursor_visible: true,
                 endpoint_modify,
                 endpoint_event,
             };
+
+            let window_handle = WindowHandle {
+                id: window_id,
+                renderer: renderer_handle,
+                input,
+                sender_modify,
+                sender_event,
+            };
+
+            {
+                let mut handle = lock.lock();
+                *handle = Some(window_handle);
+            }
+            cvar.notify_one();
 
             loop {
                 if !window.tick().is_ok() {
@@ -260,6 +254,13 @@ impl Window {
                 }
             }
         }).unwrap();
+
+        let &(ref lock, ref cvar) = &*pair;
+        let mut handle = lock.lock();
+        if handle.is_none() {
+            cvar.wait_while(&mut handle, |handle| handle.is_none());
+        }
+        let window_handle = handle.as_ref().unwrap().clone();
 
         (window_handle, join_handle)
     }
@@ -299,10 +300,6 @@ impl Window {
 
         while let Some((modify_request, rctx))
                 = self.endpoint_modify.try_pop().map_err(Self::map_ump_error)? {
-            if let Some(render_pass) = modify_request.render_pass {
-                self.renderer.set_render_pass(render_pass);
-            }
-
             if let Some(visible) = modify_request.cursor_visible {
                 self.cursor_visible = visible;
                 self.set_cursor_visible(visible);

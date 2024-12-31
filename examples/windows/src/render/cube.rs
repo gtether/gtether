@@ -1,25 +1,27 @@
 use std::sync::Arc;
 
+use gtether::event::Event;
+use gtether::render::attachment::AttachmentMap;
+use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use gtether::render::render_pass::EngineRenderHandler;
+use gtether::render::swapchain::Framebuffer;
+use gtether::render::uniform::Uniform;
+use gtether::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
 
-use gtether::render::render_pass::{AttachmentMap, EngineRenderHandler};
-use gtether::render::RenderTarget;
-use gtether::render::swapchain::Framebuffer;
-
-use crate::render::{MN, Uniform, VP};
+use crate::render::{MN, VP};
 
 mod deferred_vert {
     vulkano_shaders::shader! {
@@ -48,14 +50,16 @@ struct CubeVertex {
 
 pub struct CubeRenderer {
     target: Arc<dyn RenderTarget>,
-    graphics: Option<Arc<GraphicsPipeline>>,
+    graphics: Arc<EngineGraphicsPipeline>,
     vertex_buffer: Subbuffer<[CubeVertex]>,
     mn: Arc<Uniform<MN>>,
     vp: Arc<Uniform<VP>>,
 }
 
 impl CubeRenderer {
-    pub fn new(target: &Arc<dyn RenderTarget>) -> Self {
+    pub fn new(renderer: &RendererHandle) -> Self {
+        let target = renderer.target();
+
         let color = [1.0, 1.0, 1.0];
 
         let vertices = [
@@ -116,51 +120,6 @@ impl CubeRenderer {
             vertices,
         ).unwrap();
 
-        Self {
-            target: target.clone(),
-            graphics: None,
-            vertex_buffer,
-            mn: Arc::new(Uniform::new(MN::default(), target, 1)),
-            vp: Arc::new(Uniform::new(VP::default(), target, 0)),
-        }
-    }
-
-    #[inline]
-    pub fn mn(&self) -> &Arc<Uniform<MN>> { &self.mn }
-
-    #[inline]
-    pub fn vp(&self) -> &Arc<Uniform<VP>> { &self.vp }
-}
-
-impl EngineRenderHandler for CubeRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, _frame: &Framebuffer) {
-        let graphics = self.graphics.as_ref()
-            .expect(".recreate() not called yet");
-
-        builder
-            .bind_pipeline_graphics(graphics.clone()).unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                graphics.layout().clone(),
-                0,
-                (
-                    self.vp.descriptor_set().clone(),
-                    self.mn.descriptor_set().clone(),
-                ),
-            ).unwrap()
-            .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
-            .draw(self.vertex_buffer.len() as u32, 1, 0, 0).unwrap();
-    }
-
-    fn recreate(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, _attachments: &Arc<dyn AttachmentMap>) {
-        self.target = target.clone();
-
-        let viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: target.dimensions().into(),
-            depth_range: 0.0..=1.0,
-        };
-
         let deferred_vert = deferred_vert::load(target.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
@@ -185,45 +144,96 @@ impl EngineRenderHandler for CubeRenderer {
                 .unwrap(),
         ).unwrap();
 
-        let graphics = GraphicsPipeline::new(
-            target.device().vk_device().clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                viewport_state: Some(ViewportState {
-                    viewports: [viewport].into_iter().collect(),
-                    ..Default::default()
-                }),
+        let base_create_info = GraphicsPipelineCreateInfo {
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            stages: stages.into_iter().collect(),
+            vertex_input_state,
+            input_assembly_state: Some(InputAssemblyState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        };
+
+        let graphics = EngineGraphicsPipeline::new(
+            renderer,
+            move |subpass| GraphicsPipelineCreateInfo {
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     subpass.num_color_attachments(),
                     ColorBlendAttachmentState::default(),
                 )),
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState::simple()),
-                    ..Default::default()
-                }),
-                subpass: Some(subpass.clone().into()),
-                stages: stages.into_iter().collect(),
-                vertex_input_state,
-                input_assembly_state: Some(InputAssemblyState::default()),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::Back,
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            }
-        ).unwrap();
-
-        let mut vp = self.vp.get();
-        vp.projection = glm::perspective(
-            target.dimensions().aspect_ratio(),
-            glm::half_pi(),
-            0.01, 100.0,
+                ..base_create_info.clone()
+            },
         );
-        self.vp.set(vp);
 
-        self.mn.recreate(target, &graphics);
-        self.vp.recreate(target, &graphics);
-        self.graphics = Some(graphics);
+        let mn = Uniform::new(
+            MN::default(),
+            renderer,
+            graphics.clone(),
+            1,
+        );
+
+        let vp = Uniform::new(
+            VP::default(),
+            renderer,
+            graphics.clone(),
+            0,
+        );
+
+        let reset_vp = vp.clone();
+        renderer.event_bus().register(
+            RendererEventType::Stale,
+            move |event: &mut Event<RendererEventType, RendererEventData>| {
+                reset_vp.write().projection = glm::perspective(
+                    event.target().dimensions().aspect_ratio(),
+                    glm::half_pi(),
+                    0.01, 100.0,
+                );
+            }
+        );
+
+        Self {
+            target: target.clone(),
+            graphics,
+            vertex_buffer,
+            mn,
+            vp,
+        }
+    }
+
+    #[inline]
+    pub fn mn(&self) -> &Arc<Uniform<MN>> { &self.mn }
+
+    #[inline]
+    pub fn vp(&self) -> &Arc<Uniform<VP>> { &self.vp }
+}
+
+impl EngineRenderHandler for CubeRenderer {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, _frame: &Framebuffer) {
+        let graphics = self.graphics.vk_graphics();
+
+        builder
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                graphics.layout().clone(),
+                0,
+                (
+                    self.vp.descriptor_set().clone(),
+                    self.mn.descriptor_set().clone(),
+                ),
+            ).unwrap()
+            .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
+            .draw(self.vertex_buffer.len() as u32, 1, 0, 0).unwrap();
+    }
+
+    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, _attachments: &Arc<dyn AttachmentMap>) {
+        self.target = target.clone();
+        self.graphics.init(subpass.clone());
     }
 }
