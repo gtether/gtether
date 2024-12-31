@@ -1,29 +1,35 @@
-use std::cell::{Cell, RefCell};
-use std::fmt::Debug;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
 use tracing::{event, Level};
 
-use vulkano::{Validated, VulkanError, VulkanLibrary};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
-use vulkano::device::{Device as VKDevice, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
+use vulkano::device::{Device as VKDevice, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
 use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::swapchain::{Surface, SurfaceCapabilities};
 use vulkano::sync::GpuFuture;
-use crate::EngineMetadata;
+use vulkano::{Validated, VulkanError, VulkanLibrary};
+
+use crate::event::{EventBus, EventBusRegistry, EventType};
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::swapchain::Swapchain;
+use crate::EngineMetadata;
 
+pub mod attachment;
+pub mod font;
+pub mod image;
+pub mod pipeline;
 pub mod render_pass;
 pub mod swapchain;
-pub mod font;
+pub mod uniform;
 
 pub struct Instance {
     inner: Arc<VKInstance>,
@@ -257,73 +263,159 @@ pub trait RenderTarget: Debug + Send + Sync + 'static {
     }
 }
 
+/// [EventType] for [Renderer][r] [Events][evt].
+///
+/// See also: [RendererEventData].
+///
+/// [r]: Renderer
+/// [evt]: crate::event::Event
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RendererEventType {
+    /// The [Renderer] is stale.
+    ///
+    /// This event is fired when e.g. the [RenderTarget]'s size has changed, or anything else that
+    /// would invalidate the framebuffers. This is a good place to hook into for recreating Vulkan
+    /// pipelines / etc.
+    Stale,
+
+    /// The [Renderer] is about to render a frame.
+    ///
+    /// This event is cancellable, and cancelling it will stop the current frame from rendering.
+    PreRender,
+
+    /// The [Renderer] has just finished rendering a frame.
+    PostRender,
+}
+
+impl EventType for RendererEventType {
+    fn is_cancellable(&self) -> bool {
+        match self {
+            RendererEventType::PreRender => true,
+            _ => false,
+        }
+    }
+}
+
+/// Event data for [Renderer][r] [Events][evt].
+///
+/// See also: [RendererEventType].
+///
+/// [r]: Renderer
+/// [evt]: crate::event::Event
+pub struct RendererEventData {
+    target: Arc<dyn RenderTarget>,
+}
+
+impl RendererEventData {
+    /// The [RenderTarget] the [Renderer] is using.
+    #[inline]
+    pub fn target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+}
+
 /// Overall structure that handles rendering for a particular render target.
 ///
 /// Given a [RenderTarget] and an [EngineRenderPass], the [Renderer] will handle the actual logic
 /// around rendering to the target using an internally handled swapchain.
 pub struct Renderer {
     target: Arc<dyn RenderTarget>,
-    render_pass: RefCell<Box<dyn EngineRenderPass>>,
-    swapchain: RefCell<Swapchain>,
-    stale: Cell<bool>,
+    // TODO: Make render passes Arcs instead of Boxes; needs init() to be removed I think?
+    render_pass: Box<dyn EngineRenderPass>,
+    swapchain: Swapchain,
+    stale: bool,
+    event_bus: Arc<EventBus<RendererEventType, RendererEventData>>,
+    endpoint_render_pass: ump::Server<Box<dyn EngineRenderPass>, (), ()>,
 }
 
 impl Renderer {
     /// Create a new renderer for a particular [RenderTarget] and [EngineRenderPass].
-    pub fn new(target: &Arc<dyn RenderTarget>, render_pass: Box<dyn EngineRenderPass>) -> Self {
-        let pipeline_cell = RefCell::new(render_pass);
-        let swapchain = {
-            let mut render_pass = pipeline_cell.borrow_mut();
-            render_pass.recreate(target);
-            Swapchain::new(target, &render_pass)
+    pub fn new(target: &Arc<dyn RenderTarget>, mut render_pass: Box<dyn EngineRenderPass>) -> (Self, RendererHandle) {
+        let (endpoint_render_pass, sender_render_pass) = ump::channel();
+
+        render_pass.init(target);
+        let swapchain = Swapchain::new(target, &*render_pass);
+
+        let event_bus = Arc::new(EventBus::default());
+
+        let renderer = Self {
+            target: target.clone(),
+            render_pass,
+            swapchain,
+            stale: false,
+            event_bus: event_bus.clone(),
+            endpoint_render_pass,
         };
 
-        Self {
+        let handle = RendererHandle {
             target: target.clone(),
-            render_pass: pipeline_cell,
-            swapchain: RefCell::new(swapchain),
-            stale: Cell::new(false),
-        }
+            event_bus,
+            sender_render_pass,
+        };
+
+        (renderer, handle)
+    }
+
+    /// The [EventBusRegistry] for this Renderer's [events][re].
+    ///
+    /// [re]: RendererEventType
+    #[inline]
+    pub fn event_bus(&self) -> &EventBusRegistry<RendererEventType, RendererEventData> {
+        self.event_bus.registry()
     }
 
     /// Replace the current [EngineRenderPass] with a new one.
     ///
-    /// Marks the renderer as stale, and will cause relevant resources to be recreated during the
-    /// next call to [Renderer::render]().
+    /// Marks the renderer as stale, and will cause a [stale event][se] to be fired during the next
+    /// call to [Renderer::render()].
+    ///
+    /// [se]: RendererEventType::Stale
     pub fn set_render_pass(&mut self, render_pass: Box<dyn EngineRenderPass>) {
-        self.render_pass.replace(render_pass);
-
-        self.stale.set(true);
+        self.render_pass = render_pass;
+        self.render_pass.init(&self.target);
+        self.stale = true;
     }
 
     /// Render a frame.
     ///
     /// Handles the logic required for recreating stale resources, rendering to a free framebuffer,
     /// and swapping framebuffers in the swapchain.
-    pub fn render(&self) {
+    pub fn render(&mut self) {
+        // Check for any outside updates
+        while let Some((render_pass, rctx))
+                = self.endpoint_render_pass.try_pop().unwrap_or(None) {
+            self.set_render_pass(render_pass);
+            rctx.reply(()).unwrap();
+        }
+
         let target = &self.target;
         let device = target.device();
 
-        if self.stale.get() {
+        if self.stale {
             event!(Level::TRACE, "Renderer for target {target:?} is stale, recreating");
-            let mut render_pass = self.render_pass.borrow_mut();
-            render_pass.recreate(target);
-            self.swapchain.borrow_mut().recreate(&render_pass)
+            self.event_bus.fire(RendererEventType::Stale, RendererEventData {
+                target: target.clone(),
+            });
+            self.swapchain.recreate(&*self.render_pass)
                 .expect("Failed to recreate swapchain");
 
-            self.stale.set(false);
+            self.stale = false;
         }
 
-        let swapchain = self.swapchain.borrow();
-        let (frame, suboptimal, join_future) = match swapchain.acquire_next_frame() {
+        let pre_render_event = self.event_bus.fire(RendererEventType::PreRender, RendererEventData {
+            target: target.clone(),
+        });
+        if pre_render_event.is_cancelled() {
+            return
+        }
+
+        let (frame, suboptimal, join_future) = match self.swapchain.acquire_next_frame() {
             Ok(r) => r,
             Err(VulkanError::OutOfDate) => {
-                self.stale.set(true);
+                self.stale = true;
                 return
             },
             Err(e) => panic!("Failed to acquire next frame: {e}"),
         };
-        if suboptimal { self.stale.set(true); }
+        if suboptimal { self.stale = true; }
 
         let mut command_builder = AutoCommandBufferBuilder::primary(
             device.command_buffer_allocator().as_ref(),
@@ -331,7 +423,7 @@ impl Renderer {
             CommandBufferUsage::OneTimeSubmit,
         ).map_err(Validated::unwrap)
             .expect("Failed to allocate command builder");
-        self.render_pass.borrow().build_commands(&mut command_builder, frame);
+        self.render_pass.build_commands(&mut command_builder, frame);
         let command = command_builder.build().map_err(Validated::unwrap)
             .expect("Failed to build command");
 
@@ -340,17 +432,77 @@ impl Renderer {
 
         match frame.flush_command(command_future) {
             Ok(_) => {},
-            Err(VulkanError::OutOfDate) => { self.stale.set(true); },
+            Err(VulkanError::OutOfDate) => { self.stale = true; },
             Err(e) => panic!("Failed to flush command: {e}"),
         };
+
+        self.event_bus.fire(RendererEventType::PostRender, RendererEventData {
+            target: target.clone(),
+        });
     }
 
-    /// Mark this renderer as stale, required a recreation of some resources.
+    /// Mark this renderer as stale, requiring a recreation of some resources.
     ///
     /// Used for example when the render target's surface changes size.
+    ///
+    /// Will fire a [stale event][se] during the next call to [Renderer::render()].
+    ///
+    /// [se]: RendererEventType::Stale
     #[inline]
-    pub fn mark_stale(&self) {
-        self.stale.set(true);
+    pub fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+}
+
+/// Threaded handle to a [Renderer].
+///
+/// This handle is cheaply cloneable, and can be used to interact with a [Renderer] from other
+/// threads.
+///
+/// NOTE: It is not recommended to use a RendererHandle to interact with a [Renderer] from the same
+/// thread that the [Renderer] lives in, as that could lead to deadlocks due to the implementation
+/// of these handles.
+#[derive(Clone)]
+pub struct RendererHandle {
+    target: Arc<dyn RenderTarget>,
+    event_bus: Arc<EventBus<RendererEventType, RendererEventData>>,
+    sender_render_pass: ump::Client<Box<dyn EngineRenderPass>, (), ()>,
+}
+
+impl Debug for RendererHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RendererHandle")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RendererHandle {
+    /// The [RenderTarget] for this [Renderer].
+    #[inline]
+    pub fn target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+
+    /// The [EventBusRegistry] for this [Renderer].
+    #[inline]
+    pub fn event_bus(&self) -> &EventBusRegistry<RendererEventType, RendererEventData> {
+        self.event_bus.registry()
+    }
+
+    /// Replace this [Renderer]'s [EngineRenderPass] with a new one.
+    ///
+    /// Sends the new [EngineRenderPass] to the renderer's owning thread, and blocks until a
+    /// response has been received which indicates the [EngineRenderPass] was successfully replaced.
+    ///
+    /// # Deadlocks
+    ///
+    /// This will deadlock if called from the thread that owns the [Renderer]. Use
+    /// [Renderer::set_render_pass()] instead to set the [EngineRenderPass] from the same thread.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the renderer has been destroyed.
+    pub fn set_render_pass(&self, render_pass: Box<dyn EngineRenderPass>) {
+        self.sender_render_pass.req(render_pass).unwrap();
     }
 }
 

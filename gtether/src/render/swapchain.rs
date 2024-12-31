@@ -3,17 +3,18 @@ use std::ops::Deref;
 use std::sync::Arc;
 use tracing::{event, Level};
 
-use vulkano::{swapchain, sync, Validated, VulkanError};
 use vulkano::command_buffer::CommandBufferExecFuture;
 use vulkano::device::Device as VKDevice;
-use vulkano::image::{Image, ImageUsage};
 use vulkano::image::view::ImageView;
+use vulkano::image::{Image, ImageUsage};
 use vulkano::render_pass::{Framebuffer as VKFramebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::swapchain::{PresentFuture, Swapchain as VKSwapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
 use vulkano::sync::GpuFuture;
+use vulkano::{swapchain, sync, Validated, VulkanError};
 
-use crate::render::render_pass::{AttachmentBuffer, EngineRenderPass};
+use crate::render::attachment::AttachmentType;
+use crate::render::render_pass::EngineRenderPass;
 use crate::render::RenderTarget;
 
 type FrameFence = FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>;
@@ -59,15 +60,15 @@ impl Framebuffer {
     fn for_images(
         target: &Arc<dyn RenderTarget>,
         vk_swapchain: &Arc<VKSwapchain>,
-        render_pass: &Box<dyn EngineRenderPass>,
+        render_pass: &dyn EngineRenderPass,
         images: &Vec<Arc<Image>>,
     ) -> Vec<Framebuffer> {
         let attachment_map = render_pass.attachment_map();
         images.iter().enumerate().map(|(idx, image)| {
             let attachments = attachment_map.get_attachments_for_frame(idx).unwrap().iter()
                 .map(|atch_buffer| match atch_buffer {
-                    AttachmentBuffer::Transient(image_view) => image_view.clone(),
-                    AttachmentBuffer::Output() => ImageView::new_default(image.clone()).unwrap(),
+                    AttachmentType::Transient(image_view) => image_view.clone(),
+                    AttachmentType::Output => ImageView::new_default(image.clone()).unwrap(),
                 }).collect::<Vec<_>>();
             Framebuffer::new(
                 idx,
@@ -147,7 +148,7 @@ pub(in crate::render) struct Swapchain {
 }
 
 impl Swapchain {
-    pub(in crate::render) fn new(target: &Arc<dyn RenderTarget>, render_pass: &Box<dyn EngineRenderPass>) -> Self {
+    pub(in crate::render) fn new(target: &Arc<dyn RenderTarget>, render_pass: &dyn EngineRenderPass) -> Self {
         let device = target.device();
         let physical_device = device.physical_device();
 
@@ -187,7 +188,7 @@ impl Swapchain {
         }
     }
 
-    pub(in crate::render) fn recreate(&mut self, render_pass: &Box<dyn EngineRenderPass>) -> Result<(), VulkanError> {
+    pub(in crate::render) fn recreate(&mut self, render_pass: &dyn EngineRenderPass) -> Result<(), VulkanError> {
         let (vk_swapchain, images) = self.vk_swapchain.recreate(
             SwapchainCreateInfo {
                 image_extent: self.target.dimensions().into(),

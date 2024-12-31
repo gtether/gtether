@@ -11,25 +11,25 @@ use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
 
-use crate::render::{FlatVertex, RenderTarget};
 use crate::render::font::compositor::FontRenderer;
 use crate::render::font::layout::PositionedChar;
 use crate::render::font::size::FontSizer;
+use crate::render::image::ImageSampler;
+use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use crate::render::{FlatVertex, RenderTarget, RendererHandle};
 
 /// Starting character code (inclusive) of the Unicode Latin chart
 pub const UNICODE_LATIN_START: u32 = 0x20;
@@ -182,43 +182,21 @@ mod text_frag {
 pub struct FontSheetRenderer {
     target: Arc<dyn RenderTarget>,
     font_sheet: Arc<FontSheet>,
-    graphics: Option<Arc<GraphicsPipeline>>,
-    descriptor_set: Option<Arc<PersistentDescriptorSet>>,
+    graphics: Arc<EngineGraphicsPipeline>,
+    font_sampler: Arc<ImageSampler>,
     glyph_buffer: Subbuffer<[FlatVertex]>,
 }
 
 impl FontSheetRenderer {
     /// Create a [FontSheetRenderer] from a [FontSheet].
-    pub fn new(target: Arc<dyn RenderTarget>, font_sheet: Arc<FontSheet>) -> Box<dyn FontRenderer> {
-        let glyph_buffer = FlatVertex::buffer(
-            target.device().memory_allocator().clone(),
-            glm::vec2(0.0, 0.0),
-            glm::vec2(1.0, 1.0),
-        );
+    pub fn new(renderer: &RendererHandle, font_sheet: Arc<FontSheet>) -> Box<dyn FontRenderer> {
+        let target = renderer.target();
 
-        Box::new(Self {
-            target,
-            font_sheet,
-            graphics: None,
-            descriptor_set: None,
-            glyph_buffer,
-        })
-    }
-}
-
-impl FontRenderer for FontSheetRenderer {
-    fn recreate(&mut self, subpass: &Subpass) {
-        let viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: self.target.dimensions().into(),
-            depth_range: 0.0..=1.0,
-        };
-
-        let text_vert = text_vert::load(self.target.device().vk_device().clone())
+        let text_vert = text_vert::load(target.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let text_frag = text_frag::load(self.target.device().vk_device().clone())
+        let text_frag = text_frag::load(target.device().vk_device().clone())
             .expect("Failed to create fragment shader module")
             .entry_point("main").unwrap();
 
@@ -233,20 +211,27 @@ impl FontRenderer for FontSheetRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            self.target.device().vk_device().clone(),
+            target.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(self.target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(target.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
 
-        let graphics = GraphicsPipeline::new(
-            self.target.device().vk_device().clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                viewport_state: Some(ViewportState {
-                    viewports: [viewport].into_iter().collect(),
-                    ..Default::default()
-                }),
+        let base_create_info = GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state,
+            input_assembly_state: Some(InputAssemblyState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        };
+
+        let graphics = EngineGraphicsPipeline::new(
+            renderer,
+            move |subpass| GraphicsPipelineCreateInfo {
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     subpass.num_color_attachments(),
                     ColorBlendAttachmentState {
@@ -254,50 +239,48 @@ impl FontRenderer for FontSheetRenderer {
                         ..Default::default()
                     },
                 )),
-                subpass: Some(subpass.clone().into()),
-                stages: stages.into_iter().collect(),
-                vertex_input_state,
-                input_assembly_state: Some(InputAssemblyState::default()),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::Back,
+                ..base_create_info.clone()
+            },
+        );
+
+        let font_sampler = ImageSampler::new(
+            renderer,
+            graphics.clone(),
+            font_sheet.image_view().clone(),
+            0,
+            Sampler::new(
+                target.device().vk_device().clone(),
+                SamplerCreateInfo {
+                    mag_filter: Filter::Linear,
+                    min_filter: Filter::Linear,
                     ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            }
-        ).unwrap();
+                }
+            ).unwrap(),
+        );
 
-        let sampler = Sampler::new(
-            self.target.device().vk_device().clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
-                ..Default::default()
-            }
-        ).unwrap();
+        let glyph_buffer = FlatVertex::buffer(
+            target.device().memory_allocator().clone(),
+            glm::vec2(0.0, 0.0),
+            glm::vec2(1.0, 1.0),
+        );
 
-        let descriptor_set = PersistentDescriptorSet::new(
-            self.target.device().descriptor_set_allocator(),
-            graphics.layout().set_layouts().get(0).unwrap().clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(
-                    0,
-                    self.font_sheet.image_view().clone(),
-                    sampler,
-                ),
-            ],
-            [],
-        ).unwrap();
+        Box::new(Self {
+            target: target.clone(),
+            font_sheet,
+            graphics,
+            font_sampler,
+            glyph_buffer,
+        })
+    }
+}
 
-        self.graphics = Some(graphics);
-        self.descriptor_set = Some(descriptor_set);
+impl FontRenderer for FontSheetRenderer {
+    fn init(&mut self, subpass: &Subpass) {
+        self.graphics.init(subpass.clone());
     }
 
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, buffer: Vec<PositionedChar>) {
-        let graphics = self.graphics.as_ref()
-            .expect(".recreate() not called yet");
-        let descriptor_set = self.descriptor_set.as_ref()
-            .expect(".recreate() not called yet");
+        let graphics = self.graphics.vk_graphics();
 
         let mapper = self.font_sheet.mapper();
         let sizer = self.font_sheet.sizer();
@@ -356,7 +339,7 @@ impl FontRenderer for FontSheetRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                descriptor_set.clone(),
+                self.font_sampler.descriptor_set(),
             ).unwrap()
             .bind_vertex_buffers(0, (
                 self.glyph_buffer.clone(),

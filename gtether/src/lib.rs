@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+pub mod event;
 #[cfg(feature = "gui")]
 pub mod gui;
 #[cfg(feature = "graphics")]

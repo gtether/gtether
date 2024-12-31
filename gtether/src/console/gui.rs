@@ -3,25 +3,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tracing::{event, Level};
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
 use winit::event::ElementState;
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::console::log::ConsoleLogRecord;
 use crate::console::Console;
+use crate::event::{Event, EventHandler};
 use crate::gui::input::{InputDelegateEvent, InputDelegateLock};
 use crate::gui::window::WindowHandle;
 use crate::render::font::compositor::FontCompositor;
@@ -29,10 +27,13 @@ use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, La
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
 use crate::render::font::size::{FontSize, FontSizer};
 use crate::render::font::{Font, GlyphFont};
-use crate::render::render_pass::{AttachmentMap, EngineRenderHandler};
+use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use crate::render::render_pass::EngineRenderHandler;
 use crate::render::swapchain::Framebuffer;
-use crate::render::{FlatVertex, RenderTarget};
+use crate::render::uniform::Uniform;
+use crate::render::{FlatVertex, RenderTarget, RendererEventData, RendererEventType, RendererHandle};
 use crate::NonExhaustive;
+use crate::render::attachment::AttachmentMap;
 
 /// General alignment configuration for a [ConsoleGui] section.
 #[derive(Debug, Clone)]
@@ -305,7 +306,7 @@ impl ConsoleGui {
 
         // TODO: Make the console font configurable. Likely will depend on future Resources system
         let font = Box::new(GlyphFont::try_from_slice(
-            window_handle.render_target().device(),
+            window_handle.renderer().target().device(),
             include_bytes!("RobotoMono/RobotoMono-VariableFont_wght.ttf"),
         ).unwrap()) as Box<dyn Font>;
 
@@ -315,7 +316,7 @@ impl ConsoleGui {
         );
 
         let (text_log, text_prompt) = Self::create_text_layouts(
-            window_handle.render_target(),
+            window_handle.renderer().target(),
             &create_info.layout,
             font_sheet.sizer(),
         );
@@ -330,8 +331,10 @@ impl ConsoleGui {
             text_log: Mutex::new(text_log),
             text_prompt: Mutex::new(text_prompt),
         });
-        let gui = orig_gui.clone();
 
+        window_handle.renderer().event_bus().register(RendererEventType::Stale, orig_gui.clone());
+
+        let gui = orig_gui.clone();
         thread::spawn(move || {
             let mut input_lock: Option<InputDelegateLock> = None;
             delegate.start(|delegate, event| {
@@ -378,14 +381,20 @@ impl ConsoleGui {
         });
 
         let renderer = Box::new(ConsoleRenderer::new(
-            window_handle.render_target().clone(),
+            window_handle.renderer(),
             orig_gui.clone(),
         ));
 
         (orig_gui, renderer)
     }
+}
 
-    fn recreate(&self, target: &Arc<dyn RenderTarget>) {
+impl EventHandler<RendererEventType, RendererEventData> for ConsoleGui {
+    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
+        assert_eq!(event.event_type(), &RendererEventType::Stale,
+                   "ConsoleGui can only handle 'Stale' Renderer events");
+        let target = event.target();
+
         let (mut new_text_log, mut new_text_prompt) = Self::create_text_layouts(
             target,
             &self.layout,
@@ -438,16 +447,16 @@ mod background_solid_frag {
     }
 }
 
-struct ConsoleBackgroundRenderer {
-    target: Arc<dyn RenderTarget>,
-    gui: Arc<ConsoleGui>,
-    graphics: Option<Arc<GraphicsPipeline>>,
-    descriptor_set: Option<Arc<PersistentDescriptorSet>>,
+struct ConsoleBackgroundSolidRenderer {
+    graphics: Arc<EngineGraphicsPipeline>,
+    color: Arc<Uniform<BackgroundSolid>>,
     buffer: Subbuffer<[FlatVertex]>,
 }
 
-impl ConsoleBackgroundRenderer {
-    fn new(target: Arc<dyn RenderTarget>, gui: Arc<ConsoleGui>) -> Self {
+impl ConsoleBackgroundSolidRenderer {
+    fn new(renderer: &RendererHandle, gui: &Arc<ConsoleGui>, bg: BackgroundSolid) -> Self {
+        let target = renderer.target();
+
         let (min, max) = gui.layout.screen_bounds();
         let buffer = FlatVertex::buffer(
             target.device().memory_allocator().clone(),
@@ -455,33 +464,13 @@ impl ConsoleBackgroundRenderer {
             max,
         );
 
-        Self {
-            target,
-            gui,
-            graphics: None,
-            descriptor_set: None,
-            buffer,
-        }
-    }
-
-    fn recreate(&mut self, subpass: &Subpass) {
-        let viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: self.target.dimensions().into(),
-            depth_range: 0.0..=1.0,
-        };
-
-        let background_vert = background_vert::load(self.target.device().vk_device().clone())
+        let background_vert = background_vert::load(target.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let background_frag = match &self.gui.background {
-            ConsoleGuiBackground::Solid(_) => {
-                background_solid_frag::load(self.target.device().vk_device().clone())
-                    .expect("Failed to create fragment shader module")
-                    .entry_point("main").unwrap()
-            }
-        };
+        let background_frag = background_solid_frag::load(target.device().vk_device().clone())
+            .expect("Failed to create fragment shader module")
+            .entry_point("main").unwrap();
 
         let vertex_input_state = Some(FlatVertex::per_vertex()
             .definition(&background_vert.info().input_interface)
@@ -493,20 +482,27 @@ impl ConsoleBackgroundRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            self.target.device().vk_device().clone(),
+            target.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(self.target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(target.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
 
-        let graphics = GraphicsPipeline::new(
-            self.target.device().vk_device().clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                viewport_state: Some(ViewportState {
-                    viewports: [viewport].into_iter().collect(),
-                    ..Default::default()
-                }),
+        let base_create_info = GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state,
+            input_assembly_state: Some(InputAssemblyState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        };
+
+        let graphics = EngineGraphicsPipeline::new(
+            renderer,
+            move |subpass| GraphicsPipelineCreateInfo {
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     subpass.num_color_attachments(),
                     ColorBlendAttachmentState {
@@ -514,54 +510,30 @@ impl ConsoleBackgroundRenderer {
                         ..Default::default()
                     },
                 )),
-                subpass: Some(subpass.clone().into()),
-                stages: stages.into_iter().collect(),
-                vertex_input_state,
-                input_assembly_state: Some(InputAssemblyState::default()),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::Back,
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
+                ..base_create_info.clone()
             },
-        ).unwrap();
+        );
 
-        let descriptor_writes = match &self.gui.background {
-            ConsoleGuiBackground::Solid(bg_color) => {
-                let buffer = Buffer::from_data(
-                    self.target.device().memory_allocator().clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::UNIFORM_BUFFER,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    bg_color.clone(),
-                ).unwrap();
+        let color = Uniform::new(
+            bg,
+            renderer,
+            graphics.clone(),
+            0,
+        );
 
-                [WriteDescriptorSet::buffer(0, buffer)]
-            }
-        };
+        Self {
+            graphics,
+            color,
+            buffer,
+        }
+    }
 
-        let descriptor_set = PersistentDescriptorSet::new(
-            self.target.device().descriptor_set_allocator(),
-            graphics.layout().set_layouts().get(0).unwrap().clone(),
-            descriptor_writes,
-            [],
-        ).unwrap();
-
-        self.graphics = Some(graphics);
-        self.descriptor_set = Some(descriptor_set);
+    fn init(&self, subpass: &Subpass) {
+        self.graphics.init(subpass.clone());
     }
 
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
-        let graphics = self.graphics.as_ref()
-            .expect(".recreate() not called yet");
-        let descriptor_set = self.descriptor_set.as_ref()
-            .expect(".recreate() not called yet");
+        let graphics = self.graphics.vk_graphics();
 
         builder
             .bind_pipeline_graphics(graphics.clone()).unwrap()
@@ -569,7 +541,7 @@ impl ConsoleBackgroundRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                descriptor_set.clone(),
+                self.color.descriptor_set().clone(),
             ).unwrap()
             .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
             .draw(
@@ -581,6 +553,34 @@ impl ConsoleBackgroundRenderer {
     }
 }
 
+enum ConsoleBackgroundRenderer {
+    Solid(ConsoleBackgroundSolidRenderer),
+}
+
+impl ConsoleBackgroundRenderer {
+    fn new(renderer: &RendererHandle, gui: &Arc<ConsoleGui>) -> Self {
+        match &gui.background {
+            ConsoleGuiBackground::Solid(bg) => ConsoleBackgroundRenderer::Solid(
+                ConsoleBackgroundSolidRenderer::new(renderer, gui, bg.clone())
+            ),
+        }
+    }
+
+    fn init(&self, subpass: &Subpass) {
+        match self {
+            ConsoleBackgroundRenderer::Solid(renderer)
+                => renderer.init(subpass),
+        }
+    }
+
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+        match self {
+            ConsoleBackgroundRenderer::Solid(renderer)
+                => renderer.build_commands(builder),
+        }
+    }
+}
+
 struct ConsoleRenderer {
     target: Arc<dyn RenderTarget>,
     gui: Arc<ConsoleGui>,
@@ -589,22 +589,20 @@ struct ConsoleRenderer {
 }
 
 impl ConsoleRenderer {
-    fn new(target: Arc<dyn RenderTarget>, gui: Arc<ConsoleGui>) -> Self {
-        let background = ConsoleBackgroundRenderer::new(
-            target.clone(),
-            gui.clone(),
-        );
+    fn new(renderer: &RendererHandle, gui: Arc<ConsoleGui>) -> Self {
+        let target = renderer.target();
+
+        let background = ConsoleBackgroundRenderer::new(renderer, &gui);
 
         let font_compositor = FontCompositor::new(
-            target.clone(),
             FontSheetRenderer::new(
-                target.clone(),
+                renderer,
                 gui.font_sheet.clone(),
             ),
         );
 
         Self {
-            target,
+            target: target.clone(),
             gui,
             background,
             font_compositor,
@@ -672,9 +670,9 @@ impl EngineRenderHandler for ConsoleRenderer {
         pass.end_pass();
     }
 
-    fn recreate(&mut self, _target: &Arc<dyn RenderTarget>, subpass: &Subpass, _attachments: &Arc<dyn AttachmentMap>) {
-        self.background.recreate(subpass);
-        self.gui.recreate(&self.target);
-        self.font_compositor.recreate(subpass);
+    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, _attachments: &Arc<dyn AttachmentMap>) {
+        self.target = target.clone();
+        self.background.init(subpass);
+        self.font_compositor.init(subpass);
     }
 }

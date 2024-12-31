@@ -21,8 +21,8 @@ use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::render_pass::EngineRenderPassBuilder;
-
-use crate::render::{MN, Uniform, UniformSet, VP};
+use gtether::render::uniform::{Uniform, UniformSet};
+use crate::render::{MN, VP};
 use crate::render::ambient::{AmbientLight, AmbientRenderer};
 use crate::render::cube::CubeRenderer;
 use crate::render::directional::{DirectionalRenderer, PointLight};
@@ -45,7 +45,7 @@ impl Command for AmbientLightCommand {
         let b: f32 = parameters[2].parse()
             .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
 
-        self.ambient_light.set(AmbientLight::new(r, g, b, 1.0));
+        *self.ambient_light.write() = AmbientLight::new(r, g, b, 1.0);
 
         Ok(())
     }
@@ -60,7 +60,7 @@ impl Command for PointLightListCommand {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
 
-        for (idx, point_light) in self.point_lights.get().into_iter().enumerate() {
+        for (idx, point_light) in self.point_lights.read().iter().enumerate() {
             event!(Level::INFO, "{idx}: {point_light:?}");
         }
 
@@ -77,7 +77,7 @@ impl Command for PointLightDeleteCommand {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         ParamCountCheck::Equal(1).check(parameters.len() as u32)?;
 
-        let mut point_lights = self.point_lights.get();
+        let mut point_lights = self.point_lights.write();
 
         let idx: usize = parameters[0].parse()
             .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
@@ -87,7 +87,6 @@ impl Command for PointLightDeleteCommand {
         }
 
         point_lights.remove(idx);
-        self.point_lights.set(point_lights);
 
         Ok(())
     }
@@ -124,12 +123,11 @@ impl Command for PointLightAddCommand {
                 .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
         }
 
-        let mut point_lights = self.point_lights.get();
+        let mut point_lights = self.point_lights.write();
         point_lights.push(PointLight {
             position: [x, y, z, 1.0],
             color: [r, g, b],
         });
-        self.point_lights.set(point_lights);
 
         Ok(())
     }
@@ -246,31 +244,31 @@ impl Application for WindowsApp {
                 .with_title("Windowing Test"),
             ..Default::default()
         });
-        window.set_cursor_visible(false);
+        //window.set_cursor_visible(false);
 
-        let cube_renderer = CubeRenderer::new(window.render_target());
+        let cube_renderer = CubeRenderer::new(window.renderer());
         let mn = cube_renderer.mn().clone();
-        mn.set(MN::new(model));
+        *mn.write() = MN::new(model);
         let vp = cube_renderer.vp().clone();
-        vp.set(VP {
+        *vp.write() = VP {
             view: self.camera.borrow().view(),
             projection: identity(),
-        });
+        };
 
-        let ambient_renderer = AmbientRenderer::new(window.render_target());
+        let ambient_renderer = AmbientRenderer::new(window.renderer());
         let ambient_light = ambient_renderer.light().clone();
         cmd_registry.register_command("ambient", Box::new(AmbientLightCommand {
             ambient_light,
         })).unwrap();
 
-        let directional_renderer = DirectionalRenderer::new(window.render_target());
+        let directional_renderer = DirectionalRenderer::new(window.renderer());
         let point_lights = directional_renderer.lights().clone();
-        point_lights.set(vec![
+        *point_lights.write() = vec![
             PointLight {
                 position: [-4.0, -4.0, 0.0, 1.0],
                 color: [0.8, 0.8, 0.8],
             },
-        ]);
+        ];
 
         let mut point_light_subcommands = CommandTree::default();
         point_light_subcommands.register_command("list", Box::new(PointLightListCommand {
@@ -296,7 +294,7 @@ impl Application for WindowsApp {
             ConsoleGuiCreateInfo::default(),
         );
 
-        let render_pass = EngineRenderPassBuilder::new(window.render_target())
+        let render_pass = EngineRenderPassBuilder::new(window.renderer())
             .attachment("color".into(), AttachmentDescription {
                 format: Format::A2B10G10R10_UNORM_PACK32,
                 samples: SampleCount::Sample1,
@@ -334,7 +332,7 @@ impl Application for WindowsApp {
             .handler(console_renderer)
             .end_subpass()
             .build();
-        window.set_render_pass(render_pass);
+        window.renderer().set_render_pass(render_pass);
 
         cmd_registry.register_command("dump", Box::new(ConsoleDumpCommand {
             log: self.console.log().clone(),
@@ -350,12 +348,14 @@ impl Application for WindowsApp {
         let window = self.window.get().unwrap();
 
         let mn = self.mn.get().unwrap();
-        let model = mn.get();
-        mn.set(MN::new(glm::rotate_normalized_axis(
-            &model.model,
-            delta.as_secs_f32(),
-            &glm::vec3(0.0, 0.0, 1.0),
-        )));
+        {
+            let mut mn = mn.write();
+            *mn = MN::new(glm::rotate_normalized_axis(
+                &mn.model,
+                delta.as_secs_f32(),
+                &glm::vec3(0.0, 0.0, 1.0),
+            ));
+        }
 
         let speed = 5.0;
         let rotate_speed = 0.001;
@@ -408,10 +408,11 @@ impl Application for WindowsApp {
         }
 
         if changed {
-            let vp_uniform = self.vp.get().unwrap();
-            let mut vp = vp_uniform.get();
-            vp.view = camera.view();
-            vp_uniform.set(vp);
+            let vp = self.vp.get().unwrap();
+            {
+                let mut vp = vp.write();
+                vp.view = camera.view();
+            }
         }
 
         if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap_or(false) {
