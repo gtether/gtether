@@ -172,16 +172,31 @@ pub trait EventHandler<T: EventType, D>: Send + Sync + 'static {
 /// manner.
 ///
 /// For more complex cases, a struct-based event handler that implements [EventHandler] can be used.
-/// These are also expected to be wrapped in Arc, but generally can handle more complex interactions.
+/// Struct-based handlers can be turned into two different types of EventSubscribers:
 ///
-/// Lastly, if you expect your struct-based event handler to have a limited lifetime, you can create
-/// an EventSubscriber from a Weak reference.
+///  * A Ref EventSubscriber. This is created by giving either an Arc or Weak smart pointer to a
+///    [register function][reg]. The [EventBus] does not own these handlers, and only maintains a
+///    weak reference, allowing them to be dropped externally.
+///  * An Owned EventSubscriber. The [EventBus] will own this handler, and is responsible for its
+///    lifecycle. Due to limitations will broad-scale trait implementation for From<>, this cannot
+///    be auto-converted into when [registering][reg], and so will need to be manually created as
+///    such:
+///     ```
+///     # use std::sync::Arc;
+///     # use gtether::event::{EventType, EventHandler};
+///     use gtether::event::EventSubscriber;
+///
+///     # fn wrapper<T: EventType, D, H: EventHandler<T, D>>(handler: Arc<H>) {
+///     let subscriber = EventSubscriber::Owned(handler);
+///     # }
+///     ```
 ///
 /// [evt]: Event
 /// [et]: EventType
+/// [reg]: EventBusRegistry::register
 pub enum EventSubscriber<T: EventType, D> {
-    Strong(Arc<dyn EventHandler<T, D>>),
-    Weak(Weak<dyn EventHandler<T, D>>),
+    Owned(Arc<dyn EventHandler<T, D>>),
+    Ref(Weak<dyn EventHandler<T, D>>),
     Fn(SubscriberFn<T, D>),
 }
 
@@ -191,7 +206,16 @@ where
     H: EventHandler<T, D>,
 {
     #[inline]
-    fn from(value: Arc<H>) -> Self { Self::Strong(value) }
+    fn from(value: Arc<H>) -> Self { Self::Ref(Arc::downgrade(&value) as Weak<dyn EventHandler<T, D>>) }
+}
+
+impl<T, D, H> From<&Arc<H>> for EventSubscriber<T, D>
+where
+    T: EventType,
+    H: EventHandler<T, D>,
+{
+    #[inline]
+    fn from(value: &Arc<H>) -> Self { Self::Ref(Arc::downgrade(value) as Weak<dyn EventHandler<T, D>>) }
 }
 
 impl<T, D, H> From<Weak<H>> for EventSubscriber<T, D>
@@ -200,7 +224,7 @@ where
     H: EventHandler<T, D>,
 {
     #[inline]
-    fn from(value: Weak<H>) -> Self { Self::Weak(value) }
+    fn from(value: Weak<H>) -> Self { Self::Ref(value) }
 }
 
 impl<T, D, F> From<F> for EventSubscriber<T, D>
@@ -215,8 +239,8 @@ where
 impl<T: EventType, D> Clone for EventSubscriber<T, D> {
     fn clone(&self) -> Self {
         match self {
-            Self::Strong(handler) => Self::Strong(handler.clone()),
-            Self::Weak(handler) => Self::Weak(handler.clone()),
+            Self::Owned(handler) => Self::Owned(handler.clone()),
+            Self::Ref(handler) => Self::Ref(handler.clone()),
             Self::Fn(handler) => Self::Fn(handler.clone()),
         }
     }
@@ -225,11 +249,11 @@ impl<T: EventType, D> Clone for EventSubscriber<T, D> {
 impl<T: EventType, D: 'static> EventSubscriber<T, D> {
     fn handle_event(&self, event: &mut Event<T, D>) -> bool {
         match self {
-            Self::Strong(handler) => {
+            Self::Owned(handler) => {
                 handler.handle_event(event);
                 true
             },
-            Self::Weak(handler) => {
+            Self::Ref(handler) => {
                 if let Some(handler) = handler.upgrade() {
                     handler.handle_event(event);
                     true
@@ -688,11 +712,11 @@ mod tests {
     fn test_fire_event_weak() {
         let event_bus = EventBus::<StringEventType, u32>::default();
         let handler1 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(StringEventType::from("event"), handler1.clone());
+        event_bus.registry().register(StringEventType::from("event"), EventSubscriber::Owned(handler1));
         let handler2 = Arc::new(IncrementHandler {});
         event_bus.registry().register(StringEventType::from("event"), handler2.clone());
         let handler3 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(StringEventType::from("event"), Arc::downgrade(&handler3));
+        event_bus.registry().register(StringEventType::from("event"), handler3.clone());
         let handler4 = Arc::new(IncrementHandler {});
         event_bus.registry().register(StringEventType::from("event"), Arc::downgrade(&handler4));
 
@@ -705,6 +729,6 @@ mod tests {
 
         // Only the 1 weak should no longer be handling
         let result = event_bus.fire("event".into(), 0);
-        assert_eq!(result.into_data(), 3);
+        assert_eq!(result.into_data(), 2);
     }
 }
