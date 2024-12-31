@@ -502,6 +502,7 @@ impl LogicalLine {
         line
     }
 
+    #[allow(unused)]
     fn for_string(info: Arc<TextLayoutInfo>, val: &str, color: glm::TVec3<f32>) -> Self {
         Self::for_buffer(
             info.clone(),

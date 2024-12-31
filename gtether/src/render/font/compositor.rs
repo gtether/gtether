@@ -15,13 +15,12 @@
 //! # use gtether::render::font::layout::TextLayout;
 //! # use gtether::render::RenderTarget;
 //! #
-//! # let target: Arc<dyn RenderTarget> = return;
 //! # let font_renderer: Box<dyn FontRenderer> = return;
 //! # let builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> = return;
 //! # let layout_a: TextLayout = return;
 //! # let layout_b: TextLayout = return;
 //!
-//! let font_compositor = FontCompositor::new(target.clone(), font_renderer);
+//! let font_compositor = FontCompositor::new(font_renderer);
 //!
 //! let mut font_pass = font_compositor.begin_pass(builder);
 //!
@@ -32,20 +31,20 @@
 //! font_pass.end_pass();
 //! ```
 
-use std::sync::Arc;
-
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::render_pass::Subpass;
 
 use crate::render::font::layout::{PositionedChar, TextLayout};
-use crate::render::RenderTarget;
 
 /// Render helper for a concrete font representation.
 ///
 /// These helpers are intended to consume [PositionedChar]s from a [TextLayout], and render them
 /// according to said layout.
 pub trait FontRenderer: Send + Sync + 'static {
-    fn recreate(&mut self, subpass: &Subpass);
+    /// Initialize this FontRenderer for a given subpass.
+    ///
+    /// Should be called exactly once.
+    fn init(&mut self, subpass: &Subpass);
 
     /// Add the relevant render commands to a command buffer.
     fn build_commands(
@@ -60,26 +59,25 @@ pub trait FontRenderer: Send + Sync + 'static {
 /// Takes references to multiple [TextLayout]s in a single-pass, and renders them all to a final
 /// output.
 pub struct FontCompositor {
-    target: Arc<dyn RenderTarget>,
     renderer: Box<dyn FontRenderer>,
 }
 
 impl FontCompositor {
     /// Create a new [FontCompositor] using a specific [FontRenderer], and targeting a specific
     /// [RenderTarget].
-    pub fn new(target: Arc<dyn RenderTarget>, renderer: Box<dyn FontRenderer>) -> Self {
-        Self {
-            target,
-            renderer,
-        }
+    pub fn new(renderer: Box<dyn FontRenderer>) -> Self {
+        Self { renderer }
     }
 
-    pub fn recreate(&mut self, subpass: &Subpass) {
-        self.renderer.recreate(subpass);
+    /// Initialize this compositor (and it's [FontRenderer]) with a given subpass.
+    ///
+    /// Should be called exactly once.
+    pub fn init(&mut self, subpass: &Subpass) {
+        self.renderer.init(subpass);
     }
 
     /// Begin a pass rendering a collection of [TextLayout]s.
-    pub fn begin_pass<'a>(&'a self, builder: &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) -> FontCompositorPass {
+    pub fn begin_pass<'a>(&'a self, builder: &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) -> FontCompositorPass<'a> {
         FontCompositorPass::new(self, builder)
     }
 }
