@@ -64,7 +64,7 @@
 //! [res]: Resource
 //! [rp]: ResourcePath
 //! [rf]: ResourceFuture
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Mutex, MutexGuard};
 use smol::prelude::*;
 use smol::{future, Executor, Task};
 use std::any::{Any, TypeId};
@@ -591,10 +591,21 @@ where
                         async move {
                             // Use a weak reference here to allow the resource to be released if needed
                             if let Some(strong) = async_weak.upgrade() {
-                                let resource_mut = ResourceMut::from_resource(async_id, &strong).await;
-                                match async_loader.update(&resource_mut, data).await {
+                                let _update_lock = strong.update_lock.lock().await;
+
+                                let (resource_mut, drop_checker) = ResourceMut::from_resource(
+                                    async_id.clone(),
+                                    strong.clone(),
+                                );
+                                match async_loader.update(resource_mut, data).await {
                                     Ok(_) => {
-                                        resource_mut.finalize().await;
+                                        match drop_checker.recv().await {
+                                            Ok(_) => { debug!("Drop-checker received an unexpected message"); }
+                                            Err(_) => { /* sender was dropped, this is expected */ }
+                                        }
+
+                                        strong.update_sub_resources(&async_id).await;
+
                                         CacheEntryUpdateResult::Ok
                                     },
                                     Err(e) => CacheEntryUpdateResult::Err(e),
@@ -983,7 +994,7 @@ pub(in crate::resource) mod tests {
     use async_trait::async_trait;
     use smol::Timer;
     use std::time::Duration;
-
+    use parking_lot::RwLock;
     use crate::resource::source::{ResourceData, ResourceDataResult};
 
     pub async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
@@ -1076,11 +1087,11 @@ pub(in crate::resource) mod tests {
 
     #[async_trait]
     impl ResourceLoader<String> for TestResourceLoader {
-        async fn load(&self, mut data: ResourceReadData) -> Result<String, ResourceLoadError> {
+        async fn load(&self, mut data: ResourceReadData) -> Result<Box<String>, ResourceLoadError> {
             let mut output = String::new();
             data.read_to_string(&mut output).await
                 .map_err(|err| ResourceLoadError::from_error(err))
-                .map(|_| output)
+                .map(|_| Box::new(output))
         }
     }
 

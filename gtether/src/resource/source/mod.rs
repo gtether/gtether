@@ -28,6 +28,7 @@
 //! An example of a bare minimum source that simply yields the given id as raw bytes:
 //! ```
 //! use async_trait::async_trait;
+//! use smol::io::Cursor;
 //! use gtether::resource::path::ResourcePath;
 //! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex, ResourceData};
 //!
@@ -37,7 +38,7 @@
 //! impl ResourceSource for ReflectingSource {
 //!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
 //!         Ok(ResourceData::new(
-//!             Box::new(id.as_bytes()),
+//!             Box::new(Cursor::new(id.to_string().into_bytes())),
 //!             // The hash can simply be the ID, since the value won't change for the same ID
 //!             id.to_string().clone(),
 //!         ))
@@ -86,11 +87,11 @@
 //!
 //!     fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
 //!         // _sub_idx can be ignored for this implementation
-//!         self.watchers.lock().unwrap().insert(id, watcher)
+//!         self.watchers.lock().unwrap().insert(id, watcher);
 //!     }
 //!
 //!     fn unwatch(&self, id: &ResourcePath) {
-//!         self.watchers.lock().unwrap().remove(id)
+//!         self.watchers.lock().unwrap().remove(id);
 //!     }
 //! }
 //! ```
@@ -156,7 +157,8 @@
 //!
 //! impl MultiSource {
 //!     fn sub_sources(&self) -> impl Iterator<Item=(usize, &dyn ResourceSource)> {
-//!         todo!("Iterate over sub-sources")
+//!         todo!("Iterate over sub-sources");
+//!         # std::iter::empty()
 //!     }
 //!
 //!     fn get_sub_source(&self, sub_idx: &SourceIndex) -> Result<&dyn ResourceSource, ResourceLoadError> {
@@ -276,7 +278,7 @@ enum SubIndex {
 /// let other_index = SourceIndex::new(4);
 /// let total_index_2 = total_index.clone().with_sub_idx(Some(other_index));
 /// // Remove the sub-index
-/// let total_index = total_index.with_sub_idx(None);
+/// let total_index = total_index.with_sub_idx(None::<SourceIndex>);
 /// ```
 ///
 /// [rs]: ResourceSource

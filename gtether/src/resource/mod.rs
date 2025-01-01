@@ -21,7 +21,7 @@
 //! [eng]: crate::Engine
 
 use async_trait::async_trait;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use smol::future;
 use smol::io::AsyncRead;
 use std::any::TypeId;
@@ -39,15 +39,15 @@ pub mod manager;
 pub mod path;
 pub mod source;
 
-struct SubResourceRef<P: Send + Sync + 'static> {
+struct SubResourceRef<P: ?Sized + Send + Sync + 'static> {
     type_id: TypeId,
     update_fn: Box<dyn (
         Fn(ResourcePath, Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
     ) + Send + Sync + 'static>,
 }
 
-impl<P: Send + Sync + 'static> SubResourceRef<P> {
-    fn new<T: Send + Sync + 'static>(
+impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
+    fn new<T: ?Sized + Send + Sync + 'static>(
         resource: &Arc<Resource<T>>,
         loader: Arc<dyn SubResourceLoader<T, P>>,
     ) -> Self {
@@ -65,9 +65,13 @@ impl<P: Send + Sync + 'static> SubResourceRef<P> {
                         // lock is acquired is when the update lock is held, which it should be
                         // while in this scope.
                         let parent_value = parent.read();
-                        let resource_mut = ResourceMut::from_resource(id, &resource).await;
-                        async_loader.update(&resource_mut, &parent_value).await?;
-                        resource_mut.finalize().await;
+                        let (resource_mut, drop_checker) = ResourceMut::from_resource(id.clone(), resource.clone());
+                        async_loader.update(resource_mut, &parent_value).await?;
+                        match drop_checker.recv().await {
+                            Ok(_) => { debug!("Drop-checker received an unexpected message"); }
+                            Err(_) => { /* sender was dropped, this is expected */ }
+                        }
+                        resource.update_sub_resources(&id).await;
                     }
                     Ok(())
                 }
@@ -80,7 +84,7 @@ impl<P: Send + Sync + 'static> SubResourceRef<P> {
     }
 }
 
-impl<T: Send + Sync + 'static> Debug for SubResourceRef<T> {
+impl<T: ?Sized + Send + Sync + 'static> Debug for SubResourceRef<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubResource")
             .field("type_id", &self.type_id)
@@ -92,7 +96,7 @@ impl<T: Send + Sync + 'static> Debug for SubResourceRef<T> {
 ///
 /// Note: These locks are not async safe, and may result in deadlocks if held across an async await
 /// point. It is recommended to only hold the lock within synchronous code.
-pub type ResourceLock<'a, T> = RwLockReadGuard<'a, T>;
+pub type ResourceLock<'a, T> = MappedRwLockReadGuard<'a, T>;
 
 /// Writeable lock guard for mutating [Resource] data.
 ///
@@ -121,7 +125,7 @@ pub type ResourceLock<'a, T> = RwLockReadGuard<'a, T>;
 /// }
 /// # }
 /// ```
-pub type ResourceMutLock<'a, T> = RwLockWriteGuard<'a, T>;
+pub type ResourceMutLock<'a, T> = MappedRwLockWriteGuard<'a, T>;
 
 /// Handle for an individual resource.
 ///
@@ -161,19 +165,30 @@ pub type ResourceMutLock<'a, T> = RwLockWriteGuard<'a, T>;
 /// [srl]: SubResourceLoader
 /// [ar]: Resource::attach_sub_resource
 #[derive(Debug)]
-pub struct Resource<T: Send + Sync + 'static> {
-    value: RwLock<T>,
+pub struct Resource<T: ?Sized + Send + Sync + 'static> {
+    value: RwLock<Box<T>>,
     sub_resources: smol::lock::Mutex<Vec<SubResourceRef<T>>>,
     update_lock: smol::lock::Mutex<()>,
 }
 
-impl<T: Send + Sync + 'static> Resource<T> {
+impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     #[inline]
-    pub(in crate::resource) fn new(value: T) -> Self {
+    pub(in crate::resource) fn new(value: Box<T>) -> Self {
         Self {
             value: RwLock::new(value),
             sub_resources: smol::lock::Mutex::new(Vec::new()),
             update_lock: smol::lock::Mutex::new(()),
+        }
+    }
+
+    pub(in crate::resource) async fn update_sub_resources(self: &Arc<Self>, id: &ResourcePath) {
+        let sub_resources = self.sub_resources.lock().await;
+        for sub_resource in &*sub_resources {
+            let sub_id = id.clone() + ":<sub-resource>";
+            match sub_resource.update(sub_id.clone(), self.clone()).await {
+                Ok(_) => {},
+                Err(error) => debug!(id = %sub_id, %error, "Failed to update sub-resource"),
+            }
         }
     }
 
@@ -182,13 +197,13 @@ impl<T: Send + Sync + 'static> Resource<T> {
     /// [lg]: ResourceLock
     #[inline]
     pub fn read(&self) -> ResourceLock<'_, T> {
-        self.value.read()
+        RwLockReadGuard::map(self.value.read(), |b| b.as_ref())
     }
 
     /// Create a sub-resource for this resource, which is updated when this resource is updated.
     ///
     /// See [sub-resources](Self#sub-resources) for more information.
-    pub async fn attach_sub_resource<S: Send + Sync + 'static>(
+    pub async fn attach_sub_resource<S: ?Sized + Send + Sync + 'static>(
         &self,
         loader: impl SubResourceLoader<S, T>,
     ) -> ResourceLoadResult<S> {
@@ -204,7 +219,7 @@ impl<T: Send + Sync + 'static> Resource<T> {
     /// Same as [Self::attach_sub_resource()], but blocking.
     ///
     /// See [sub-resources](Self#sub-resources) for more information.
-    pub fn attach_sub_resource_blocking<S: Send + Sync + 'static>(
+    pub fn attach_sub_resource_blocking<S: ?Sized + Send + Sync + 'static>(
         &self,
         loader: impl SubResourceLoader<S, T>,
     ) -> ResourceLoadResult<S> {
@@ -220,34 +235,27 @@ impl<T: Send + Sync + 'static> Resource<T> {
 ///
 /// [id]: ResourcePath
 /// [rm]: manager::ResourceManager
-pub struct ResourceMut<'a, T: Send + Sync + 'static> {
+pub struct ResourceMut<T: ?Sized + Send + Sync + 'static> {
     id: ResourcePath,
-    inner: &'a Arc<Resource<T>>,
+    inner: Arc<Resource<T>>,
     #[allow(dead_code)] // This is simply being held for the duration of this struct
-    update_lock: smol::lock::MutexGuard<'a, ()>,
+    drop_notice: smol::channel::Sender<()>,
 }
 
-impl<'a, T: Send + Sync + 'static> ResourceMut<'a, T> {
+impl<T: ?Sized + Send + Sync + 'static> ResourceMut<T> {
     // An instance of Arc<Resource> should not be allowed to be arbitrarily mutated, so getting
     //  mutable access like this is only allowed within this module for inner mechanisms.
     #[inline]
-    pub(in crate::resource) async fn from_resource(id: ResourcePath, resource: &'a Arc<Resource<T>>) -> Self {
-        Self {
+    pub(in crate::resource) fn from_resource(
+        id: ResourcePath,
+        resource: Arc<Resource<T>>
+    ) -> (Self, smol::channel::Receiver<()>) {
+        let (drop_notice, drop_checker) = smol::channel::bounded(1);
+        (Self {
             id,
             inner: resource,
-            update_lock: resource.update_lock.lock().await,
-        }
-    }
-
-    pub(in crate::resource) async fn finalize(self) {
-        let sub_resources = self.inner.sub_resources.lock().await;
-        for sub_resource in &*sub_resources {
-            let sub_id = self.id.clone() + ":<sub-resource>";
-            match sub_resource.update(sub_id.clone(), self.inner.clone()).await {
-                Ok(_) => {},
-                Err(error) => debug!(id = %sub_id, %error, "Failed to update sub-resource"),
-            }
-        }
+            drop_notice,
+        }, drop_checker)
     }
 
     /// The [id][rp] associated with this mutable handle.
@@ -261,7 +269,7 @@ impl<'a, T: Send + Sync + 'static> ResourceMut<'a, T> {
     /// The underlying read-only [Resource] handle.
     #[inline]
     pub fn resource(&self) -> &Arc<Resource<T>> {
-        self.inner
+        &self.inner
     }
 
     /// Retrieve a read-only [lock guard][lg] for this resource.
@@ -271,7 +279,7 @@ impl<'a, T: Send + Sync + 'static> ResourceMut<'a, T> {
     /// [lg]: ResourceLock
     #[inline]
     pub fn read(&self) -> ResourceLock<'_, T> {
-        self.inner.value.read()
+        RwLockReadGuard::map(self.inner.value.read(), |b| b.as_ref())
     }
 
     /// Retrieve a writeable [lock guard][lg] for this resource.
@@ -281,7 +289,15 @@ impl<'a, T: Send + Sync + 'static> ResourceMut<'a, T> {
     /// [lg]: ResourceMutLock
     #[inline]
     pub fn write(&self) -> ResourceMutLock<'_, T> {
-        self.inner.value.write()
+        RwLockWriteGuard::map(self.inner.value.write(), |b| b.as_mut())
+    }
+
+    /// Directly replace the value of this resource.
+    ///
+    /// Useful for if the value type is unsized, or a simple wholesale replacement is needed.
+    #[inline]
+    pub fn replace(&self, value: Box<T>) {
+        *self.inner.value.write() = value;
     }
 }
 
@@ -308,7 +324,7 @@ pub enum ResourceLoadError {
 impl ResourceLoadError {
     /// Convenience method for creating a [ResourceLoadError::TypeMismatch].
     #[inline]
-    pub fn from_mismatch<T: Send + Sync + 'static>(actual: TypeId) -> Self {
+    pub fn from_mismatch<T: ?Sized + Send + Sync + 'static>(actual: TypeId) -> Self {
         Self::TypeMismatch { actual, requested: TypeId::of::<T>() }
     }
 
@@ -359,11 +375,11 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 ///
 /// #[async_trait]
 /// impl ResourceLoader<String> for StringLoader {
-///     async fn load(&self, mut data: ResourceReadData) -> Result<String, ResourceLoadError> {
+///     async fn load(&self, mut data: ResourceReadData) -> Result<Box<String>, ResourceLoadError> {
 ///         let mut output = String::new();
 ///         data.read_to_string(&mut output).await
-///             .map_err(|err| ResourceLoadError::from_error(err))
-///             .map(|_| output)
+///             .map_err(ResourceLoadError::from_error)
+///             .map(|_| Box::new(output))
 ///     }
 ///
 ///     // update() does not need to be implemented if you don't have any custom synchronization logic
@@ -374,11 +390,11 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 /// [rd]: ResourceReadData
 /// [rm]: manager::ResourceManager
 #[async_trait]
-pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
+pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'static {
     /// Load and create a value from [raw data][rd].
     ///
     /// [rd]: ResourceReadData
-    async fn load(&self, data: ResourceReadData) -> Result<T, ResourceLoadError>;
+    async fn load(&self, data: ResourceReadData) -> Result<Box<T>, ResourceLoadError>;
 
     /// Given a [mutable resource handle][rm], load and update a resource from [raw data][rd].
     ///
@@ -387,10 +403,10 @@ pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
     ///
     /// [rm]: ResourceMut
     /// [rd]: ResourceReadData
-    async fn update(&self, resource: &ResourceMut<'_, T>, data: ResourceReadData)
+    async fn update(&self, resource: ResourceMut<T>, data: ResourceReadData)
         -> Result<(), ResourceLoadError>
     {
-        *resource.write() = self.load(data).await?;
+        resource.replace(self.load(data).await?);
         Ok(())
     }
 }
@@ -420,13 +436,13 @@ pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
 ///
 /// #[async_trait]
 /// impl SubResourceLoader<String, String> for SubStringLoader {
-///     async fn load(&self, parent: &String) -> Result<String, ResourceLoadError> {
-///         Ok(parent.clone() + "-<substring>")
+///     async fn load(&self, parent: &String) -> Result<Box<String>, ResourceLoadError> {
+///         Ok(Box::new(parent.clone() + "-<substring>"))
 ///     }
 /// }
 ///
 /// fn make_substring(parent: &Arc<Resource<String>>) -> Arc<Resource<String>> {
-///     parent.attach_sub_resource_blocking(SubStringLoader::default())
+///     parent.attach_sub_resource_blocking(SubStringLoader::default()).unwrap()
 /// }
 /// ```
 ///
@@ -436,15 +452,15 @@ pub trait ResourceLoader<T: Send + Sync + 'static>: Send + Sync + 'static {
 #[async_trait]
 pub trait SubResourceLoader<T, P>: Send + Sync + 'static
 where
-    T: Send + Sync + 'static,
-    P: Send + Sync + 'static,
+    T: ?Sized + Send + Sync + 'static,
+    P: ?Sized + Send + Sync + 'static,
 {
-    async fn load(&self, parent: &P) -> Result<T, ResourceLoadError>;
+    async fn load(&self, parent: &P) -> Result<Box<T>, ResourceLoadError>;
 
-    async fn update(&self, resource: &ResourceMut<'_, T>, parent: &P)
+    async fn update(&self, resource: ResourceMut<T>, parent: &P)
         -> Result<(), ResourceLoadError>
     {
-        *resource.write() = self.load(parent).await?;
+        resource.replace(self.load(parent).await?);
         Ok(())
     }
 }
@@ -494,18 +510,18 @@ mod tests {
 
     #[async_trait]
     impl SubResourceLoader<String, String> for SubStringLoader {
-        async fn load(&self, parent: &String) -> Result<String, ResourceLoadError> {
+        async fn load(&self, parent: &String) -> Result<Box<String>, ResourceLoadError> {
             match &self.suffix {
-                Some(suffix) => Ok(parent.clone() + "-" + &suffix),
+                Some(suffix) => Ok(Box::new(parent.clone() + "-" + &suffix)),
                 None => Err(ResourceLoadError::from_error(SubStringLoaderError::NoSuffix)),
             }
         }
 
-        async fn update(&self, resource: &ResourceMut<'_, String>, parent: &String) -> Result<(), ResourceLoadError> {
+        async fn update(&self, resource: ResourceMut<String>, parent: &String) -> Result<(), ResourceLoadError> {
             if self.no_update {
                 Err(ResourceLoadError::from_error(SubStringLoaderError::NoUpdate))
             } else {
-                *resource.write() = self.load(parent).await?;
+                resource.replace(self.load(parent).await?);
                 Ok(())
             }
         }
