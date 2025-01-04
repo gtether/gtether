@@ -213,14 +213,14 @@ impl Drop for ManagerExecutor {
     }
 }
 
-struct ResourceTaskData<T: Send + Sync + 'static> {
+struct ResourceTaskData<T: ?Sized + Send + Sync + 'static> {
     id: ResourcePath,
     result: Result<(Arc<Resource<T>>, String), ResourceLoadError>,
     source_idx: SourceIndex,
     loader: Arc<dyn ResourceLoader<T>>,
 }
 
-enum ResourceFutureState<T: Send + Sync + 'static> {
+enum ResourceFutureState<T: ?Sized + Send + Sync + 'static> {
     Immediate(ResourceLoadResult<T>),
     Delayed{
         cache: Weak<CacheEntry>,
@@ -244,13 +244,13 @@ enum ResourceFutureState<T: Send + Sync + 'static> {
 /// [id]: ResourcePath
 /// [rl]: ResourceLoader
 /// [rm]: ResourceManager
-pub struct ResourceFuture<T: Send + Sync + 'static> {
+pub struct ResourceFuture<T: ?Sized + Send + Sync + 'static> {
     state: ResourceFutureState<T>,
 }
 
 impl<T> Debug for ResourceFuture<T>
 where
-    T: Debug + Send + Sync + 'static,
+    T: ?Sized + Debug + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         struct ImmediateOk();
@@ -290,7 +290,7 @@ where
     }
 }
 
-impl<T: Send + Sync + 'static> ResourceFuture<T> {
+impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<T> {
     #[inline]
     fn from_result(result: ResourceLoadResult<T>) -> Self {
         Self { state: ResourceFutureState::Immediate(result) }
@@ -366,13 +366,13 @@ impl<T: Send + Sync + 'static> ResourceFuture<T> {
     }
 }
 
-enum CacheEntryGetResult<T: Send + Sync + 'static> {
+enum CacheEntryGetResult<T: ?Sized + Send + Sync + 'static> {
     Ok(Arc<Resource<T>>),
     Expired,
     Err(ResourceLoadError),
 }
 
-impl<T: Send + Sync + 'static> From<Result<(Arc<Resource<T>>, String), ResourceLoadError>> for CacheEntryGetResult<T> {
+impl<T: ?Sized + Send + Sync + 'static> From<Result<(Arc<Resource<T>>, String), ResourceLoadError>> for CacheEntryGetResult<T> {
     #[inline]
     fn from(value: Result<(Arc<Resource<T>>, String), ResourceLoadError>) -> Self {
         match value {
@@ -422,7 +422,7 @@ impl CacheEntryState {
     #[inline]
     fn from_task<T>(task: Task<ResourceTaskData<T>>, manager: Arc<ResourceManager>) -> Self
     where
-        T: Send + Sync + 'static,
+        T: ?Sized + Send + Sync + 'static,
     {
         Self::Loading {
             task: Box::new(task) as Box<dyn Any + Send>,
@@ -433,7 +433,7 @@ impl CacheEntryState {
 
     fn poll<T>(self) -> (Self, Option<CacheEntryGetResult<T>>)
     where
-        T: Send + Sync + 'static,
+        T: ?Sized + Send + Sync + 'static,
     {
         match self {
             CacheEntryState::Loading { task, resource_type, manager } => {
@@ -478,7 +478,7 @@ impl CacheEntryState {
 
     async fn wait<T>(self) -> (Self, CacheEntryGetResult<T>)
     where
-        T: Send + Sync + 'static,
+        T: ?Sized + Send + Sync + 'static,
     {
         match self {
             CacheEntryState::Loading { task, resource_type, manager } => {
@@ -569,7 +569,7 @@ impl CacheEntryState {
 
 impl<T> From<ResourceTaskData<T>> for CacheEntryState
 where
-    T: Send + Sync + 'static
+    T: ?Sized + Send + Sync + 'static
 {
     fn from(value: ResourceTaskData<T>) -> Self {
         match value.result {
@@ -638,7 +638,7 @@ struct CacheEntry {
 
 impl CacheEntry {
     #[inline]
-    fn from_task<T: Send + Sync + 'static>(
+    fn from_task<T: ?Sized + Send + Sync + 'static>(
         id: ResourcePath,
         task: Task<ResourceTaskData<T>>,
         manager: Arc<ResourceManager>,
@@ -671,12 +671,12 @@ impl CacheEntry {
     }
 
     #[inline]
-    fn poll<T: Send + Sync + 'static>(&self) -> Option<CacheEntryGetResult<T>> {
+    fn poll<T: ?Sized + Send + Sync + 'static>(&self) -> Option<CacheEntryGetResult<T>> {
         self.with_state_blocking(|state| state.poll())
     }
 
     #[inline]
-    async fn wait<T: Send + Sync + 'static>(&self) -> CacheEntryGetResult<T> {
+    async fn wait<T: ?Sized + Send + Sync + 'static>(&self) -> CacheEntryGetResult<T> {
         self.with_state(|state| async move { state.wait().await }).await
     }
 
@@ -861,7 +861,7 @@ impl ResourceManager {
         load_priority: LoadPriority,
     ) -> ResourceFuture<T>
     where
-        T: Send + Sync + 'static,
+        T: ?Sized + Send + Sync + 'static,
     {
         let strong_self = self.weak.upgrade()
             .expect("ResourceManager cyclic reference should not be broken");
@@ -902,7 +902,7 @@ impl ResourceManager {
         load_priority: LoadPriority,
     ) -> ResourceFuture<T>
     where
-        T: Send + Sync + 'static,
+        T: ?Sized + Send + Sync + 'static,
     {
         let mut cache = self.cache.lock();
         if let Some(entry) = cache.get(&id) {
@@ -953,7 +953,7 @@ impl ResourceManager {
         load_priority: LoadPriority,
     ) -> ResourceFuture<T>
     where
-        T: Send + Sync + 'static,
+        T: ?Sized + Send + Sync + 'static,
     {
         self.get_or_load_impl(id.into(), Arc::new(loader), load_priority)
     }
