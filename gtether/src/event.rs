@@ -558,6 +558,18 @@ impl<T: EventType, D: 'static> EventBus<T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::time::Duration;
+    use smol::future::FutureExt;
+    use smol::{future, Timer};
+
+    async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
+        let timeout_fn = async move {
+            Timer::after(time).await;
+            panic!("Timeout reached: {time:?}");
+        };
+        fut.or(timeout_fn).await
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     struct StringEventType(String);
@@ -657,7 +669,8 @@ mod tests {
         // First should work
         let mut result = event_bus.fire("inc".into(), 0);
         assert_eq!(*result.event_data(), 1);
-        // TODO: wait for future with timeout
+        future::block_on(timeout(once_fut.wait(), Duration::from_secs(1)))
+            .expect("SubscriberOnce should not error");
 
         // Second should do nothing
         let mut result = event_bus.fire("inc".into(), 0);
@@ -677,7 +690,8 @@ mod tests {
         // First should do both
         let mut result = event_bus.fire("inc".into(), 0);
         assert_eq!(*result.event_data(), 2);
-        // TODO: wait for future with timeout
+        future::block_on(timeout(once_fut.wait(), Duration::from_secs(1)))
+            .expect("SubscriberOnce should not error");
 
         // Second should do one
         let mut result = event_bus.fire("inc".into(), 0);
