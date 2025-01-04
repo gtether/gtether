@@ -40,20 +40,20 @@ pub mod path;
 pub mod source;
 
 struct SubResourceRef<P: ?Sized + Send + Sync + 'static> {
-    type_id: TypeId,
+    type_id: Option<TypeId>,
     update_fn: Box<dyn (
         Fn(ResourcePath, Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
     ) + Send + Sync + 'static>,
 }
 
 impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
-    fn new<T: ?Sized + Send + Sync + 'static>(
+    fn from_sub_resource<T: ?Sized + Send + Sync + 'static>(
         resource: &Arc<Resource<T>>,
         loader: Arc<dyn SubResourceLoader<T, P>>,
     ) -> Self {
         let weak = Arc::downgrade(resource);
         Self {
-            type_id: TypeId::of::<T>(),
+            type_id: Some(TypeId::of::<T>()),
             update_fn: Box::new(move |id, parent| Box::new({
                 let async_weak = weak.clone();
                 let async_loader = loader.clone();
@@ -79,6 +79,24 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
         }
     }
 
+    fn from_callback<F, Fut>(callback: F) -> Self
+    where
+        F: (Fn(Arc<Resource<P>>) -> Fut) + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let callback = Arc::new(callback);
+        Self {
+            type_id: None,
+            update_fn: Box::new(move |_, parent| {
+                let callback = callback.clone();
+                Box::new(async move {
+                    callback(parent).await;
+                    Ok(())
+                })
+            })
+        }
+    }
+
     async fn update(&self, id: ResourcePath, parent: Arc<Resource<P>>) -> Result<(), ResourceLoadError> {
         Box::into_pin((self.update_fn)(id, parent)).await
     }
@@ -86,9 +104,13 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
 
 impl<T: ?Sized + Send + Sync + 'static> Debug for SubResourceRef<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SubResource")
-            .field("type_id", &self.type_id)
-            .finish_non_exhaustive()
+        let mut ds = f.debug_struct("SubResource");
+        match &self.type_id {
+            Some(type_id) => ds
+                .field("type", &"SubResource")
+                .field("type_id", &type_id),
+            None => ds.field("type", &"Callback"),
+        }.finish_non_exhaustive()
     }
 }
 
@@ -210,7 +232,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
         let sub_value = loader.load(&self.read()).await?;
         let mut sub_resources = self.sub_resources.lock().await;
         let sub_resource = Arc::new(Resource::new(sub_value));
-        sub_resources.push(SubResourceRef::new(&sub_resource, Arc::new(loader)));
+        sub_resources.push(SubResourceRef::from_sub_resource(&sub_resource, Arc::new(loader)));
         Ok(sub_resource)
     }
 
@@ -219,11 +241,34 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     /// Same as [Self::attach_sub_resource()], but blocking.
     ///
     /// See [sub-resources](Self#sub-resources) for more information.
+    #[inline]
     pub fn attach_sub_resource_blocking<S: ?Sized + Send + Sync + 'static>(
         &self,
         loader: impl SubResourceLoader<S, T>,
     ) -> ResourceLoadResult<S> {
         future::block_on(self.attach_sub_resource(loader))
+    }
+
+    /// Attach a callback to this resource, which is executed when this resource is updated.
+    pub async fn attach_update_callback<F, Fut>(&self, callback: F)
+    where
+        F: (Fn(Arc<Resource<T>>) -> Fut) + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut sub_resources = self.sub_resources.lock().await;
+        sub_resources.push(SubResourceRef::from_callback(callback));
+    }
+
+    /// Attach a callback to this resource, which is executed when this resource is updated.
+    ///
+    /// Same as [Self::attach_update_callback()], but blocking.
+    #[inline]
+    pub fn attach_update_callback_blocking<F, Fut>(&self, callback: F)
+    where
+        F: (Fn(Arc<Resource<T>>) -> Fut) + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        future::block_on(self.attach_update_callback(callback))
     }
 }
 
