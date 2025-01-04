@@ -310,7 +310,7 @@ impl SubscriberOnceFuture {
     /// # use gtether::event::{EventBus, EventType, SubscriberOnceError};
     /// use gtether::event::Event;
     ///
-    /// # async fn wrapper<T: EventType, D>(event_type: T, event_bus: EventBus<T, D>) -> Result<(), SubscriberOnceError> {
+    /// # async fn wrapper<T: EventType, D: 'static>(event_type: T, event_bus: EventBus<T, D>) -> Result<(), SubscriberOnceError> {
     /// let fut = event_bus.registry().register_once(event_type, |event: &mut Event<T, D>| {
     ///     // Some one-time action
     /// });
@@ -334,7 +334,7 @@ impl SubscriberOnceFuture {
     /// # use gtether::event::{EventBus, EventType, SubscriberOnceError};
     /// use gtether::event::Event;
     ///
-    /// # fn wrapper<T: EventType, D>(event_type: T, event_bus: EventBus<T, D>) -> Result<(), SubscriberOnceError> {
+    /// # fn wrapper<T: EventType, D: 'static>(event_type: T, event_bus: EventBus<T, D>) -> Result<(), SubscriberOnceError> {
     /// let fut = event_bus.registry().register_once(event_type, |event: &mut Event<T, D>| {
     ///     // Some one-time action
     /// });
