@@ -16,12 +16,15 @@ use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentSt
 use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
 use gtether::console::{Console, ConsoleStdinReader};
 use gtether::console::command::{Command, CommandError, CommandRegistry, CommandTree, ParamCountCheck};
-use gtether::console::gui::{ConsoleGui, ConsoleGuiCreateInfo};
+use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
+use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::{Uniform, UniformSet};
+use gtether::resource::manager::{LoadPriority, ResourceManager};
+use gtether::resource::source::constant::ConstantResourceSource;
 use crate::render::{MN, VP};
 use crate::render::ambient::{AmbientLight, AmbientRenderer};
 use crate::render::cube::CubeRenderer;
@@ -230,7 +233,7 @@ impl WindowsApp {
 }
 
 impl Application for WindowsApp {
-    fn init(&self, _engine: &Engine<Self>, registry: &mut Registry) {
+    fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {
         let mut cmd_registry = self.console.registry();
 
         let mut model = identity();
@@ -288,11 +291,15 @@ impl Application for WindowsApp {
             .register_command("point", Box::new(point_light_subcommands)).unwrap()
             .register_alias("points", "point").unwrap();
 
-        let (_, console_renderer) = ConsoleGui::new(
-            self.console.clone(),
-            &window,
-            ConsoleGuiCreateInfo::default(),
-        );
+        let console_font = engine.resources().get_or_load(
+            "console_font",
+            GlyphFontLoader::new(window.renderer().clone()),
+            LoadPriority::Immediate,
+        ).wait_blocking().unwrap();
+        let (_, console_renderer) = ConsoleGui::builder(self.console.clone())
+            .window(&window)
+            .font(console_font)
+            .build().unwrap();
 
         let render_pass = EngineRenderPassBuilder::new(window.renderer())
             .attachment("color".into(), AttachmentDescription {
@@ -430,12 +437,19 @@ fn main() {
         .with(ConsoleLogLayer::new(app.console.log()))
         .init();
 
+    let resources = ResourceManager::builder()
+        .source(ConstantResourceSource::builder()
+            .resource("console_font", include_bytes!("RobotoMono/RobotoMono-VariableFont_wght.ttf"))
+            .build())
+        .build();
+
     EngineBuilder::new()
         .metadata(EngineMetadata {
             application_name: Some(String::from("gTether Example - windows")),
             ..Default::default()
         })
         .app(app)
+        .resources(resources)
         .build()
         .start();
 }

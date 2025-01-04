@@ -1,4 +1,6 @@
 use parking_lot::Mutex;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -22,18 +24,19 @@ use crate::console::Console;
 use crate::event::{Event, EventHandler};
 use crate::gui::input::{InputDelegateEvent, InputDelegateLock};
 use crate::gui::window::WindowHandle;
+use crate::render::attachment::AttachmentMap;
 use crate::render::font::compositor::FontCompositor;
 use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
 use crate::render::font::size::{FontSize, FontSizer};
-use crate::render::font::{Font, GlyphFont};
+use crate::render::font::Font;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::swapchain::Framebuffer;
 use crate::render::uniform::Uniform;
 use crate::render::{FlatVertex, RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
-use crate::render::attachment::AttachmentMap;
 
 /// General alignment configuration for a [ConsoleGui] section.
 #[derive(Debug, Clone)]
@@ -154,26 +157,6 @@ impl Default for ConsoleGuiBackground {
     }
 }
 
-/// Configuration needed to create a new [ConsoleGui].
-#[derive(Debug, Clone)]
-pub struct ConsoleGuiCreateInfo {
-    /// Layout configuration, such as how the [ConsoleGui] is positioned and it's size.
-    pub layout: ConsoleGuiLayout,
-    /// Background configuration, which determines what is rendered behind the text.
-    pub background: ConsoleGuiBackground,
-    pub _ne: NonExhaustive,
-}
-
-impl Default for ConsoleGuiCreateInfo {
-    fn default() -> Self {
-        Self {
-            layout: ConsoleGuiLayout::default(),
-            background: ConsoleGuiBackground::default(),
-            _ne: NonExhaustive(()),
-        }
-    }
-}
-
 /// GUI representation of a [Console].
 ///
 /// Wrapper around a [Console] used to both display and interact with said [Console]. To display the
@@ -189,36 +172,67 @@ impl Default for ConsoleGuiCreateInfo {
 /// ```
 /// # use std::sync::Arc;
 /// # use gtether::console::Console;
-/// use gtether::console::gui::{ConsoleGui, ConsoleGuiCreateInfo};
+/// use gtether::console::gui::ConsoleGui;
 /// # use gtether::gui::window::WindowHandle;
+/// # use gtether::render::font::Font;
 /// # use gtether::render::render_pass::EngineRenderSubpassBuilder;
+/// # use gtether::resource::Resource;
 /// #
 /// # let console: Arc<Console> = return;
 /// # let window_handle: WindowHandle = return;
+/// # let font: Arc<Resource<dyn Font>> = return;
 /// # let render_subpass_builder: EngineRenderSubpassBuilder = return;
 ///
-/// let (console_gui, console_renderer) = ConsoleGui::new(
-///     console.clone(),
-///     &window_handle,
-///     ConsoleGuiCreateInfo::default(),
-/// );
+/// let (console_gui, console_renderer) = ConsoleGui::builder(console.clone())
+///     .window(&window_handle)
+///     .font(font.clone())
+///     .build().unwrap();
 ///
 /// // Later, when building a render pass
 /// render_subpass_builder
 ///     .handler(console_renderer);
+/// ```
+///
+/// Creating GUIs for multiple windows from one console
+/// ```
+/// # use std::sync::Arc;
+/// # use gtether::console::Console;
+/// use gtether::console::gui::ConsoleGui;
+/// # use gtether::gui::window::WindowHandle;
+/// # use gtether::render::font::Font;
+/// # use gtether::resource::Resource;
+/// #
+/// # let console: Arc<Console> = return;
+/// # let window_1: WindowHandle = return;
+/// # let window_2: WindowHandle = return;
+/// # let font: Arc<Resource<dyn Font>> = return;
+///
+/// let builder = ConsoleGui::builder(console.clone())
+///     .font(font.clone());
+///
+/// let (console_gui_1, console_renderer_1) = builder.window(&window_1).build().unwrap();
+/// let (console_gui_2, console_renderer_2) = builder.window(&window_2).build().unwrap();
 /// ```
 pub struct ConsoleGui {
     console: Arc<Console>,
     visible: AtomicBool,
     layout: ConsoleGuiLayout,
     background: ConsoleGuiBackground,
-    font: Box<dyn Font>,
-    font_sheet: Arc<FontSheet>,
+    // Font is required here to keep the resource alive even if it's not used elsewhere
+    #[allow(unused)]
+    font: Arc<Resource<dyn Font>>,
+    font_sheet: Arc<Resource<FontSheet>>,
     text_log: Mutex<TextLayout>,
     text_prompt: Mutex<TextLayout>,
 }
 
 impl ConsoleGui {
+    /// Create a [ConsoleGuiBuilder].
+    ///
+    /// This is the recommended method of creating a [ConsoleGui].
+    #[inline]
+    pub fn builder(console: Arc<Console>) -> ConsoleGuiBuilder { ConsoleGuiBuilder::new(console) }
+
     fn create_text_layouts(
         target: &Arc<dyn RenderTarget>,
         layout: &ConsoleGuiLayout,
@@ -287,51 +301,32 @@ impl ConsoleGui {
         (text_log, text_prompt)
     }
 
-    /// Create a new [ConsoleGui].
-    ///
-    /// Starts a background thread to handle input events for the [ConsoleGui].
-    ///
-    /// Returns both the [ConsoleGui] and an associated [EngineRenderHandler] for rendering it.
-    pub fn new(
+    fn new(
         console: Arc<Console>,
         window_handle: &WindowHandle,
-        create_info: ConsoleGuiCreateInfo,
-    ) -> (Arc<Self>, Box<dyn EngineRenderHandler>) {
-        if create_info.layout.size <= 0.0 || create_info.layout.size > 1.0 {
-            // TODO: Some sort of ValidationError with Result instead?
-            panic!("ConsoleGui size must be within (0.0..1.0]")
-        }
-
+        layout: ConsoleGuiLayout,
+        background: ConsoleGuiBackground,
+        font: Arc<Resource<dyn Font>>,
+        font_sheet: Arc<Resource<FontSheet>>,
+    ) -> Arc<Self> {
         let delegate = window_handle.input_state().create_delegate();
-
-        // TODO: Make the console font configurable. Likely will depend on future Resources system
-        let font = Box::new(GlyphFont::try_from_slice(
-            window_handle.renderer().target().device(),
-            include_bytes!("RobotoMono/RobotoMono-VariableFont_wght.ttf"),
-        ).unwrap()) as Box<dyn Font>;
-
-        let font_sheet = font.create_sheet(
-            64.0,
-            UnicodeFontSheetMap::basic_latin(),
-        );
 
         let (text_log, text_prompt) = Self::create_text_layouts(
             window_handle.renderer().target(),
-            &create_info.layout,
-            font_sheet.sizer(),
+            &layout,
+            font_sheet.read().sizer(),
         );
 
         let orig_gui = Arc::new(Self {
             console,
             visible: AtomicBool::new(false),
-            layout: create_info.layout,
-            background: create_info.background,
+            layout,
+            background,
             font,
             font_sheet,
             text_log: Mutex::new(text_log),
             text_prompt: Mutex::new(text_prompt),
         });
-
         window_handle.renderer().event_bus().register(RendererEventType::Stale, orig_gui.clone());
 
         let gui = orig_gui.clone();
@@ -380,12 +375,7 @@ impl ConsoleGui {
             });
         });
 
-        let renderer = Box::new(ConsoleRenderer::new(
-            window_handle.renderer(),
-            orig_gui.clone(),
-        ));
-
-        (orig_gui, renderer)
+        orig_gui
     }
 }
 
@@ -398,7 +388,7 @@ impl EventHandler<RendererEventType, RendererEventData> for ConsoleGui {
         let (mut new_text_log, mut new_text_prompt) = Self::create_text_layouts(
             target,
             &self.layout,
-            self.font_sheet.sizer(),
+            self.font_sheet.read().sizer(),
         );
 
         let mut text_log = self.text_log.lock();
@@ -674,5 +664,151 @@ impl EngineRenderHandler for ConsoleRenderer {
         self.target = target.clone();
         self.background.init(subpass);
         self.font_compositor.init(subpass);
+    }
+}
+
+#[derive(Debug)]
+pub enum ConsoleGuiBuildError {
+    MissingWindowParam,
+    MissingFontParam,
+    LayoutSizeOutOfBounds(f32),
+    ResourceLoadError(ResourceLoadError),
+}
+
+impl Display for ConsoleGuiBuildError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsoleGuiBuildError::MissingWindowParam
+                => f.write_str(".window() must be set"),
+            ConsoleGuiBuildError::MissingFontParam
+                => f.write_str(".font() must be set"),
+            ConsoleGuiBuildError::LayoutSizeOutOfBounds(size)
+                => write!(f, "Size ({size}) must be within (0.0..1.0]"),
+            ConsoleGuiBuildError::ResourceLoadError(err)
+                => err.fmt(f),
+        }
+    }
+}
+
+impl Error for ConsoleGuiBuildError {}
+
+impl ConsoleGuiBuildError {
+    fn check_layout(layout: ConsoleGuiLayout) -> Result<ConsoleGuiLayout, ConsoleGuiBuildError> {
+        if layout.size < 0.0 || layout.size > 1.0 {
+            Err(ConsoleGuiBuildError::LayoutSizeOutOfBounds(layout.size))
+        } else {
+            Ok(layout)
+        }
+    }
+}
+
+/// Builder pattern for [ConsoleGui].
+///
+/// See [ConsoleGui] documentation for examples of usage.
+pub struct ConsoleGuiBuilder {
+    console: Arc<Console>,
+    window_handle: Option<WindowHandle>,
+    layout: Option<ConsoleGuiLayout>,
+    background: Option<ConsoleGuiBackground>,
+    font: Option<Arc<Resource<dyn Font>>>,
+}
+
+impl ConsoleGuiBuilder {
+    /// Create a new [ConsoleGuiBuilder].
+    ///
+    /// It is recommended to use [ConsoleGui::builder()] instead.
+    #[inline]
+    pub fn new(console: Arc<Console>) -> Self {
+        Self {
+            console,
+            window_handle: None,
+            layout: None,
+            background: None,
+            font: None,
+        }
+    }
+
+    /// Set the [window][wh] that this [ConsoleGui] is for.
+    ///
+    /// This is a required parameter, and [Self::build()] will fail without it.
+    ///
+    /// [wh]: WindowHandle
+    pub fn window(&mut self, window_handle: &WindowHandle) -> &mut Self {
+        self.window_handle = Some(window_handle.clone());
+        self
+    }
+
+    /// Set the [layout][lay] that this [ConsoleGui] will use.
+    ///
+    /// If not set, a default layout will be used.
+    ///
+    /// [lay]: ConsoleGuiLayout
+    pub fn layout(&mut self, layout: ConsoleGuiLayout) -> &mut Self {
+        self.layout = Some(layout);
+        self
+    }
+
+    /// Set the [background][bg] that this [ConsoleGui] will use.
+    ///
+    /// If not set, a default background will be used.
+    ///
+    /// [bg]: ConsoleGuiBackground
+    pub fn background(&mut self, background: ConsoleGuiBackground) -> &mut Self {
+        self.background = Some(background);
+        self
+    }
+
+    /// Set the [font][ft] that this [ConsoleGui] will use.
+    ///
+    /// This is a required parameter, and [Self::build()] will fail without it.
+    ///
+    /// [ft]: Font
+    pub fn font(&mut self, font: Arc<Resource<dyn Font>>) -> &mut Self {
+        self.font = Some(font);
+        self
+    }
+
+    /// Build a new [ConsoleGui] and associated [render handler][rh].
+    ///
+    /// This is a non-consuming operation, so multiple GUIs can be built from one builder.
+    ///
+    /// # Errors
+    /// Will [error][er] if any required parameters are missing, or if a [FontSheet] cannot be made
+    /// from the provided [Font].
+    ///
+    /// [rh]: EngineRenderHandler
+    /// [er]: ConsoleGuiBuildError
+    pub fn build(&self) -> Result<(Arc<ConsoleGui>, Box<dyn EngineRenderHandler>), ConsoleGuiBuildError> {
+        let console = self.console.clone();
+        let window_handle = self.window_handle.as_ref()
+            .ok_or(ConsoleGuiBuildError::MissingWindowParam)?;
+        let layout = ConsoleGuiBuildError::check_layout(self.layout.clone().unwrap_or_default())?;
+        let background = self.background.clone().unwrap_or_default();
+        let font = self.font.clone()
+            .ok_or(ConsoleGuiBuildError::MissingFontParam)?;
+
+        let font_sheet = FontSheet::from_font(
+            &font,
+            window_handle.renderer().clone(),
+            64.0,
+            Arc::new(UnicodeFontSheetMap::basic_latin()),
+        ).map_err(ConsoleGuiBuildError::ResourceLoadError)?;
+
+        let console_gui = ConsoleGui::new(
+            console,
+            window_handle,
+            layout,
+            background,
+            font,
+            font_sheet,
+        );
+        window_handle.renderer().event_bus().register(RendererEventType::Stale, console_gui.clone());
+
+        let console_renderer = Box::new(ConsoleRenderer::new(
+            window_handle.renderer(),
+            console_gui.clone(),
+        ));
+
+        Ok((console_gui, console_renderer))
     }
 }
