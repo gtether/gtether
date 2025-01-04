@@ -5,6 +5,7 @@ extern crate nalgebra_glm as glm;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use crate::resource::manager::ResourceManager;
 
 pub mod event;
 #[cfg(feature = "gui")]
@@ -58,6 +59,7 @@ pub struct Engine<A: Application> {
     state: EngineState,
     app: A,
     pub(crate) should_exit: AtomicBool,
+    resources: Arc<ResourceManager>,
     #[cfg(feature = "graphics")]
     render_instance: Arc<render::Instance>,
     #[cfg(feature = "gui")]
@@ -73,6 +75,10 @@ impl<A: Application> Engine<A> {
 
     #[inline]
     pub fn state(&self) -> EngineState { self.state }
+
+    /// The engine's main [ResourceManager].
+    #[inline]
+    pub fn resources(&self) -> &Arc<ResourceManager> { &self.resources }
 
     #[cfg(feature = "graphics")]
     #[inline]
@@ -124,6 +130,7 @@ impl<A: Application> Engine<A> {
 pub struct EngineBuilder<A: Application> {
     metadata: Option<EngineMetadata>,
     app: Option<A>,
+    resources: Option<Arc<ResourceManager>>,
     #[cfg(feature = "graphics")]
     render_extensions: vulkano::instance::InstanceExtensions,
 }
@@ -133,6 +140,7 @@ impl<A: Application> EngineBuilder<A> {
         Self {
             metadata: None,
             app: None,
+            resources: None,
             render_extensions: vulkano::instance::InstanceExtensions::default(),
         }
     }
@@ -144,6 +152,15 @@ impl<A: Application> EngineBuilder<A> {
 
     pub fn app(mut self, app: A) -> Self {
         self.app = Some(app);
+        self
+    }
+
+    /// Configure a main [ResourceManager] for the engine.
+    ///
+    /// If no [ResourceManager] is specified, a default one with no sources - effectively a noop
+    /// manager - will be created.
+    pub fn resources(mut self, resources: Arc<ResourceManager>) -> Self {
+        self.resources = Some(resources);
         self
     }
 
@@ -159,6 +176,9 @@ impl<A: Application> EngineBuilder<A> {
 
         let app = self.app
             .expect(".app() is required");
+
+        let resources = self.resources
+            .unwrap_or_else(|| ResourceManager::builder().build());
 
         #[cfg(feature = "gui")]
         let window_starter = gui::WindowOrchestratorStarter::new();
@@ -178,6 +198,7 @@ impl<A: Application> EngineBuilder<A> {
             state: EngineState::Init,
             app,
             should_exit: AtomicBool::new(false),
+            resources,
             #[cfg(feature = "graphics")]
             render_instance,
             #[cfg(feature = "gui")]
