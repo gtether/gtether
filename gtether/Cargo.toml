@@ -16,7 +16,7 @@ gui = ["graphics", "dep:winit"]
 
 [dependencies]
 ab_glyph = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
+async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 image = { workspace = true, optional = true }
