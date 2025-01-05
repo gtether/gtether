@@ -1,0 +1,56 @@
+stages:
+  - build
+  - test
+  - release
+
+.build-jobs:
+  tags:
+    - build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build-gtether:
+  extends:
+    - .build-jobs
+  stage: build
+  script:
+    - cargo build --package gtether --all-features --release
+  artifacts:
+    paths:
+      - "target/"
+
+test-gtether:
+  extends:
+    - .build-jobs
+  stage: test
+  dependencies:
+    - build-gtether
+  script:
+    - cargo test --package gtether --all-features --release
+
+release-gtether-docs:
+  extends:
+    - .build-jobs
+  stage: release
+  dependencies:
+    - build-gtether
+  script:
+    - cargo doc --package gtether --no-deps --all-features --release
+  artifacts:
+    expose_as: "docs"
+    paths:
+      - "target/doc/gtether/"
+
+release-example-windows:
+  extends:
+    - .build-jobs
+  stage: release
+  dependencies:
+    - build-gtether
+  script:
+    - cargo build --package windows --release
+  artifacts:
+    expose_as: "example-windows"
+    paths:
+      - "target/release/windows"
