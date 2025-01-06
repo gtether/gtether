@@ -102,4 +102,4 @@ release-example-windows:
   artifacts:
     expose_as: "example-windows"
     paths:
-      - "target/release/${BIN_NAME}"
+      - "target/${TARGET}/release/${BIN_NAME}"
