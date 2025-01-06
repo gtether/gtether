@@ -37,7 +37,7 @@ test-gtether:
         matrix:
           - TARGET: x86_64-unknown-linux-gnu
   script:
-    - cargo +nightly test -- --format=json -Z unstable-options --report-time --package gtether --all-features --release | junitify --out test-results
+    - cargo +nightly test --package gtether --all-features --release -- --format=json -Z unstable-options --report-time | junitify --out test-results
   cache:
     key: "${CI_COMMIT_REF_NAME}-x86_64-unknown-linux-gnu"
     policy: pull
