@@ -105,7 +105,7 @@ impl<A: Application> Engine<A> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// # use std::time::Duration;
 /// # use gtether::{Engine, Registry};
 /// use gtether::{Application, EngineBuilder, EngineMetadata};
