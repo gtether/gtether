@@ -31,8 +31,6 @@ test-gtether:
   extends:
     - .build-jobs
   stage: test
-  dependencies:
-    - "build-gtether: [x86_64-unknown-linux-gnu]"
   needs:
     - job: build-gtether
       parallel:
@@ -54,8 +52,6 @@ release-gtether-docs:
   extends:
     - .build-jobs
   stage: release
-  dependencies:
-    - "build-gtether: [x86_64-unknown-linux-gnu]"
   needs:
     - job: build-gtether
       parallel:
@@ -83,19 +79,19 @@ release-example-windows:
           - x86_64-unknown-linux-gnu
           - x86_64-pc-windows-gnu
   rules:
-    - if: $TARGET == x86_64-unknown-linux-gnu
+    - if: $TARGET == "x86_64-unknown-linux-gnu"
       variables:
         BIN_NAME: windows
-    - if: $TARGET == x86_64-pc-windows-gnu
+    - if: $TARGET == "x86_64-pc-windows-gnu"
       variables:
         BIN_NAME: windows.exe
-  dependencies:
-    - "build-gtether: [$TARGET]"
   needs:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET: $TARGET
+          - TARGET:
+              - x86_64-unknown-linux-gnu
+              - x86_64-pc-windows-gnu
   script:
     - cargo build --package windows --release --target $TARGET
   cache:
@@ -104,6 +100,6 @@ release-example-windows:
     paths:
       - "target/"
   artifacts:
-    expose_as: "example-windows-${TARGET}"
+    expose_as: "example-windows"
     paths:
       - "target/release/${BIN_NAME}"
