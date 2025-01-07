@@ -19,21 +19,18 @@ use crate::render::attachment::{AttachmentMap, AttachmentType};
 /// The gTether engine provides some standard implementations of [EngineRenderPass], but custom
 /// implementations can also be used if desired.
 ///
-/// Implementations must be [Send]able so that they can be passed off to separate render threads.
-pub trait EngineRenderPass: Send {
-    /// The [vulkano::render_pass::RenderPass] that is created and maintained by this [EngineRenderPass].
+/// Implementations must be [Send]/[Sync] so that they can be passed off to separate render threads.
+pub trait EngineRenderPass: Send + Sync + 'static {
+    /// The Vulkano [RenderPass] that is created and maintained by this [EngineRenderPass].
     fn render_pass(&self) -> &Arc<RenderPass>;
-    /// A mapping of attachment names to [AttachmentBuffer]s.
+
+    /// A mapping of attachment names to [AttachmentType]s.
     fn attachment_map(&self) -> Arc<dyn AttachmentMap>;
+
     /// Build the render commands used to render a particular frame.
     ///
     /// In general, this delegates to [EngineRenderHandler]s to build specific commands.
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer);
-
-    /// Initialize this EngineRenderPass for a given [RenderTarget].
-    ///
-    /// Should be called exactly once.
-    fn init(&mut self, target: &Arc<dyn RenderTarget>);
 }
 
 /// An individual render handler, used for rendering specific details of subpasses.
@@ -41,20 +38,14 @@ pub trait EngineRenderPass: Send {
 /// [EngineRenderHandler] is usually implemented by engine users for custom rendering logic, but the
 /// gTether engine does provide several built-in handlers for certain use-cases.
 ///
-/// Implementations must be [Send]able so that they can be passed off to separate render threads.
-pub trait EngineRenderHandler: Send {
+/// Implementations must be [Send]/[Sync] so that they can be passed off to separate render threads.
+pub trait EngineRenderHandler: Send + Sync + 'static {
     /// Build the specific render commands used to render the part of the frame this handler is
     /// responsible for.
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer);
-
-    /// Initialize this EngineRenderHandler for a given render pass's subpass.
-    ///
-    /// Should be called exactly once.
-    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>);
 }
 
 struct EngineRenderSubpass {
-    subpass: Subpass,
     handlers: Vec<Box<dyn EngineRenderHandler>>,
 }
 
@@ -62,16 +53,6 @@ impl EngineRenderSubpass {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         for handler in &self.handlers {
             handler.build_commands(builder, frame);
-        }
-    }
-
-    fn init(
-        &mut self,
-        target: &Arc<dyn RenderTarget>,
-        attachments: &Arc<dyn AttachmentMap>,
-    ) {
-        for handler in &mut self.handlers {
-            handler.init(target, &self.subpass, attachments);
         }
     }
 }
@@ -161,31 +142,6 @@ struct StandardEngineRenderPass {
     clear_values: Vec<Option<ClearValue>>,
 }
 
-impl StandardEngineRenderPass {
-    fn new(
-        renderer: &RendererHandle,
-        //target: &Arc<dyn RenderTarget>,
-        render_pass: Arc<RenderPass>,
-        subpasses: Vec<EngineRenderSubpass>,
-        attachment_name_map: HashMap<String, u32>,
-        clear_values: Vec<Option<ClearValue>>,
-    ) -> Self {
-        let attachments = AttachmentData::new(
-            renderer.target(),
-            &render_pass,
-            attachment_name_map,
-        );
-        renderer.event_bus().register(RendererEventType::Stale, attachments.clone());
-
-        Self {
-            render_pass,
-            subpasses,
-            attachments,
-            clear_values,
-        }
-    }
-}
-
 impl EngineRenderPass for StandardEngineRenderPass {
     #[inline]
     fn render_pass(&self) -> &Arc<RenderPass> { &self.render_pass }
@@ -223,14 +179,10 @@ impl EngineRenderPass for StandardEngineRenderPass {
 
         builder.end_render_pass(SubpassEndInfo::default()).unwrap();
     }
-
-    fn init(&mut self, target: &Arc<dyn RenderTarget>) {
-        let attachments = self.attachment_map();
-        for subpass in &mut self.subpasses {
-            subpass.init(target, &attachments);
-        }
-    }
 }
+
+type CreateHandlerFn = Box<dyn FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>)
+    -> Box<dyn EngineRenderHandler>>;
 
 /// Builder pattern for creating a standard [EngineRenderPass].
 pub struct EngineRenderPassBuilder {
@@ -238,7 +190,7 @@ pub struct EngineRenderPassBuilder {
     attachments: Vec<AttachmentDescription>,
     attachment_name_map: HashMap<String, u32>,
     clear_values: Vec<Option<ClearValue>>,
-    subpass_infos: Vec<(SubpassDescription, Vec<Box<dyn EngineRenderHandler>>)>,
+    subpass_infos: Vec<(SubpassDescription, Vec<CreateHandlerFn>)>,
 }
 
 impl EngineRenderPassBuilder {
@@ -304,8 +256,9 @@ impl EngineRenderPassBuilder {
     pub fn begin_subpass(mut self) -> EngineRenderSubpassBuilder { EngineRenderSubpassBuilder::new(self) }
 
     /// Build the [EngineRenderPass].
-    pub fn build(self) -> Box<dyn EngineRenderPass> {
-        let vk_device = self.renderer.target().device().vk_device();
+    pub fn build(self) -> Arc<dyn EngineRenderPass> {
+        let target = self.renderer.target();
+        let vk_device = target.device().vk_device();
 
         // Ripped from the ordered_passes_renderpass() macro from Vulkano, as no changes are needed
         // to this logic
@@ -355,19 +308,31 @@ impl EngineRenderPassBuilder {
             }
         ).unwrap();
 
+        let attachments = AttachmentData::new(
+            target,
+            &render_pass,
+            self.attachment_name_map,
+        );
+        self.renderer.event_bus().register(RendererEventType::Stale, attachments.clone());
+        let dyn_attachments: Arc<dyn AttachmentMap> = attachments.clone();
+
         let subpasses = handler_groups.into_iter().enumerate()
-            .map(|(idx, handlers)| EngineRenderSubpass {
-                subpass: Subpass::from(render_pass.clone(), idx as u32).unwrap(),
-                handlers,
+            .map(|(idx, handlers)| {
+                let subpass = Subpass::from(render_pass.clone(), idx as u32).unwrap();
+                let handlers = handlers.into_iter()
+                    .map(|handler| handler(&self.renderer, &subpass, &dyn_attachments))
+                    .collect::<Vec<_>>();
+                EngineRenderSubpass {
+                    handlers,
+                }
             }).collect::<Vec<_>>();
 
-        Box::new(StandardEngineRenderPass::new(
-            &self.renderer,
+        Arc::new(StandardEngineRenderPass {
             render_pass,
             subpasses,
-            self.attachment_name_map,
-            self.clear_values,
-        ))
+            attachments,
+            clear_values: self.clear_values,
+        })
     }
 }
 
@@ -382,7 +347,7 @@ pub struct EngineRenderSubpassBuilder {
     depth_stencil_attachment: Option<AttachmentReference>,
     // TODO: Add support for depth_stencil_resolve
     input_attachments: Vec<Option<AttachmentReference>>,
-    handlers: Vec<Box<dyn EngineRenderHandler>>,
+    handlers: Vec<CreateHandlerFn>,
 }
 
 impl EngineRenderSubpassBuilder {
@@ -443,13 +408,22 @@ impl EngineRenderSubpassBuilder {
 
     /// Add an [EngineRenderHandler].
     ///
+    /// Handlers are added via a callback that creates said handler. This allows the builder to
+    /// fully create the Vulkano [RenderPass] and it's [Subpass]es before handlers are created, as
+    /// many handlers depend on these during creation.
+    ///
     /// This handler will be called when it is time to render this subpass. Multiple handlers can
-    /// be added, and they will eventually be called in the order that they were added.
-    pub fn handler(
+    /// be added, and they will be executed during rendering in the order that they were added.
+    pub fn handler<H>(
         mut self,
-        handler: Box<dyn EngineRenderHandler>,
-    ) -> Self {
-        self.handlers.push(handler);
+        handler: impl (FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> H) + 'static,
+    ) -> Self
+    where
+        H: EngineRenderHandler
+    {
+        self.handlers.push(Box::new(|renderer, subpass, attachments| {
+            Box::new(handler(renderer, subpass, attachments))
+        }));
         self
     }
 
@@ -507,7 +481,7 @@ impl AttachmentMap for NoOpAttachmentMap {
 /// use gtether::render::Renderer;
 /// use gtether::render::render_pass::NoOpEngineRenderPass;
 ///
-/// # fn wrapper(target: &Arc<dyn RenderTarget>, render_pass: Box<dyn EngineRenderPass>) {
+/// # fn wrapper(target: &Arc<dyn RenderTarget>, render_pass: Arc<dyn EngineRenderPass>) {
 /// let noop_render_pass = NoOpEngineRenderPass::new(target);
 /// let (mut renderer, _) = Renderer::new(target, noop_render_pass);
 ///
@@ -522,7 +496,7 @@ pub struct NoOpEngineRenderPass {
 
 impl NoOpEngineRenderPass {
     /// Create a new [NoOpEngineRenderPass].
-    pub fn new(target: &Arc<dyn RenderTarget>) -> Box<dyn EngineRenderPass> {
+    pub fn new(target: &Arc<dyn RenderTarget>) -> Arc<dyn EngineRenderPass> {
         let format = target.format();
         let vk_render_pass = vulkano::single_pass_renderpass!(
             target.device().vk_device().clone(),
@@ -540,7 +514,7 @@ impl NoOpEngineRenderPass {
             },
         ).unwrap();
 
-        Box::new(Self {
+        Arc::new(Self {
             vk_render_pass,
         })
     }
@@ -569,6 +543,4 @@ impl EngineRenderPass for NoOpEngineRenderPass {
             ).unwrap()
             .end_render_pass(SubpassEndInfo::default()).unwrap();
     }
-
-    fn init(&mut self, _target: &Arc<dyn RenderTarget>) {}
 }

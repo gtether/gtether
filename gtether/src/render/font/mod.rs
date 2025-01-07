@@ -18,6 +18,7 @@
 //! Load a font and create a compositor
 //! ```
 //! # use std::sync::Arc;
+//! # use vulkano::render_pass::Subpass;
 //! use gtether::render::font::compositor::FontCompositor;
 //! use gtether::render::font::glyph::GlyphFontLoader;
 //! use gtether::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
@@ -27,6 +28,7 @@
 //! #
 //! # let resource_manager: Arc<ResourceManager> = return;
 //! # let renderer: &RendererHandle = return;
+//! # let subpass: &Subpass = return;
 //! # let render_target: Arc<dyn RenderTarget> = return;
 //! # let font_data: Vec<u8> = return;
 //!
@@ -46,6 +48,7 @@
 //! let font_compositor = FontCompositor::new(
 //!     FontSheetRenderer::new(
 //!         renderer,
+//!         subpass,
 //!         font_sheet.clone(),
 //!     ),
 //! );

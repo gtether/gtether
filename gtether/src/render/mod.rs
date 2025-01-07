@@ -2,6 +2,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::mpsc;
 use tracing::{event, Level};
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -318,20 +319,18 @@ impl RendererEventData {
 /// around rendering to the target using an internally handled swapchain.
 pub struct Renderer {
     target: Arc<dyn RenderTarget>,
-    // TODO: Make render passes Arcs instead of Boxes; needs init() to be removed I think?
-    render_pass: Box<dyn EngineRenderPass>,
+    render_pass: Arc<dyn EngineRenderPass>,
     swapchain: Swapchain,
     stale: bool,
     event_bus: Arc<EventBus<RendererEventType, RendererEventData>>,
-    endpoint_render_pass: ump::Server<Box<dyn EngineRenderPass>, (), ()>,
+    recv_render_pass: mpsc::Receiver<Arc<dyn EngineRenderPass>>,
 }
 
 impl Renderer {
     /// Create a new renderer for a particular [RenderTarget] and [EngineRenderPass].
-    pub fn new(target: &Arc<dyn RenderTarget>, mut render_pass: Box<dyn EngineRenderPass>) -> (Self, RendererHandle) {
-        let (endpoint_render_pass, sender_render_pass) = ump::channel();
+    pub fn new(target: &Arc<dyn RenderTarget>, render_pass: Arc<dyn EngineRenderPass>) -> (Self, RendererHandle) {
+        let (send_render_pass, recv_render_pass) = mpsc::channel();
 
-        render_pass.init(target);
         let swapchain = Swapchain::new(target, &*render_pass);
 
         let event_bus = Arc::new(EventBus::default());
@@ -342,13 +341,13 @@ impl Renderer {
             swapchain,
             stale: false,
             event_bus: event_bus.clone(),
-            endpoint_render_pass,
+            recv_render_pass,
         };
 
         let handle = RendererHandle {
             target: target.clone(),
             event_bus,
-            sender_render_pass,
+            send_render_pass,
         };
 
         (renderer, handle)
@@ -368,9 +367,8 @@ impl Renderer {
     /// call to [Renderer::render()].
     ///
     /// [se]: RendererEventType::Stale
-    pub fn set_render_pass(&mut self, render_pass: Box<dyn EngineRenderPass>) {
+    pub fn set_render_pass(&mut self, render_pass: Arc<dyn EngineRenderPass>) {
         self.render_pass = render_pass;
-        self.render_pass.init(&self.target);
         self.stale = true;
     }
 
@@ -380,10 +378,8 @@ impl Renderer {
     /// and swapping framebuffers in the swapchain.
     pub fn render(&mut self) {
         // Check for any outside updates
-        while let Some((render_pass, rctx))
-                = self.endpoint_render_pass.try_pop().unwrap_or(None) {
+        while let Ok(render_pass) = self.recv_render_pass.try_recv() {
             self.set_render_pass(render_pass);
-            rctx.reply(()).unwrap();
         }
 
         let target = &self.target;
@@ -458,15 +454,11 @@ impl Renderer {
 ///
 /// This handle is cheaply cloneable, and can be used to interact with a [Renderer] from other
 /// threads.
-///
-/// NOTE: It is not recommended to use a RendererHandle to interact with a [Renderer] from the same
-/// thread that the [Renderer] lives in, as that could lead to deadlocks due to the implementation
-/// of these handles.
 #[derive(Clone)]
 pub struct RendererHandle {
     target: Arc<dyn RenderTarget>,
     event_bus: Arc<EventBus<RendererEventType, RendererEventData>>,
-    sender_render_pass: ump::Client<Box<dyn EngineRenderPass>, (), ()>,
+    send_render_pass: mpsc::Sender<Arc<dyn EngineRenderPass>>,
 }
 
 impl Debug for RendererHandle {
@@ -490,19 +482,16 @@ impl RendererHandle {
 
     /// Replace this [Renderer]'s [EngineRenderPass] with a new one.
     ///
-    /// Sends the new [EngineRenderPass] to the renderer's owning thread, and blocks until a
-    /// response has been received which indicates the [EngineRenderPass] was successfully replaced.
+    /// Sends the new [EngineRenderPass] to the renderer's owning thread. This call is non-blocking,
+    /// so it is not guaranteed that the renderer's render pass has been replaced before this call
+    /// returns.
     ///
-    /// # Deadlocks
+    /// # Errors
     ///
-    /// This will deadlock if called from the thread that owns the [Renderer]. Use
-    /// [Renderer::set_render_pass()] instead to set the [EngineRenderPass] from the same thread.
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the renderer has been destroyed.
-    pub fn set_render_pass(&self, render_pass: Box<dyn EngineRenderPass>) {
-        self.sender_render_pass.req(render_pass).unwrap();
+    /// - Errors if the renderer has been destroyed.
+    pub fn set_render_pass(&self, render_pass: Arc<dyn EngineRenderPass>)
+            -> Result<(), mpsc::SendError<Arc<dyn EngineRenderPass>>> {
+        self.send_render_pass.send(render_pass)
     }
 }
 

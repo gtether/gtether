@@ -59,7 +59,6 @@ pub trait AttachmentMap: Send + Sync {
 
 #[derive(Default)]
 struct AttachmentSetState {
-    attachment_map: Option<Arc<dyn AttachmentMap>>,
     descriptor_sets: OnceLock<Vec<Arc<PersistentDescriptorSet>>>,
 }
 
@@ -68,13 +67,12 @@ impl AttachmentSetState {
         &self,
         target: &Arc<dyn RenderTarget>,
         graphics: &Arc<dyn VKGraphicsPipelineSource>,
+        attachment_map: &Arc<dyn AttachmentMap>,
         input_names: &Vec<String>,
         set_index: u32,
     ) -> &Vec<Arc<PersistentDescriptorSet>> {
         self.descriptor_sets.get_or_init(|| {
             let graphics = graphics.vk_graphics();
-            let attachment_map = self.attachment_map.as_ref()
-                .expect("AttachmentSet not initialized");
 
             let input_buffers = (0..target.framebuffer_count()).into_iter().map(|frame_idx| {
                 input_names.iter().map(|color| {
@@ -116,6 +114,7 @@ impl Debug for AttachmentSetState {
 pub struct AttachmentSet {
     target: Arc<dyn RenderTarget>,
     graphics: Arc<dyn VKGraphicsPipelineSource>,
+    attachment_map: Arc<dyn AttachmentMap>,
     input_names: Vec<String>,
     set_index: u32,
     inner: Mutex<AttachmentSetState>,
@@ -139,12 +138,14 @@ impl AttachmentSet {
     pub fn new(
         renderer: &RendererHandle,
         graphics: Arc<dyn VKGraphicsPipelineSource>,
+        attachment_map: Arc<dyn AttachmentMap>,
         input_names: Vec<String>,
         set_index: u32,
     ) -> Arc<Self> {
         let attachment_set = Arc::new(Self {
             target: renderer.target().clone(),
             graphics,
+            attachment_map,
             input_names,
             set_index,
             inner: Mutex::new(AttachmentSetState::default()),
@@ -153,18 +154,12 @@ impl AttachmentSet {
         attachment_set
     }
 
-    /// Initialize this [AttachmentSet] with the render pass's [AttachmentMap].
-    ///
-    /// Should be called exactly once.
-    pub fn init(&self, attachment_map: Arc<dyn AttachmentMap>) {
-        self.inner.lock().attachment_map = Some(attachment_map);
-    }
-
     /// Get the descriptor set associated with this [AttachmentSet], creating it if necessary.
     pub fn descriptor_set(&self, frame_idx: usize) -> Option<Arc<PersistentDescriptorSet>> {
         self.inner.lock().get_or_init_descriptor_sets(
             &self.target,
             &self.graphics,
+            &self.attachment_map,
             &self.input_names,
             self.set_index
         ).get(frame_idx).map(Arc::clone)

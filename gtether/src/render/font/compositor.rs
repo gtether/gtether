@@ -32,7 +32,6 @@
 //! ```
 
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-use vulkano::render_pass::Subpass;
 
 use crate::render::font::layout::{PositionedChar, TextLayout};
 
@@ -41,11 +40,6 @@ use crate::render::font::layout::{PositionedChar, TextLayout};
 /// These helpers are intended to consume [PositionedChar]s from a [TextLayout], and render them
 /// according to said layout.
 pub trait FontRenderer: Send + Sync + 'static {
-    /// Initialize this FontRenderer for a given subpass.
-    ///
-    /// Should be called exactly once.
-    fn init(&mut self, subpass: &Subpass);
-
     /// Add the relevant render commands to a command buffer.
     fn build_commands(
         &self,
@@ -67,13 +61,6 @@ impl FontCompositor {
     /// [RenderTarget].
     pub fn new(renderer: Box<dyn FontRenderer>) -> Self {
         Self { renderer }
-    }
-
-    /// Initialize this compositor (and it's [FontRenderer]) with a given subpass.
-    ///
-    /// Should be called exactly once.
-    pub fn init(&mut self, subpass: &Subpass) {
-        self.renderer.init(subpass);
     }
 
     /// Begin a pass rendering a collection of [TextLayout]s.

@@ -17,7 +17,6 @@ use std::sync::Arc;
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::GraphicsPipeline;
-use vulkano::render_pass::Subpass;
 
 use crate::event::{Event, EventHandler};
 use crate::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
@@ -31,14 +30,8 @@ pub trait VKGraphicsPipelineSource: Send + Sync {
     fn vk_graphics(&self) -> Arc<GraphicsPipeline>;
 }
 
-pub type GenGraphicsPipelineCreateInfoFn = Box<
-    dyn (Fn(&Subpass) -> GraphicsPipelineCreateInfo)
-    + Send + Sync + 'static
->;
-
 #[derive(Debug, Default)]
 struct EngineGraphicsPipelineState {
-    subpass: Option<Subpass>,
     pipeline: Option<Arc<GraphicsPipeline>>
 }
 
@@ -48,23 +41,27 @@ struct EngineGraphicsPipelineState {
 /// the [Renderer][re] is stale.
 ///
 /// In order to recreate the underlying pipeline, this struct needs to know what
-/// [GraphicsPipelineCreateInfo] to use - some of which may be determined dynamically. To facilitate
-/// this, this struct takes in a callback that can generate [GraphicsPipelineCreateInfo] from a
-/// [Subpass] reference.
+/// [GraphicsPipelineCreateInfo] to use, and will expect some base-level create info to be given
+/// to it. The [viewport state][civs] field does not need to be set, as it will be set on pipeline
+/// creation based on the current [render target][rt]'s [dimensions][rtd].
+///
+/// [re]: crate::render::Renderer
+/// [civs]: GraphicsPipelineCreateInfo::viewport_state
+/// [rt]: RenderTarget
+/// [rtd]: RenderTarget::dimensions
 ///
 /// # Examples
 /// ```
 /// # use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 /// use vulkano::pipeline::{PipelineLayout, PipelineShaderStageCreateInfo};
-/// use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 /// use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 /// use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+/// # use vulkano::render_pass::Subpass;
 /// # use vulkano::shader::EntryPoint;
 /// use gtether::render::pipeline::EngineGraphicsPipeline;
-///
 /// # use gtether::render::RendererHandle;
 ///
-/// # fn wrapper(renderer: &RendererHandle, vertex_shader: EntryPoint, fragment_shader: EntryPoint, vertex_input_state: Option<VertexInputState>) {
+/// # fn wrapper(renderer: &RendererHandle, subpass: &Subpass, vertex_shader: EntryPoint, fragment_shader: EntryPoint, vertex_input_state: Option<VertexInputState>) {
 /// // Assuming some existing vertex/fragment shaders + vertex input state
 /// let stages = [
 ///     PipelineShaderStageCreateInfo::new(vertex_shader),
@@ -78,29 +75,23 @@ struct EngineGraphicsPipelineState {
 ///         .unwrap(),
 /// ).unwrap();
 ///
-/// let base_create_info = GraphicsPipelineCreateInfo {
+/// let create_info = GraphicsPipelineCreateInfo {
 ///     stages: stages.into_iter().collect(),
 ///     vertex_input_state,
-///     // Any other static configuration that never needs to change goes here
+///     subpass: Some(subpass.clone().into()),
+///     // Any other configuration can go here
 ///     ..GraphicsPipelineCreateInfo::layout(layout)
 /// };
 ///
-/// let graphics = EngineGraphicsPipeline::new(renderer, move |subpass| GraphicsPipelineCreateInfo {
-///     // Dynamic configuration goes here
-///     // For example, subpass color blending
-///     color_blend_state: Some(ColorBlendState::with_attachment_states(
-///         subpass.num_color_attachments(),
-///         ColorBlendAttachmentState::default(),
-///     )),
-///     ..base_create_info.clone()
-/// });
+/// let graphics = EngineGraphicsPipeline::new(
+///     renderer,
+///     create_info,
+/// );
 /// # }
 /// ```
-///
-/// [re]: crate::render::Renderer
 pub struct EngineGraphicsPipeline {
     target: Arc<dyn RenderTarget>,
-    gen_create_info: GenGraphicsPipelineCreateInfoFn,
+    create_info: GraphicsPipelineCreateInfo,
     inner: Mutex<EngineGraphicsPipelineState>,
 }
 
@@ -119,23 +110,15 @@ impl EngineGraphicsPipeline {
     /// See [top-level documentation](Self) for more.
     pub fn new(
         renderer: &RendererHandle,
-        gen_create_info: impl (Fn(&Subpass) -> GraphicsPipelineCreateInfo)
-            + Send + Sync + 'static,
+        create_info: GraphicsPipelineCreateInfo,
     ) -> Arc<Self> {
         let graphics = Arc::new(Self {
             target: renderer.target().clone(),
-            gen_create_info: Box::new(gen_create_info),
+            create_info,
             inner: Mutex::new(EngineGraphicsPipelineState::default()),
         });
         renderer.event_bus().register(RendererEventType::Stale, graphics.clone());
         graphics
-    }
-
-    /// Initialize this pipeline.
-    ///
-    /// Should be called exactly once.
-    pub fn init(&self, subpass: Subpass) {
-        self.inner.lock().subpass = Some(subpass);
     }
 }
 
@@ -146,9 +129,6 @@ impl VKGraphicsPipelineSource for EngineGraphicsPipeline {
         if let Some(pipeline) = &lock.pipeline {
             pipeline.clone()
         } else {
-            let subpass = lock.subpass.as_ref()
-                .expect("GraphicsPipelineCell not initialized");
-
             // TODO: Make customizable if needed
             let viewport = Viewport {
                 offset: [0.0, 0.0],
@@ -164,8 +144,7 @@ impl VKGraphicsPipelineSource for EngineGraphicsPipeline {
                         viewports: [viewport].into_iter().collect(),
                         ..Default::default()
                     }),
-                    subpass: Some(subpass.clone().into()),
-                    ..(self.gen_create_info)(subpass)
+                    ..self.create_info.clone()
                 }
             ).unwrap();
 

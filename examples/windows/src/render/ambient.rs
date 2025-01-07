@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use gtether::render::attachment::{AttachmentMap, AttachmentSet};
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{RenderTarget, RendererHandle};
+use gtether::render::RendererHandle;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState};
@@ -59,7 +59,6 @@ impl Default for AmbientLight {
 }
 
 pub struct AmbientRenderer {
-    target: Arc<dyn RenderTarget>,
     graphics: Arc<EngineGraphicsPipeline>,
     screen_buffer: Subbuffer<[FlatVertex]>,
     attachments: Arc<AttachmentSet>,
@@ -67,7 +66,7 @@ pub struct AmbientRenderer {
 }
 
 impl AmbientRenderer {
-    pub fn new(renderer: &RendererHandle) -> Self {
+    fn new(renderer: &RendererHandle, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>) -> Self {
         let target = renderer.target();
 
         let ambient_vert = ambient_vert::load(target.device().vk_device().clone())
@@ -94,9 +93,24 @@ impl AmbientRenderer {
                 .unwrap(),
         ).unwrap();
 
-        let base_create_info = GraphicsPipelineCreateInfo {
+        let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state,
+            subpass: Some(subpass.clone().into()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend {
+                        src_color_blend_factor: BlendFactor::One,
+                        dst_color_blend_factor: BlendFactor::One,
+                        color_blend_op: BlendOp::Add,
+                        src_alpha_blend_factor: BlendFactor::One,
+                        dst_alpha_blend_factor: BlendFactor::One,
+                        alpha_blend_op: BlendOp::Max,
+                    }),
+                    ..Default::default()
+                },
+            )),
             input_assembly_state: Some(InputAssemblyState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
@@ -108,28 +122,13 @@ impl AmbientRenderer {
 
         let graphics = EngineGraphicsPipeline::new(
             renderer,
-            move |subpass| GraphicsPipelineCreateInfo {
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend {
-                            src_color_blend_factor: BlendFactor::One,
-                            dst_color_blend_factor: BlendFactor::One,
-                            color_blend_op: BlendOp::Add,
-                            src_alpha_blend_factor: BlendFactor::One,
-                            dst_alpha_blend_factor: BlendFactor::One,
-                            alpha_blend_op: BlendOp::Max,
-                        }),
-                        ..Default::default()
-                    },
-                )),
-                ..base_create_info.clone()
-            },
+            create_info,
         );
 
         let attachments = AttachmentSet::new(
             renderer,
             graphics.clone(),
+            attachments.clone(),
             vec!["color".into()],
             0,
         );
@@ -142,16 +141,12 @@ impl AmbientRenderer {
         );
 
         Self {
-            target: target.clone(),
             graphics,
             screen_buffer: FlatVertex::screen_buffer(target),
             attachments,
             light,
         }
     }
-
-    #[inline]
-    pub fn light(&self) -> &Arc<Uniform<AmbientLight>> { &self.light }
 }
 
 impl EngineRenderHandler for AmbientRenderer {
@@ -172,10 +167,33 @@ impl EngineRenderHandler for AmbientRenderer {
             .bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap()
             .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
     }
+}
 
-    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>) {
-        self.target = target.clone();
-        self.graphics.init(subpass.clone());
-        self.attachments.init(attachments.clone());
+#[derive(Default)]
+pub struct AmbientRendererRefs {
+    light: OnceLock<Arc<Uniform<AmbientLight>>>,
+}
+
+impl AmbientRendererRefs {
+    #[inline]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn bootstrap(self: &Arc<AmbientRendererRefs>)
+            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> AmbientRenderer {
+        let self_clone = self.clone();
+        move |renderer, subpass, attachments| {
+            let ambient_renderer = AmbientRenderer::new(renderer, subpass, attachments);
+            self_clone.light.set(ambient_renderer.light.clone())
+                .expect(".bootstrap() should not be called twice");
+            ambient_renderer
+        }
+    }
+
+    #[inline]
+    pub fn light(&self) -> &Arc<Uniform<AmbientLight>> {
+        self.light.get()
+            .expect("AmbientRenderer not yet created")
     }
 }

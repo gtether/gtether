@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use gtether::render::attachment::{AttachmentMap, AttachmentSet};
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::UniformSet;
-use gtether::render::{RenderTarget, RendererHandle};
+use gtether::render::RendererHandle;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState};
@@ -42,7 +42,6 @@ pub struct PointLight {
 }
 
 pub struct DirectionalRenderer {
-    target: Arc<dyn RenderTarget>,
     graphics: Arc<EngineGraphicsPipeline>,
     screen_buffer: Subbuffer<[FlatVertex]>,
     attachments: Arc<AttachmentSet>,
@@ -50,7 +49,7 @@ pub struct DirectionalRenderer {
 }
 
 impl DirectionalRenderer {
-    pub fn new(renderer: &RendererHandle) -> Self {
+    fn new(renderer: &RendererHandle, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>) -> Self {
         let target = renderer.target();
 
         let directional_vert = directional_vert::load(target.device().vk_device().clone())
@@ -77,9 +76,24 @@ impl DirectionalRenderer {
                 .unwrap(),
         ).unwrap();
 
-        let base_create_info = GraphicsPipelineCreateInfo {
+        let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state,
+            subpass: Some(subpass.clone().into()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend {
+                        src_color_blend_factor: BlendFactor::One,
+                        dst_color_blend_factor: BlendFactor::One,
+                        color_blend_op: BlendOp::Add,
+                        src_alpha_blend_factor: BlendFactor::One,
+                        dst_alpha_blend_factor: BlendFactor::One,
+                        alpha_blend_op: BlendOp::Max,
+                    }),
+                    ..Default::default()
+                },
+            )),
             input_assembly_state: Some(InputAssemblyState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
@@ -91,28 +105,13 @@ impl DirectionalRenderer {
 
         let graphics = EngineGraphicsPipeline::new(
             renderer,
-            move |subpass| GraphicsPipelineCreateInfo {
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend {
-                            src_color_blend_factor: BlendFactor::One,
-                            dst_color_blend_factor: BlendFactor::One,
-                            color_blend_op: BlendOp::Add,
-                            src_alpha_blend_factor: BlendFactor::One,
-                            dst_alpha_blend_factor: BlendFactor::One,
-                            alpha_blend_op: BlendOp::Max,
-                        }),
-                        ..Default::default()
-                    },
-                )),
-                ..base_create_info.clone()
-            },
+            create_info,
         );
 
         let attachments = AttachmentSet::new(
             renderer,
             graphics.clone(),
+            attachments.clone(),
             vec!["color".into(), "normals".into()],
             0,
         );
@@ -125,16 +124,12 @@ impl DirectionalRenderer {
         );
 
         Self {
-            target: target.clone(),
             graphics,
             screen_buffer: FlatVertex::screen_buffer(target),
             attachments,
             lights,
         }
     }
-
-    #[inline]
-    pub fn lights(&self) -> &Arc<UniformSet<PointLight>> { &self.lights }
 }
 
 impl EngineRenderHandler for DirectionalRenderer {
@@ -157,10 +152,33 @@ impl EngineRenderHandler for DirectionalRenderer {
                 .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
         }
     }
+}
 
-    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>) {
-        self.target = target.clone();
-        self.graphics.init(subpass.clone());
-        self.attachments.init(attachments.clone());
+#[derive(Default)]
+pub struct DirectionalRendererRefs {
+    lights: OnceLock<Arc<UniformSet<PointLight>>>
+}
+
+impl DirectionalRendererRefs {
+    #[inline]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn bootstrap(self: &Arc<DirectionalRendererRefs>)
+            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> DirectionalRenderer {
+        let self_clone = self.clone();
+        move |renderer, subpass, attachments| {
+            let directional_renderer = DirectionalRenderer::new(renderer, subpass, attachments);
+            self_clone.lights.set(directional_renderer.lights.clone())
+                .expect(".bootstrap() should not be called twice");
+            directional_renderer
+        }
+    }
+
+    #[inline]
+    pub fn lights(&self) -> &Arc<UniformSet<PointLight>> {
+        self.lights.get()
+            .expect("DirectionalRenderer not yet created")
     }
 }

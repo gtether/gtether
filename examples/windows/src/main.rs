@@ -7,17 +7,16 @@ use std::time::Duration;
 
 use glm::identity;
 use tracing::{event, Level};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
-use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
-use gtether::console::{Console, ConsoleStdinReader};
 use gtether::console::command::{Command, CommandError, CommandRegistry, CommandTree, ParamCountCheck};
 use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
+use gtether::console::{Console, ConsoleStdinReader};
 use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::font::glyph::GlyphFontLoader;
@@ -25,10 +24,12 @@ use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::{Uniform, UniformSet};
 use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
+use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
+
+use crate::render::ambient::{AmbientLight, AmbientRendererRefs};
+use crate::render::cube::CubeRendererRefs;
+use crate::render::directional::{DirectionalRendererRefs, PointLight};
 use crate::render::{MN, VP};
-use crate::render::ambient::{AmbientLight, AmbientRenderer};
-use crate::render::cube::CubeRenderer;
-use crate::render::directional::{DirectionalRenderer, PointLight};
 
 mod render;
 
@@ -249,54 +250,16 @@ impl Application for WindowsApp {
         });
         //window.set_cursor_visible(false);
 
-        let cube_renderer = CubeRenderer::new(window.renderer());
-        let mn = cube_renderer.mn().clone();
-        *mn.write() = MN::new(model);
-        let vp = cube_renderer.vp().clone();
-        *vp.write() = VP {
-            view: self.camera.borrow().view(),
-            projection: identity(),
-        };
-
-        let ambient_renderer = AmbientRenderer::new(window.renderer());
-        let ambient_light = ambient_renderer.light().clone();
-        cmd_registry.register_command("ambient", Box::new(AmbientLightCommand {
-            ambient_light,
-        })).unwrap();
-
-        let directional_renderer = DirectionalRenderer::new(window.renderer());
-        let point_lights = directional_renderer.lights().clone();
-        *point_lights.write() = vec![
-            PointLight {
-                position: [-4.0, -4.0, 0.0, 1.0],
-                color: [0.8, 0.8, 0.8],
-            },
-        ];
-
-        let mut point_light_subcommands = CommandTree::default();
-        point_light_subcommands.register_command("list", Box::new(PointLightListCommand {
-            point_lights: point_lights.clone()
-        })).unwrap();
-        point_light_subcommands.register_alias("l", "list").unwrap();
-        point_light_subcommands.register_command("delete", Box::new(PointLightDeleteCommand {
-            point_lights: point_lights.clone()
-        })).unwrap();
-        point_light_subcommands.register_alias("del", "delete").unwrap();
-        point_light_subcommands.register_alias("d", "delete").unwrap();
-        point_light_subcommands.register_command("add", Box::new(PointLightAddCommand {
-            point_lights: point_lights.clone()
-        })).unwrap();
-        point_light_subcommands.register_alias("a", "add").unwrap();
-        cmd_registry
-            .register_command("point", Box::new(point_light_subcommands)).unwrap()
-            .register_alias("points", "point").unwrap();
+        let cube_renderer = CubeRendererRefs::new();
+        let ambient_renderer = AmbientRendererRefs::new();
+        let directional_renderer = DirectionalRendererRefs::new();
 
         let console_font = engine.resources().get_or_load(
             "console_font",
             GlyphFontLoader::new(window.renderer().clone()),
             LoadPriority::Immediate,
         ).wait_blocking().unwrap();
-        let (_, console_renderer) = ConsoleGui::builder(self.console.clone())
+        let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)
             .font(console_font)
             .build().unwrap();
@@ -325,21 +288,60 @@ impl Application for WindowsApp {
             }, Some(1.0.into()))
             .final_color_attachment("final_color".into(), [0.0, 0.0, 0.0, 1.0].into())
             .begin_subpass()
-            .color_attachment("color".into())
-            .color_attachment("normals".into())
-            .depth_stencil_attachment("depth".into())
-            .handler(Box::new(cube_renderer))
+                .color_attachment("color".into())
+                .color_attachment("normals".into())
+                .depth_stencil_attachment("depth".into())
+                .handler(cube_renderer.bootstrap())
             .end_subpass()
             .begin_subpass()
-            .input_attachment("color".into())
-            .input_attachment("normals".into())
-            .color_attachment("final_color".into())
-            .handler(Box::new(ambient_renderer))
-            .handler(Box::new(directional_renderer))
-            .handler(console_renderer)
+                .input_attachment("color".into())
+                .input_attachment("normals".into())
+                .color_attachment("final_color".into())
+                .handler(ambient_renderer.bootstrap())
+                .handler(directional_renderer.bootstrap())
+                .handler(console_gui.bootstrap_renderer())
             .end_subpass()
             .build();
-        window.renderer().set_render_pass(render_pass);
+        window.renderer().set_render_pass(render_pass).unwrap();
+
+        let mn = cube_renderer.mn().clone();
+        *mn.write() = MN::new(model);
+        let vp = cube_renderer.vp().clone();
+        *vp.write() = VP {
+            view: self.camera.borrow().view(),
+            projection: identity(),
+        };
+
+        let ambient_light = ambient_renderer.light().clone();
+        cmd_registry.register_command("ambient", Box::new(AmbientLightCommand {
+            ambient_light,
+        })).unwrap();
+
+        let point_lights = directional_renderer.lights().clone();
+        *point_lights.write() = vec![
+            PointLight {
+                position: [-4.0, -4.0, 0.0, 1.0],
+                color: [0.8, 0.8, 0.8],
+            },
+        ];
+
+        let mut point_light_subcommands = CommandTree::default();
+        point_light_subcommands.register_command("list", Box::new(PointLightListCommand {
+            point_lights: point_lights.clone()
+        })).unwrap();
+        point_light_subcommands.register_alias("l", "list").unwrap();
+        point_light_subcommands.register_command("delete", Box::new(PointLightDeleteCommand {
+            point_lights: point_lights.clone()
+        })).unwrap();
+        point_light_subcommands.register_alias("del", "delete").unwrap();
+        point_light_subcommands.register_alias("d", "delete").unwrap();
+        point_light_subcommands.register_command("add", Box::new(PointLightAddCommand {
+            point_lights: point_lights.clone()
+        })).unwrap();
+        point_light_subcommands.register_alias("a", "add").unwrap();
+        cmd_registry
+            .register_command("point", Box::new(point_light_subcommands)).unwrap()
+            .register_alias("points", "point").unwrap();
 
         cmd_registry.register_command("dump", Box::new(ConsoleDumpCommand {
             log: self.console.log().clone(),

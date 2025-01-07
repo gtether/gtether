@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use gtether::event::Event;
 use gtether::render::attachment::AttachmentMap;
@@ -6,7 +6,7 @@ use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use gtether::render::{RendererEventData, RendererEventType, RendererHandle};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -49,7 +49,6 @@ struct CubeVertex {
 }
 
 pub struct CubeRenderer {
-    target: Arc<dyn RenderTarget>,
     graphics: Arc<EngineGraphicsPipeline>,
     vertex_buffer: Subbuffer<[CubeVertex]>,
     mn: Arc<Uniform<MN>>,
@@ -57,7 +56,7 @@ pub struct CubeRenderer {
 }
 
 impl CubeRenderer {
-    pub fn new(renderer: &RendererHandle) -> Self {
+    fn new(renderer: &RendererHandle, subpass: &Subpass) -> Self {
         let target = renderer.target();
 
         let color = [1.0, 1.0, 1.0];
@@ -144,13 +143,18 @@ impl CubeRenderer {
                 .unwrap(),
         ).unwrap();
 
-        let base_create_info = GraphicsPipelineCreateInfo {
+        let create_info = GraphicsPipelineCreateInfo {
             depth_stencil_state: Some(DepthStencilState {
                 depth: Some(DepthState::simple()),
                 ..Default::default()
             }),
             stages: stages.into_iter().collect(),
             vertex_input_state,
+            subpass: Some(subpass.clone().into()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
             input_assembly_state: Some(InputAssemblyState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
@@ -162,13 +166,7 @@ impl CubeRenderer {
 
         let graphics = EngineGraphicsPipeline::new(
             renderer,
-            move |subpass| GraphicsPipelineCreateInfo {
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState::default(),
-                )),
-                ..base_create_info.clone()
-            },
+            create_info,
         );
 
         let mn = Uniform::new(
@@ -198,19 +196,12 @@ impl CubeRenderer {
         );
 
         Self {
-            target: target.clone(),
             graphics,
             vertex_buffer,
             mn,
             vp,
         }
     }
-
-    #[inline]
-    pub fn mn(&self) -> &Arc<Uniform<MN>> { &self.mn }
-
-    #[inline]
-    pub fn vp(&self) -> &Arc<Uniform<VP>> { &self.vp }
 }
 
 impl EngineRenderHandler for CubeRenderer {
@@ -231,9 +222,42 @@ impl EngineRenderHandler for CubeRenderer {
             .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
             .draw(self.vertex_buffer.len() as u32, 1, 0, 0).unwrap();
     }
+}
 
-    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, _attachments: &Arc<dyn AttachmentMap>) {
-        self.target = target.clone();
-        self.graphics.init(subpass.clone());
+#[derive(Default)]
+pub struct CubeRendererRefs {
+    mn: OnceLock<Arc<Uniform<MN>>>,
+    vp: OnceLock<Arc<Uniform<VP>>>,
+}
+
+impl CubeRendererRefs {
+    #[inline]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn bootstrap(self: &Arc<CubeRendererRefs>)
+            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> CubeRenderer {
+        let self_clone = self.clone();
+        move |renderer, subpass, _| {
+            let cube_renderer = CubeRenderer::new(renderer, subpass);
+            self_clone.mn.set(cube_renderer.mn.clone())
+                .expect(".bootstrap() should not be called twice");
+            self_clone.vp.set(cube_renderer.vp.clone())
+                .expect(".bootstrap() should not be called twice");
+            cube_renderer
+        }
+    }
+
+    #[inline]
+    pub fn mn(&self) -> &Arc<Uniform<MN>> {
+        self.mn.get()
+            .expect("CubeRenderer not yet created")
+    }
+
+    #[inline]
+    pub fn vp(&self) -> &Arc<Uniform<VP>> {
+        self.vp.get()
+            .expect("CubeRenderer not yet created")
     }
 }

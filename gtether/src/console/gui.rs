@@ -183,14 +183,14 @@ impl Default for ConsoleGuiBackground {
 /// # let font: Arc<Resource<dyn Font>> = return;
 /// # let render_subpass_builder: EngineRenderSubpassBuilder = return;
 ///
-/// let (console_gui, console_renderer) = ConsoleGui::builder(console.clone())
+/// let console_gui = ConsoleGui::builder(console.clone())
 ///     .window(&window_handle)
 ///     .font(font.clone())
 ///     .build().unwrap();
 ///
 /// // Later, when building a render pass
 /// render_subpass_builder
-///     .handler(console_renderer);
+///     .handler(console_gui.bootstrap_renderer());
 /// ```
 ///
 /// Creating GUIs for multiple windows from one console
@@ -210,8 +210,8 @@ impl Default for ConsoleGuiBackground {
 /// let builder = ConsoleGui::builder(console.clone())
 ///     .font(font.clone());
 ///
-/// let (console_gui_1, console_renderer_1) = builder.window(&window_1).build().unwrap();
-/// let (console_gui_2, console_renderer_2) = builder.window(&window_2).build().unwrap();
+/// let console_gui_1 = builder.window(&window_1).build().unwrap();
+/// let console_gui_2 = builder.window(&window_2).build().unwrap();
 /// ```
 pub struct ConsoleGui {
     console: Arc<Console>,
@@ -377,6 +377,30 @@ impl ConsoleGui {
 
         orig_gui
     }
+
+    /// Generate a callback that creates a [ConsoleRenderer] for this [ConsoleGui].
+    ///
+    /// Intended for use while [building render passes][rpb]:
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use gtether::console::gui::ConsoleGui;
+    /// # use gtether::render::render_pass::EngineRenderSubpassBuilder;
+    /// #
+    /// # let render_subpass_builder: EngineRenderSubpassBuilder = return;
+    /// # let console_gui: Arc<ConsoleGui> = return;
+    /// #
+    /// render_subpass_builder
+    ///     .handler(console_gui.bootstrap_renderer());
+    /// ```
+    ///
+    /// [rpb]: crate::render::render_pass::EngineRenderPassBuilder
+    pub fn bootstrap_renderer(self: &Arc<Self>)
+            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> ConsoleRenderer {
+        let self_clone = self.clone();
+        |renderer, subpass, _| {
+            ConsoleRenderer::new(renderer, subpass, self_clone)
+        }
+    }
 }
 
 impl EventHandler<RendererEventType, RendererEventData> for ConsoleGui {
@@ -444,7 +468,7 @@ struct ConsoleBackgroundSolidRenderer {
 }
 
 impl ConsoleBackgroundSolidRenderer {
-    fn new(renderer: &RendererHandle, gui: &Arc<ConsoleGui>, bg: BackgroundSolid) -> Self {
+    fn new(renderer: &RendererHandle, subpass: &Subpass, gui: &Arc<ConsoleGui>, bg: BackgroundSolid) -> Self {
         let target = renderer.target();
 
         let (min, max) = gui.layout.screen_bounds();
@@ -478,9 +502,17 @@ impl ConsoleBackgroundSolidRenderer {
                 .unwrap(),
         ).unwrap();
 
-        let base_create_info = GraphicsPipelineCreateInfo {
+        let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state,
+            subpass: Some(subpass.clone().into()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend::alpha()),
+                    ..Default::default()
+                },
+            )),
             input_assembly_state: Some(InputAssemblyState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
@@ -492,16 +524,7 @@ impl ConsoleBackgroundSolidRenderer {
 
         let graphics = EngineGraphicsPipeline::new(
             renderer,
-            move |subpass| GraphicsPipelineCreateInfo {
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                ..base_create_info.clone()
-            },
+            create_info,
         );
 
         let color = Uniform::new(
@@ -516,10 +539,6 @@ impl ConsoleBackgroundSolidRenderer {
             color,
             buffer,
         }
-    }
-
-    fn init(&self, subpass: &Subpass) {
-        self.graphics.init(subpass.clone());
     }
 
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
@@ -548,18 +567,11 @@ enum ConsoleBackgroundRenderer {
 }
 
 impl ConsoleBackgroundRenderer {
-    fn new(renderer: &RendererHandle, gui: &Arc<ConsoleGui>) -> Self {
+    fn new(renderer: &RendererHandle, subpass: &Subpass, gui: &Arc<ConsoleGui>) -> Self {
         match &gui.background {
             ConsoleGuiBackground::Solid(bg) => ConsoleBackgroundRenderer::Solid(
-                ConsoleBackgroundSolidRenderer::new(renderer, gui, bg.clone())
+                ConsoleBackgroundSolidRenderer::new(renderer, subpass, gui, bg.clone())
             ),
-        }
-    }
-
-    fn init(&self, subpass: &Subpass) {
-        match self {
-            ConsoleBackgroundRenderer::Solid(renderer)
-                => renderer.init(subpass),
         }
     }
 
@@ -571,28 +583,38 @@ impl ConsoleBackgroundRenderer {
     }
 }
 
-struct ConsoleRenderer {
-    target: Arc<dyn RenderTarget>,
+/// [RendererHandler][erh] for a [ConsoleGui].
+///
+/// See [ConsoleGui] documentation for more.
+///
+/// [erh]: EngineRenderHandler
+pub struct ConsoleRenderer {
     gui: Arc<ConsoleGui>,
     background: ConsoleBackgroundRenderer,
     font_compositor: FontCompositor,
 }
 
 impl ConsoleRenderer {
-    fn new(renderer: &RendererHandle, gui: Arc<ConsoleGui>) -> Self {
-        let target = renderer.target();
-
-        let background = ConsoleBackgroundRenderer::new(renderer, &gui);
+    /// Create a new [ConsoleRenderer].
+    ///
+    /// This method exists to use [ConsoleRenderer] with custom render pass implementations. If you
+    /// are using the engine-provided [render pass][rp], it is recommended to use the
+    /// [bootstrap][bs] method with the relevant builder pattern instead.
+    ///
+    /// [rp]: crate::render::render_pass::EngineRenderPassBuilder
+    /// [bs]: ConsoleGui::bootstrap_renderer
+    pub fn new(renderer: &RendererHandle, subpass: &Subpass, gui: Arc<ConsoleGui>) -> Self {
+        let background = ConsoleBackgroundRenderer::new(renderer, subpass, &gui);
 
         let font_compositor = FontCompositor::new(
             FontSheetRenderer::new(
                 renderer,
+                subpass,
                 gui.font_sheet.clone(),
             ),
         );
 
         Self {
-            target: target.clone(),
             gui,
             background,
             font_compositor,
@@ -659,19 +681,18 @@ impl EngineRenderHandler for ConsoleRenderer {
         pass.layout(&prompt_layout);
         pass.end_pass();
     }
-
-    fn init(&mut self, target: &Arc<dyn RenderTarget>, subpass: &Subpass, _attachments: &Arc<dyn AttachmentMap>) {
-        self.target = target.clone();
-        self.background.init(subpass);
-        self.font_compositor.init(subpass);
-    }
 }
 
+/// Possible errors when building a [ConsoleGui] using [ConsoleGuiBuilder].
 #[derive(Debug)]
 pub enum ConsoleGuiBuildError {
+    /// The [window](ConsoleGuiBuilder::window) parameter was not set.
     MissingWindowParam,
+    /// The [font](ConsoleGuiBuilder::font) parameter was not set.
     MissingFontParam,
+    /// The [layout](ConsoleGuiBuilder::layout) size was out of bounds (must be within (0.0..1.0]).
     LayoutSizeOutOfBounds(f32),
+    /// There was an issue when creating a [FontSheet] from the provided [Font].
     ResourceLoadError(ResourceLoadError),
 }
 
@@ -768,7 +789,7 @@ impl ConsoleGuiBuilder {
         self
     }
 
-    /// Build a new [ConsoleGui] and associated [render handler][rh].
+    /// Build a new [ConsoleGui].
     ///
     /// This is a non-consuming operation, so multiple GUIs can be built from one builder.
     ///
@@ -776,9 +797,8 @@ impl ConsoleGuiBuilder {
     /// Will [error][er] if any required parameters are missing, or if a [FontSheet] cannot be made
     /// from the provided [Font].
     ///
-    /// [rh]: EngineRenderHandler
     /// [er]: ConsoleGuiBuildError
-    pub fn build(&self) -> Result<(Arc<ConsoleGui>, Box<dyn EngineRenderHandler>), ConsoleGuiBuildError> {
+    pub fn build(&self) -> Result<Arc<ConsoleGui>, ConsoleGuiBuildError> {
         let console = self.console.clone();
         let window_handle = self.window_handle.as_ref()
             .ok_or(ConsoleGuiBuildError::MissingWindowParam)?;
@@ -804,11 +824,6 @@ impl ConsoleGuiBuilder {
         );
         window_handle.renderer().event_bus().register(RendererEventType::Stale, console_gui.clone());
 
-        let console_renderer = Box::new(ConsoleRenderer::new(
-            window_handle.renderer(),
-            console_gui.clone(),
-        ));
-
-        Ok((console_gui, console_renderer))
+        Ok(console_gui)
     }
 }

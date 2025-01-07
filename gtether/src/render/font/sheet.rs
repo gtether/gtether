@@ -328,7 +328,7 @@ pub struct FontSheetRenderer {
 
 impl FontSheetRenderer {
     /// Create a [FontSheetRenderer] from a [FontSheet].
-    pub fn new(renderer: &RendererHandle, font_sheet: Arc<Resource<FontSheet>>) -> Box<dyn FontRenderer> {
+    pub fn new(renderer: &RendererHandle, subpass: &Subpass, font_sheet: Arc<Resource<FontSheet>>) -> Box<dyn FontRenderer> {
         let target = renderer.target();
 
         let text_vert = text_vert::load(target.device().vk_device().clone())
@@ -356,9 +356,17 @@ impl FontSheetRenderer {
                 .unwrap(),
         ).unwrap();
 
-        let base_create_info = GraphicsPipelineCreateInfo {
+        let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state,
+            subpass: Some(subpass.clone().into()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend::alpha()),
+                    ..Default::default()
+                },
+            )),
             input_assembly_state: Some(InputAssemblyState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
@@ -370,16 +378,7 @@ impl FontSheetRenderer {
 
         let graphics = EngineGraphicsPipeline::new(
             renderer,
-            move |subpass| GraphicsPipelineCreateInfo {
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        ..Default::default()
-                    },
-                )),
-                ..base_create_info.clone()
-            },
+            create_info,
         );
 
         let font_sampler = ImageSampler::new(
@@ -421,10 +420,6 @@ impl FontSheetRenderer {
 }
 
 impl FontRenderer for FontSheetRenderer {
-    fn init(&mut self, subpass: &Subpass) {
-        self.graphics.init(subpass.clone());
-    }
-
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, buffer: Vec<PositionedChar>) {
         let graphics = self.graphics.vk_graphics();
 
