@@ -1,0 +1,9 @@
+[package]
+name = "reversi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gtether = { workspace = true, features = ["gui"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
