@@ -207,7 +207,7 @@ impl EngineRenderPassBuilder {
         }
     }
 
-    fn attachment_ref(&self, name: &String) -> AttachmentReference {
+    fn attachment_ref(&self, name: &str) -> AttachmentReference {
         let attachment = self.attachment_name_map.get(name).unwrap().clone();
         AttachmentReference {
             attachment,
@@ -223,14 +223,14 @@ impl EngineRenderPassBuilder {
     /// A clear value must be specified if the attachment's load op is CLEAR.
     pub fn attachment(
         mut self,
-        name: String,
+        name: impl Into<String>,
         atch: AttachmentDescription,
-        clear_value: Option<ClearValue>,
+        clear_value: Option<impl Into<ClearValue>>,
     ) -> Self {
         let atch_num = self.attachments.len() as u32;
         self.attachments.push(atch);
-        self.attachment_name_map.insert(name, atch_num);
-        self.clear_values.push(clear_value);
+        self.attachment_name_map.insert(name.into(), atch_num);
+        self.clear_values.push(clear_value.map(Into::into));
         self
     }
 
@@ -239,9 +239,9 @@ impl EngineRenderPassBuilder {
     /// This is a convenience method on top of [Self::attachment()]; the format and similar values
     /// are deduced from information gathered from the [RenderTarget].
     #[allow(unused_mut)]
-    pub fn final_color_attachment(mut self, name: String, clear_value: ClearValue) -> Self {
+    pub fn final_color_attachment(mut self, name: impl Into<String>, clear_value: impl Into<ClearValue>) -> Self {
         let format = self.renderer.target().format();
-        self.attachment(name, AttachmentDescription {
+        self.attachment(name.into(), AttachmentDescription {
             format,
             samples: SampleCount::try_from(1).unwrap(),
             load_op: AttachmentLoadOp::Clear,
@@ -364,13 +364,13 @@ impl EngineRenderSubpassBuilder {
     /// Define a color attachment for this subpass.
     ///
     /// The name should match an attachment created in the top-level [EngineRenderPassBuilder].
-    pub fn color_attachment(
+    pub fn color_attachment<'a>(
         mut self,
-        name: String,
+        name: impl Into<&'a str>,
     ) -> Self {
         let attachment = AttachmentReference {
             layout: ImageLayout::ColorAttachmentOptimal,
-            ..self.parent.attachment_ref(&name)
+            ..self.parent.attachment_ref(name.into())
         };
         self.color_attachments.push(Some(attachment));
         self
@@ -379,13 +379,13 @@ impl EngineRenderSubpassBuilder {
     /// Define a depth stencil attachment for this subpass.
     ///
     /// The name should match an attachment created in the top-level [EngineRenderPassBuilder].
-    pub fn depth_stencil_attachment(
+    pub fn depth_stencil_attachment<'a>(
         mut self,
-        name: String,
+        name: impl Into<&'a str>,
     ) -> Self {
         let attachment = AttachmentReference {
             layout: ImageLayout::DepthStencilAttachmentOptimal,
-            ..self.parent.attachment_ref(&name)
+            ..self.parent.attachment_ref(name.into())
         };
         self.depth_stencil_attachment = Some(attachment);
         self
@@ -394,13 +394,13 @@ impl EngineRenderSubpassBuilder {
     /// Define an input attachment for this subpass.
     ///
     /// The name should match an attachment created in the top-level [EngineRenderPassBuilder].
-    pub fn input_attachment(
+    pub fn input_attachment<'a>(
         mut self,
-        name: String,
+        name: impl Into<&'a str>,
     ) -> Self {
         let attachment = AttachmentReference {
             layout: ImageLayout::ShaderReadOnlyOptimal,
-            ..self.parent.attachment_ref(&name)
+            ..self.parent.attachment_ref(name.into())
         };
         self.input_attachments.push(Some(attachment));
         self

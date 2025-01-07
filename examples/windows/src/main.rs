@@ -265,38 +265,38 @@ impl Application for WindowsApp {
             .build().unwrap();
 
         let render_pass = EngineRenderPassBuilder::new(window.renderer())
-            .attachment("color".into(), AttachmentDescription {
+            .attachment("color", AttachmentDescription {
                 format: Format::A2B10G10R10_UNORM_PACK32,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
-            }, Some([0.0, 0.0, 0.0, 1.0].into()))
-            .attachment("normals".into(), AttachmentDescription {
+            }, Some([0.0, 0.0, 0.0, 1.0]))
+            .attachment("normals", AttachmentDescription {
                 format: Format::R16G16B16A16_SFLOAT,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
-            }, Some([0.0, 0.0, 0.0, 1.0].into()))
-            .attachment("depth".into(), AttachmentDescription {
+            }, Some([0.0, 0.0, 0.0, 1.0]))
+            .attachment("depth", AttachmentDescription {
                 format: Format::D16_UNORM,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
-            }, Some(1.0.into()))
-            .final_color_attachment("final_color".into(), [0.0, 0.0, 0.0, 1.0].into())
+            }, Some(1.0))
+            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0])
             .begin_subpass()
-                .color_attachment("color".into())
-                .color_attachment("normals".into())
-                .depth_stencil_attachment("depth".into())
+                .color_attachment("color")
+                .color_attachment("normals")
+                .depth_stencil_attachment("depth")
                 .handler(cube_renderer.bootstrap())
             .end_subpass()
             .begin_subpass()
-                .input_attachment("color".into())
-                .input_attachment("normals".into())
-                .color_attachment("final_color".into())
+                .input_attachment("color")
+                .input_attachment("normals")
+                .color_attachment("final_color")
                 .handler(ambient_renderer.bootstrap())
                 .handler(directional_renderer.bootstrap())
                 .handler(console_gui.bootstrap_renderer())
