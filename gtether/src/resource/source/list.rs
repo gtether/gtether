@@ -96,7 +96,7 @@ mod tests {
         let (manager, data_maps) = create_list_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
         let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
@@ -109,7 +109,7 @@ mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
         let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         data_maps[0].assert_watch("key", true);
@@ -133,7 +133,7 @@ mod tests {
         data_maps[2].insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
         let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value_1".to_owned());
