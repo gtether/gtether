@@ -380,6 +380,20 @@ impl ResourceLoadError {
     }
 }
 
+impl<'a> From<&'a str> for ResourceLoadError {
+    #[inline]
+    fn from(value: &'a str) -> Self {
+        Self::ReadError(Box::<dyn Error + Send + Sync>::from(value).into())
+    }
+}
+
+impl From<String> for ResourceLoadError {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self::ReadError(Box::<dyn Error + Send + Sync>::from(value).into())
+    }
+}
+
 impl Display for ResourceLoadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
