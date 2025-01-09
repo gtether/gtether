@@ -149,6 +149,8 @@ impl From<LoadPriority> for TaskPriority {
     }
 }
 
+pub type ManagerTask<T> = Task<T>;
+
 struct ManagerExecutor {
     execs: Arc<[Executor<'static>; TaskPriority::COUNT]>,
     worker: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
@@ -193,7 +195,7 @@ impl ManagerExecutor {
         &self,
         priority: TaskPriority,
         future: impl Future<Output = T> + Send + 'static,
-    ) -> Task<T> {
+    ) -> ManagerTask<T> {
         self.execs[priority as usize].spawn(future)
     }
 }
@@ -856,6 +858,21 @@ impl ResourceManager {
             }
         }
         None
+    }
+
+    /// Spawn a new async task for the ResourceManager to execute in the background.
+    ///
+    /// The spawned task shares the same executor as all [Resource] load and update tasks. This
+    /// spawn() method is intended to be used _only_ for Resource loading adjacent tasks, such as
+    /// spawning a delayed load of some of a Resource's components. This is _not_ a general purpose
+    /// executor, and should not be used as such.
+    #[inline]
+    pub fn spawn<T: Send + 'static>(
+        &self,
+        priority: LoadPriority,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> ManagerTask<T> {
+        self.executor.spawn(priority.into(), future)
     }
 
     fn load<T>(
