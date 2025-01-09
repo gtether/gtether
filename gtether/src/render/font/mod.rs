@@ -36,7 +36,7 @@
 //!     "my_font",
 //!     GlyphFontLoader::new(renderer.clone()),
 //!     LoadPriority::Immediate
-//! ).wait_blocking().unwrap();
+//! ).wait().unwrap();
 //!
 //! let font_sheet = FontSheet::from_font(
 //!     &font,

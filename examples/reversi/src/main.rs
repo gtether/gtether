@@ -42,7 +42,7 @@ impl Application for ReversiApp {
             "console_font",
             GlyphFontLoader::new(window.renderer().clone()),
             LoadPriority::Immediate,
-        ).wait_blocking().unwrap();
+        ).wait().unwrap();
         let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)
             .font(console_font)

@@ -598,7 +598,7 @@ mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         value.attach_sub_resource_blocking(SubStringLoader::err())
@@ -611,7 +611,7 @@ mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
@@ -629,7 +629,7 @@ mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         let sub_value_1 = value.attach_sub_resource_blocking(SubStringLoader::no_update("subvalue1"))
@@ -652,7 +652,7 @@ mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
