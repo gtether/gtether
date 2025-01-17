@@ -28,6 +28,7 @@ pub mod attachment;
 pub mod descriptor_set;
 pub mod font;
 pub mod image;
+pub mod model;
 pub mod pipeline;
 pub mod render_pass;
 pub mod swapchain;
