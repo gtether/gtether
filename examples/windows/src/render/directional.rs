@@ -1,7 +1,7 @@
 use bytemuck::NoUninit;
 use gtether::render::attachment::{AttachmentDescriptor, AttachmentMap};
 use gtether::render::descriptor_set::EngineDescriptorSet;
-use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::UniformSet;
@@ -117,6 +117,7 @@ impl DirectionalRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::TopLeft,
         );
 
         let descriptor_set = EngineDescriptorSet::builder(target)

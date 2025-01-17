@@ -30,7 +30,7 @@ use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, La
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
 use crate::render::font::size::{FontSize, FontSizer};
 use crate::render::font::Font;
-use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::swapchain::Framebuffer;
 use crate::render::uniform::Uniform;
@@ -527,6 +527,7 @@ impl ConsoleBackgroundSolidRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::TopLeft,
         );
 
         let color = Arc::new(Uniform::new(

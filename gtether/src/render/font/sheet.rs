@@ -33,7 +33,7 @@ use crate::render::font::layout::PositionedChar;
 use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
 use crate::render::image::ImageSampler;
-use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::{Device, FlatVertex, RenderTarget, RendererEventType, RendererHandle};
 use crate::render::descriptor_set::EngineDescriptorSet;
 use crate::render::swapchain::Framebuffer;
@@ -382,6 +382,7 @@ impl FontSheetRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::TopLeft,
         );
 
         let font_sampler = Arc::new(ImageSampler::new(

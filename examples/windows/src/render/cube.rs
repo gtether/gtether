@@ -3,7 +3,7 @@ use std::sync::Arc;
 use gtether::event::Event;
 use gtether::render::attachment::AttachmentMap;
 use gtether::render::descriptor_set::EngineDescriptorSet;
-use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
@@ -68,47 +68,47 @@ impl CubeRenderer {
 
         let vertices = [
             // Front
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
             CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
             // Back
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
             CubeVertex { position: [-1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
             // Top
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
             CubeVertex { position: [-1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
             // Bottom
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
             CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
             // Left
-            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
             CubeVertex { position: [-1.0, -1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
             // Right
-            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
             CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
         ];
 
         let vertex_buffer = Buffer::from_iter(
@@ -173,6 +173,7 @@ impl CubeRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::BottomLeft,
         );
 
         let reset_vp = vp.clone();

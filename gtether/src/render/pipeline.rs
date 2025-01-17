@@ -12,7 +12,7 @@
 //! [vkgp]: vulkano::pipeline::GraphicsPipeline
 
 use parking_lot::Mutex;
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -28,6 +28,77 @@ pub trait VKGraphicsPipelineSource: Send + Sync {
     /// This pipeline does not need to be constant, and indeed it is expected that new pipelines
     /// may be created as needed when Vulkan resources such as framebuffers get stale.
     fn vk_graphics(&self) -> Arc<GraphicsPipeline>;
+}
+
+/// Viewport style when creating a pipeline.
+///
+/// Vulkan by default uses a top-left coordinate system, which is flipped from the classic style
+/// of OpenGL. This enumeration allows each graphics pipeline to set their own style.
+///
+/// Additionally, you can also use a completely custom viewport style, if needed.
+#[derive(Clone)]
+pub enum ViewportType {
+    /// Vulkan's default coordinate system.
+    ///
+    /// [-1, -1] is top-left, [1, 1] is bottom right.
+    TopLeft,
+    /// OpenGL style coordinate system.
+    ///
+    /// [-1, -1] is bottom-left, [1, 1] is top right.
+    BottomLeft,
+    /// Use a custom function to create the viewport.
+    Custom(Arc<dyn (Fn(&Arc<dyn RenderTarget>) -> Viewport) + Send + Sync + 'static>),
+}
+
+impl Debug for ViewportType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TopLeft => write!(f, "TopLeft"),
+            Self::BottomLeft => write!(f, "BottomLeft"),
+            Self::Custom(_) => write!(f, "Custom"),
+        }
+    }
+}
+
+impl Default for ViewportType {
+    #[inline]
+    fn default() -> Self {
+        Self::TopLeft
+    }
+}
+
+impl<F> From<F> for ViewportType
+where
+    F: (Fn(&Arc<dyn RenderTarget>) -> Viewport) + Send + Sync + 'static,
+{
+    #[inline]
+    fn from(value: F) -> Self {
+        Self::Custom(Arc::new(value))
+    }
+}
+
+impl ViewportType {
+    /// Create a [Viewport] using information from a given [RenderTarget].
+    pub fn viewport(&self, target: &Arc<dyn RenderTarget>) -> Viewport {
+        match self {
+            Self::TopLeft => {
+                Viewport {
+                    offset: [0.0, 0.0],
+                    extent: target.dimensions().into(),
+                    depth_range: 0.0..=1.0,
+                }
+            },
+            Self::BottomLeft => {
+                let extent: glm::TVec2<f32> = target.dimensions().into();
+                Viewport {
+                    offset: [0.0, extent.y],
+                    extent: [extent.x, -extent.y],
+                    depth_range: 0.0..=1.0,
+                }
+            },
+            Self::Custom(create_viewport) => create_viewport(target),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -58,7 +129,7 @@ struct EngineGraphicsPipelineState {
 /// use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 /// # use vulkano::render_pass::Subpass;
 /// # use vulkano::shader::EntryPoint;
-/// use gtether::render::pipeline::EngineGraphicsPipeline;
+/// use gtether::render::pipeline::{EngineGraphicsPipeline, ViewportType};
 /// # use gtether::render::RendererHandle;
 ///
 /// # fn wrapper(renderer: &RendererHandle, subpass: &Subpass, vertex_shader: EntryPoint, fragment_shader: EntryPoint, vertex_input_state: Option<VertexInputState>) {
@@ -86,6 +157,7 @@ struct EngineGraphicsPipelineState {
 /// let graphics = EngineGraphicsPipeline::new(
 ///     renderer,
 ///     create_info,
+///     ViewportType::default(),
 /// );
 /// # }
 /// ```
@@ -93,6 +165,7 @@ struct EngineGraphicsPipelineState {
 pub struct EngineGraphicsPipeline {
     target: Arc<dyn RenderTarget>,
     create_info: GraphicsPipelineCreateInfo,
+    viewport_type: ViewportType,
     inner: Mutex<EngineGraphicsPipelineState>,
 }
 
@@ -103,10 +176,12 @@ impl EngineGraphicsPipeline {
     pub fn new(
         renderer: &RendererHandle,
         create_info: GraphicsPipelineCreateInfo,
+        viewport_type: ViewportType,
     ) -> Arc<Self> {
         let graphics = Arc::new(Self {
             target: renderer.target().clone(),
             create_info,
+            viewport_type,
             inner: Mutex::new(EngineGraphicsPipelineState::default()),
         });
         renderer.event_bus().register(RendererEventType::Stale, graphics.clone());
@@ -121,12 +196,7 @@ impl VKGraphicsPipelineSource for EngineGraphicsPipeline {
         if let Some(pipeline) = &lock.pipeline {
             pipeline.clone()
         } else {
-            // TODO: Make customizable if needed
-            let viewport = Viewport {
-                offset: [0.0, 0.0],
-                extent: self.target.dimensions().into(),
-                depth_range: 0.0..=1.0,
-            };
+            let viewport = self.viewport_type.viewport(&self.target);
 
             let pipeline = GraphicsPipeline::new(
                 self.target.device().vk_device().clone(),
