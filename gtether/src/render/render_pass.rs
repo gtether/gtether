@@ -1,6 +1,8 @@
+use itertools::Itertools;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
+use ahash::{AHashMap, AHashSet};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
 use vulkano::format::ClearValue;
 use vulkano::image::view::ImageView;
@@ -184,13 +186,19 @@ impl EngineRenderPass for StandardEngineRenderPass {
 type CreateHandlerFn = Box<dyn FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>)
     -> Box<dyn EngineRenderHandler>>;
 
+struct SubpassInfo {
+    description: SubpassDescription,
+    create_handlers: Vec<CreateHandlerFn>,
+    attachments: AHashSet<u32>,
+}
+
 /// Builder pattern for creating a standard [EngineRenderPass].
 pub struct EngineRenderPassBuilder {
     renderer: RendererHandle,
     attachments: Vec<AttachmentDescription>,
     attachment_name_map: HashMap<String, u32>,
     clear_values: Vec<Option<ClearValue>>,
-    subpass_infos: Vec<(SubpassDescription, Vec<CreateHandlerFn>)>,
+    subpass_infos: Vec<SubpassInfo>,
 }
 
 impl EngineRenderPassBuilder {
@@ -260,24 +268,43 @@ impl EngineRenderPassBuilder {
         let target = self.renderer.target();
         let vk_device = target.device().vk_device();
 
-        // Ripped from the ordered_passes_renderpass() macro from Vulkano, as no changes are needed
-        // to this logic
-        let dependencies = (0..self.subpass_infos.len().saturating_sub(1) as u32)
-            .map(|id| {
-                SubpassDependency {
-                    src_subpass: id.into(),
-                    dst_subpass: (id + 1).into(),
-                    src_stages: PipelineStages::ALL_GRAPHICS,
-                    dst_stages: PipelineStages::ALL_GRAPHICS,
-                    src_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
-                    dst_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
-                    dependency_flags: DependencyFlags::BY_REGION,
-                    ..Default::default()
-                }
-            }).collect::<Vec<_>>();
+        let mut attachment_to_subpass_map: AHashMap<u32, AHashSet<u32>> = AHashMap::new();
+        for (subpass_id, subpass_info) in self.subpass_infos.iter().enumerate() {
+            for attachment in &subpass_info.attachments {
+                attachment_to_subpass_map.entry(attachment.clone())
+                    .or_default()
+                    .insert(subpass_id as u32);
+            }
+        }
+
+        let dependencies = self.subpass_infos.iter().enumerate()
+            .map(|(dst_id, subpass_info)| {
+                let dst_id = dst_id as u32;
+                subpass_info.description.input_attachments.iter()
+                    .flatten()
+                    .map(|atch_ref| {
+                        attachment_to_subpass_map[&atch_ref.attachment].iter().cloned()
+                    })
+                    .flatten()
+                    .unique()
+                    .map(move |src_id| SubpassDependency {
+                        src_subpass: Some(src_id),
+                        dst_subpass: Some(dst_id),
+                        src_stages: PipelineStages::ALL_GRAPHICS,
+                        dst_stages: PipelineStages::ALL_GRAPHICS,
+                        src_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                        dst_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                        dependency_flags: DependencyFlags::BY_REGION,
+                        ..Default::default()
+                    })
+            })
+            .flatten()
+            .collect::<Vec<_>>();
 
         let (subpasses, handler_groups): (Vec<_>, Vec<_>)
-            = self.subpass_infos.into_iter().unzip();
+            = self.subpass_infos.into_iter()
+            .map(|subpass_info| (subpass_info.description, subpass_info.create_handlers))
+            .unzip();
 
         // TODO: This block will result in an user-override of initial_layout being possible, but
         //       final_layout will always be determined by this block instead. Perhaps fix?
@@ -429,18 +456,22 @@ impl EngineRenderSubpassBuilder {
 
     /// Build this subpass and return to the top-level [EngineRenderPassBuilder].
     pub fn end_subpass(mut self) -> EngineRenderPassBuilder {
-        let all_attachments = self.color_attachments.iter()
+        let attachments = self.color_attachments.iter()
             .chain(&[self.depth_stencil_attachment.clone()])
-            .chain(&self.input_attachments)
             .flatten()
-            .map(|attachment| attachment.attachment)
-            .collect::<HashSet<_>>();
+            .map(|atch_ref| atch_ref.attachment)
+            .collect::<AHashSet<_>>();
+
+        let all_attachments = &attachments | &self.input_attachments.iter()
+            .flatten()
+            .map(|atch_ref| atch_ref.attachment)
+            .collect::<AHashSet<_>>();
 
         let preserve_attachments = (0 .. self.parent.attachments.len() as u32)
             .filter(|atch_id| !all_attachments.contains(atch_id))
             .collect::<Vec<_>>();
 
-        let subpass_description = SubpassDescription {
+        let description = SubpassDescription {
             color_attachments: self.color_attachments,
             depth_stencil_attachment: self.depth_stencil_attachment,
             input_attachments: self.input_attachments,
@@ -448,7 +479,11 @@ impl EngineRenderSubpassBuilder {
             ..Default::default()
         };
 
-        self.parent.subpass_infos.push((subpass_description, self.handlers));
+        self.parent.subpass_infos.push(SubpassInfo {
+            description,
+            create_handlers: self.handlers,
+            attachments,
+        });
         self.parent
     }
 }
