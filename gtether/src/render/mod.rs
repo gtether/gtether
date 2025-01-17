@@ -25,6 +25,7 @@ use crate::render::swapchain::Swapchain;
 use crate::EngineMetadata;
 
 pub mod attachment;
+pub mod descriptor_set;
 pub mod font;
 pub mod image;
 pub mod pipeline;

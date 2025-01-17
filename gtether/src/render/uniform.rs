@@ -2,190 +2,56 @@
 //!
 //! This module contains helper utilities for working with Vulkan uniforms. These come in two
 //! primary flavors; one for a [single uniform](Uniform), and one for a
-//! [set of uniforms](UniformSet) that share the same index. The latter are intended for iterating
+//! [set of uniforms](UniformSet) that share the same index. The latter is intended for iterating
 //! over during multiple render calls, such as when working with light sources.
 //!
 //! These utilities are entirely optional, and you are free to roll your own logic for Vulkan
 //! uniforms.
 
-use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, OnceLock};
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use arrayvec::ArrayVec;
+use bytemuck::NoUninit;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use smallvec::SmallVec;
+use std::fmt::Debug;
+use std::sync::Arc;
+use vulkano::buffer::{AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::descriptor_set::{DescriptorBufferInfo, WriteDescriptorSet};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::Pipeline;
+use vulkano::{DeviceSize, Validated};
 
-use crate::event::{Event, EventHandler};
-use crate::render::pipeline::VKGraphicsPipelineSource;
-use crate::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use crate::render::descriptor_set::{DescriptorOffsetIter, VKDescriptorSource};
+use crate::render::RenderTarget;
 
-struct UniformData<T: Clone + BufferContents> {
-    value: T,
-    descriptor_set: OnceLock<Arc<PersistentDescriptorSet>>,
+#[derive(Debug)]
+struct UniformBuffer<T: ?Sized> {
+    buffer: Subbuffer<T>,
+    stale: bool,
 }
 
-impl<T: Clone + BufferContents> Debug for UniformData<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UniformData")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<T: Clone + BufferContents> UniformData<T> {
-    fn new(value: T) -> Self {
-        Self {
-            value,
-            descriptor_set: OnceLock::new(),
-        }
-    }
-
-    fn get_or_init_descriptor_set(
-        &self,
-        target: &Arc<dyn RenderTarget>,
-        graphics: &Arc<dyn VKGraphicsPipelineSource>,
-        set_index: u32,
-    ) -> &Arc<PersistentDescriptorSet> {
-        self.descriptor_set.get_or_init(|| {
-            let graphics = graphics.vk_graphics();
-
-            let buffer = Buffer::from_data(
-                target.device().memory_allocator().clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::UNIFORM_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                self.value.clone(),
-            ).unwrap();
-
-            PersistentDescriptorSet::new(
-                target.device().descriptor_set_allocator(),
-                graphics.layout().set_layouts().get(set_index as usize).unwrap().clone(),
-                [
-                    WriteDescriptorSet::buffer(0, buffer),
-                ],
-                [],
-            ).unwrap()
-        })
-    }
-}
-
-pub type UniformReadGuard<'a, T> = MappedRwLockReadGuard<'a, T>;
-pub type UniformWriteGuard<'a, T> = MappedRwLockWriteGuard<'a, T>;
+pub type UniformReadGuard<'a, T> = RwLockReadGuard<'a, T>;
+pub type UniformWriteGuard<'a, T> = RwLockWriteGuard<'a, T>;
 
 /// Helper struct for maintaining a Vulkan uniform.
 ///
-/// This struct integrates with a [Renderer][re]'s event system in order to invalidate itself when
-/// the [Renderer][re] is stale.
-///
-/// [re]: crate::render::Renderer
+/// Internally, this struct maintains a series of uniform buffers, one per frame in the target's
+/// framebuffer. These buffers are eventually consistent. Whenever the value of this Uniform is
+/// written to, the buffers will be marked as stale. Stale buffers are updated on a frame-by-frame
+/// basis to the latest value when any descriptor sets that reference this uniform are used.
+#[derive(Debug)]
 pub struct Uniform<T: Clone + BufferContents> {
-    target: Arc<dyn RenderTarget>,
-    graphics: Arc<dyn VKGraphicsPipelineSource>,
-    set_index: u32,
-    inner: RwLock<UniformData<T>>,
-}
-
-impl<T: Clone + BufferContents> Debug for Uniform<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Uniform")
-            .field("target", &self.target)
-            .field("set_index", &self.set_index)
-            .field("inner", &self.inner)
-            .finish_non_exhaustive()
-    }
+    // NOTE: When locking both value and buffers, ALWAYS lock buffers first to avoid deadlocks
+    value: RwLock<T>,
+    buffers: Mutex<SmallVec<[UniformBuffer<T>; 3]>>,
 }
 
 impl<T: Clone + BufferContents> Uniform<T> {
-    /// Create a new uniform.
-    #[inline]
+    /// Create a new uniform, using the target's framebuffer count.
     pub fn new(
-        value: T,
-        renderer: &RendererHandle,
-        graphics: Arc<dyn VKGraphicsPipelineSource>,
-        set_index: u32,
-    ) -> Arc<Self> {
-        let uniform = Arc::new(Self {
-            target: renderer.target().clone(),
-            graphics,
-            set_index,
-            inner: RwLock::new(UniformData::new(value)),
-        });
-        renderer.event_bus().register(RendererEventType::Stale, uniform.clone());
-        uniform
-    }
-
-    /// Get a read lock on this uniform's value.
-    #[inline]
-    pub fn read(&self) -> UniformReadGuard<'_, T> {
-        RwLockReadGuard::map(self.inner.read(), |inner| &inner.value)
-    }
-
-    /// Get a write lock on this uniform's value.
-    ///
-    /// The descriptor set associated with this uniform will be automatically invalidated, forcing
-    /// recreation next time it is needed.
-    #[inline]
-    pub fn write(&self) -> UniformWriteGuard<'_, T> {
-        let mut lock = self.inner.write();
-        // Assume any write operation is going to mutate the data, requiring a new descriptor set
-        lock.descriptor_set.take();
-        RwLockWriteGuard::map(lock, |inner| &mut inner.value)
-    }
-
-    /// Get the descriptor set associated with this uniform, creating it if necessary.
-    #[inline]
-    pub fn descriptor_set(&self) -> Arc<PersistentDescriptorSet> {
-        self.inner.read().get_or_init_descriptor_set(
-            &self.target,
-            &self.graphics,
-            self.set_index,
-        ).clone()
-    }
-}
-
-impl<T: Clone + BufferContents> EventHandler<RendererEventType, RendererEventData> for Uniform<T> {
-    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
-        assert_eq!(event.event_type(), &RendererEventType::Stale,
-                   "Uniform can only handle 'Stale' Renderer events");
-        self.inner.write().descriptor_set.take();
-    }
-}
-
-struct UniformSetData<T: Clone + BufferContents> {
-    values: Vec<T>,
-    descriptor_sets: OnceLock<Vec<Arc<PersistentDescriptorSet>>>,
-}
-
-impl<T: Clone + BufferContents> Debug for UniformSetData<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UniformSetData")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<T: Clone + BufferContents> UniformSetData<T> {
-    fn new(values: Vec<T>) -> Self {
-        Self {
-            values,
-            descriptor_sets: OnceLock::new(),
-        }
-    }
-
-    fn get_or_init_descriptor_sets(
-        &self,
         target: &Arc<dyn RenderTarget>,
-        graphics: &Arc<dyn VKGraphicsPipelineSource>,
-        set_index: u32,
-    ) -> &Vec<Arc<PersistentDescriptorSet>> {
-        self.descriptor_sets.get_or_init(|| {
-            let graphics = graphics.vk_graphics();
-
-            self.values.iter().map(|value| {
+        value: T,
+    ) -> Result<Self, Validated<AllocateBufferError>> {
+        let buffers = (0..target.framebuffer_count()).into_iter()
+            .map(|_| {
                 let buffer = Buffer::from_data(
                     target.device().memory_allocator().clone(),
                     BufferCreateInfo {
@@ -197,106 +63,286 @@ impl<T: Clone + BufferContents> UniformSetData<T> {
                         ..Default::default()
                     },
                     value.clone(),
-                ).unwrap();
+                )?;
+                Ok(UniformBuffer {
+                    buffer,
+                    stale: false,
+                })
+            }).collect::<Result<SmallVec<_>, Validated<AllocateBufferError>>>()?;
 
-                PersistentDescriptorSet::new(
-                    target.device().descriptor_set_allocator(),
-                    graphics.layout().set_layouts().get(set_index as usize).unwrap().clone(),
-                    [
-                        WriteDescriptorSet::buffer(0, buffer),
-                    ],
-                    [],
-                ).unwrap()
-            }).collect::<Vec<_>>()
+        Ok(Self {
+            value: RwLock::new(value),
+            buffers: Mutex::new(buffers),
         })
     }
+
+    /// Get a read lock on this uniform's value.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// # use vulkano::buffer::AllocateBufferError;
+    /// # use vulkano::Validated;
+    /// # use gtether::render::RenderTarget;
+    /// use gtether::render::uniform::Uniform;
+    ///
+    /// # fn wrapper(target: &Arc<dyn RenderTarget>) -> Result<(), Validated<AllocateBufferError>> {
+    /// let value: u64 = 42;
+    /// let uniform = Arc::new(Uniform::new(target, value)?);
+    /// assert_eq!(*uniform.read(), value);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn read(&self) -> UniformReadGuard<'_, T> {
+        self.value.read()
+    }
+
+    /// Get a write lock on this uniform's value.
+    ///
+    /// Buffers will be marked as stale, and will be updated the next time they need to be accessed.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// # use vulkano::buffer::AllocateBufferError;
+    /// # use vulkano::Validated;
+    /// # use gtether::render::RenderTarget;
+    /// use gtether::render::uniform::Uniform;
+    ///
+    /// # fn wrapper(target: &Arc<dyn RenderTarget>) -> Result<(), Validated<AllocateBufferError>> {
+    /// let value: u64 = 0;
+    /// let uniform = Arc::new(Uniform::new(target, value)?);
+    /// *uniform.write() = 42;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn write(&self) -> UniformWriteGuard<'_, T> {
+        let mut buffers = self.buffers.lock();
+        let lock = self.value.write();
+        // Assume any write operation is going to mutate the data
+        for buffer in &mut *buffers {
+            buffer.stale = true;
+        }
+        lock
+    }
+}
+
+impl<T: BufferContents + Debug + Clone> VKDescriptorSource for Uniform<T> {
+    fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+        let buffers = self.buffers.lock();
+        let buffer = buffers.get(frame_idx)
+            .expect("Frame count should match target's frame count");
+        (
+            WriteDescriptorSet::buffer(binding, buffer.buffer.clone()),
+            // These buffers are never replaced, and so never need a descriptor recreated
+            0,
+        )
+    }
+
+    fn update_descriptor_source(&self, frame_idx: usize) -> u64 {
+        let mut buffers = self.buffers.lock();
+        let value = self.value.read();
+        let buffer = buffers.get_mut(frame_idx)
+            .expect("Frame count should match target's frame count");
+        if buffer.stale {
+            let mut write_guard = buffer.buffer.write().unwrap();
+            *write_guard = (*value).clone();
+            buffer.stale = false;
+        }
+        // These buffers are never replaced, and so never need a descriptor recreated
+        0
+    }
+}
+
+#[derive(Debug)]
+struct UniformSetBuffer {
+    buffer: Subbuffer<[u8]>,
+    len: usize,
+    stale: bool,
 }
 
 /// Helper struct for maintaining a set of Vulkan uniforms.
 ///
-/// This struct integrates with a [Renderer][re]'s event system in order to invalidate itself when
-/// the [Renderer][re] is stale.
+/// This struct differs from [Uniform] in that it uses dynamic uniform buffers. The buffer capacity
+/// is set at creation time using constant generics, but the UniformSet can contain any number of
+/// values up to that capacity. All uniforms in this set use the same descriptor index, and the
+/// intended use is with [descriptor set offsets][dso].
 ///
-/// This struct differs from [Uniform] in that it contains a dynamic list of values, where one
-/// uniform will be created for each value in this set, but all uniforms will use the same
-/// descriptor set index. This is useful for a collection of values that you want to execute
-/// separate render calls for, such as different positional lights.
+/// Otherwise, this struct functions similarly to [Uniform].
 ///
-/// [re]: crate::render::Renderer
-pub struct UniformSet<T: Clone + BufferContents> {
-    target: Arc<dyn RenderTarget>,
-    graphics: Arc<dyn VKGraphicsPipelineSource>,
-    set_index: u32,
-    inner: RwLock<UniformSetData<T>>,
+/// [dso]: vulkano::descriptor_set::DescriptorSetWithOffsets
+#[derive(Debug)]
+pub struct UniformSet<T: Clone + BufferContents, const CAP: usize> {
+    // NOTE: When locking both uniforms and buffers, ALWAYS lock buffers first to avoid deadlocks
+    uniforms: RwLock<ArrayVec<T, CAP>>,
+    buffers: Mutex<SmallVec<[UniformSetBuffer; 3]>>,
+    align: usize,
 }
 
-impl<T: Clone + BufferContents> Debug for UniformSet<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UniformSet")
-            .field("target", &self.target)
-            .field("set_index", &self.set_index)
-            .field("inner", &self.inner)
-            .finish_non_exhaustive()
+impl<T: Clone + BufferContents + NoUninit, const CAP: usize> UniformSet<T, CAP> {
+    fn fill_buffer(buffer: &mut UniformSetBuffer, uniforms: &ArrayVec<T, CAP>, align: usize) {
+        let mut write_guard = buffer.buffer.write().unwrap();
+        for (val_idx, value) in uniforms.iter().enumerate() {
+            let bytes = bytemuck::bytes_of(value);
+            for (idx, byte) in bytes.iter().enumerate() {
+                write_guard[(val_idx * align) + idx] = *byte;
+            }
+            for idx in bytes.len()..align {
+                write_guard[(val_idx * align) + idx] = 0;
+            }
+        }
+        for idx in (uniforms.len() * align)..write_guard.len() {
+            write_guard[idx] = 0;
+        }
+        buffer.len = uniforms.len();
     }
-}
 
-impl<T: Clone + BufferContents> UniformSet<T> {
-    /// Create a new uniform set.
-    #[inline]
+    /// Create a new uniform set, using the target's framebuffer count.
     pub fn new(
-        values: Vec<T>,
-        renderer: &RendererHandle,
-        graphics: Arc<dyn VKGraphicsPipelineSource>,
-        set_index: u32,
-    ) -> Arc<Self> {
-        let uniform_set = Arc::new(Self {
-            target: renderer.target().clone(),
-            graphics,
-            set_index,
-            inner: RwLock::new(UniformSetData::new(values)),
-        });
-        renderer.event_bus().register(RendererEventType::Stale, uniform_set.clone());
-        uniform_set
-    }
+        target: &Arc<dyn RenderTarget>,
+        values: impl IntoIterator<Item=T>,
+    ) -> Result<Self, Validated<AllocateBufferError>> {
+        let uniforms = values.into_iter().collect::<ArrayVec<_, CAP>>();
 
-    /// Get a read lock on this uniform's values.
-    #[inline]
-    pub fn read(&self) -> UniformReadGuard<'_, Vec<T>> {
-        RwLockReadGuard::map(self.inner.read(), |inner| &inner.values)
-    }
+        let min_dynamic_align = target.device().vk_device()
+            .physical_device()
+            .properties().min_uniform_buffer_offset_alignment
+            .as_devicesize() as usize;
+        // Round size up to the next multiple of align
+        let align = (size_of::<T>() + min_dynamic_align - 1) & !(min_dynamic_align - 1);
 
-    /// Get a write lock on this uniform's values.
-    ///
-    /// The descriptor sets associated with this uniform set will be automatically invalidated,
-    /// forcing recreation next time they are needed.
-    ///
-    /// Values may be added or removed; new descriptor sets will be created as needed.
-    #[inline]
-    pub fn write(&self) -> UniformWriteGuard<'_, Vec<T>> {
-        let mut lock = self.inner.write();
-        // Assume any write operation is going to mutate the data, requiring new descriptor sets
-        lock.descriptor_sets.take();
-        RwLockWriteGuard::map(lock, |inner| &mut inner.values)
-    }
+        let buffers = (0..target.framebuffer_count()).into_iter()
+            .map(|_| {
+                let buffer = Buffer::new_slice::<u8>(
+                    target.device().memory_allocator().clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::UNIFORM_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    (align * CAP).try_into().unwrap(),
+                )?;
 
-    /// Get the descriptor sets associated with this uniform set, creating them if necessary.
-    ///
-    /// One descriptor set will be returned for each value in this uniform set, and they will all
-    /// use the same set index.
-    #[inline]
-    pub fn descriptor_sets(&self) -> Vec<Arc<PersistentDescriptorSet>> {
-        self.inner.read().get_or_init_descriptor_sets(
-            &self.target,
-            &self.graphics,
-            self.set_index,
-        ).clone()
+                let mut uniform_buffer = UniformSetBuffer {
+                    buffer,
+                    len: 0,
+                    stale: false,
+                } ;
+
+                Self::fill_buffer(
+                    &mut uniform_buffer,
+                    &uniforms,
+                    align,
+                );
+
+                Ok(uniform_buffer)
+            }).collect::<Result<SmallVec<_>, Validated<AllocateBufferError>>>()?;
+
+        Ok(Self {
+            uniforms: RwLock::new(uniforms),
+            buffers: Mutex::new(buffers),
+            align,
+        })
     }
 }
 
-impl<T: Clone + BufferContents> EventHandler<RendererEventType, RendererEventData> for UniformSet<T> {
-    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
-        assert_eq!(event.event_type(), &RendererEventType::Stale,
-                   "UniformSet can only handle 'Stale' Renderer events");
-        self.inner.write().descriptor_sets.take();
+impl<T: Clone + BufferContents, const CAP: usize> UniformSet<T, CAP> {
+    /// Get a read lock on this uniform set's values.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// # use vulkano::buffer::AllocateBufferError;
+    /// # use vulkano::Validated;
+    /// # use gtether::render::RenderTarget;
+    /// use gtether::render::uniform::UniformSet;
+    ///
+    /// # fn wrapper(target: &Arc<dyn RenderTarget>) -> Result<(), Validated<AllocateBufferError>> {
+    /// let values = [0, 1, 2];
+    /// let uniform: Arc<UniformSet<u64, 8>> = Arc::new(UniformSet::new(target, values)?);
+    /// assert_eq!(uniform.read().as_slice(), &[0, 1, 2]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn read(&self) -> UniformReadGuard<'_, ArrayVec<T, CAP>> {
+        self.uniforms.read()
+    }
+
+    /// Get a write lock on this uniform set's values.
+    ///
+    /// Buffers will be marked as stale, and will be updated the next time they need to be accessed.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// # use vulkano::buffer::AllocateBufferError;
+    /// # use vulkano::Validated;
+    /// # use gtether::render::RenderTarget;
+    /// use gtether::render::uniform::UniformSet;
+    ///
+    /// # fn wrapper(target: &Arc<dyn RenderTarget>) -> Result<(), Validated<AllocateBufferError>> {
+    /// let values = [0, 1, 2];
+    /// let uniform: Arc<UniformSet<u64, 8>> = Arc::new(UniformSet::new(target, values)?);
+    /// let mut write_guard = uniform.write();
+    /// write_guard[1] = 42;
+    /// write_guard.push(9001);
+    /// assert_eq!(write_guard.as_slice(), &[0, 42, 2, 9001]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn write(&self) -> UniformWriteGuard<'_, ArrayVec<T, CAP>> {
+        let mut buffers = self.buffers.lock();
+        let lock = self.uniforms.write();
+        // Assume any write operation is going to mutate the data
+        for buffer in &mut *buffers {
+            buffer.stale = true;
+        }
+        lock
+    }
+}
+
+impl<T: BufferContents + Debug + Clone + NoUninit, const CAP: usize> VKDescriptorSource for UniformSet<T, CAP> {
+    fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+        let buffers = self.buffers.lock();
+        let buffer = buffers.get(frame_idx)
+            .expect("Frame count should match target's frame count");
+        (
+            WriteDescriptorSet::buffer_with_range(
+                binding,
+                DescriptorBufferInfo {
+                    buffer: buffer.buffer.clone(),
+                    range: 0..size_of::<T>() as DeviceSize,
+                },
+            ),
+            // These buffers are never replaced, and so never need a descriptor recreated
+            0,
+        )
+    }
+
+    fn update_descriptor_source(&self, frame_idx: usize) -> u64 {
+        let mut buffers = self.buffers.lock();
+        let values = self.uniforms.read();
+        let buffer = buffers.get_mut(frame_idx)
+            .expect("Frame count should match target's frame count");
+        if buffer.stale {
+            Self::fill_buffer(
+                buffer,
+                &values,
+                self.align,
+            );
+            buffer.stale = false;
+        }
+        // These buffers are never replaced, and so never need a descriptor recreated
+        0
+    }
+
+    fn descriptor_offsets(&self, frame_idx: usize) -> Option<DescriptorOffsetIter> {
+        let buffers = self.buffers.lock();
+        let buffer = buffers.get(frame_idx)
+            .expect("Frame count should match target's frame count");
+        Some(DescriptorOffsetIter::new(self.align as u32, (buffer.len * self.align) as u32))
     }
 }

@@ -12,7 +12,7 @@
 //! [vkgp]: vulkano::pipeline::GraphicsPipeline
 
 use parking_lot::Mutex;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::sync::Arc;
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -89,19 +89,11 @@ struct EngineGraphicsPipelineState {
 /// );
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct EngineGraphicsPipeline {
     target: Arc<dyn RenderTarget>,
     create_info: GraphicsPipelineCreateInfo,
     inner: Mutex<EngineGraphicsPipelineState>,
-}
-
-impl Debug for EngineGraphicsPipeline {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GraphicsPipelineCell")
-            .field("target", &self.target)
-            .field("inner", &self.inner)
-            .finish()
-    }
 }
 
 impl EngineGraphicsPipeline {
