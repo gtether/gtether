@@ -12,7 +12,8 @@ use arrayvec::ArrayVec;
 use bytemuck::NoUninit;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use smallvec::SmallVec;
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use vulkano::buffer::{AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorBufferInfo, WriteDescriptorSet};
@@ -22,10 +23,35 @@ use vulkano::{DeviceSize, Validated};
 use crate::render::descriptor_set::{DescriptorOffsetIter, VKDescriptorSource};
 use crate::render::RenderTarget;
 
-#[derive(Debug)]
+/// Helper trait that all values wrapped by [Uniform] or [UniformSet] must implement.
+///
+/// This trait defines how to retrieve buffer contents from the uniform's value. Note that this
+/// trait is automatically implemented for any type that also implements [BufferContents], Debug,
+/// and Clone, with an implementation that simply clones the type and returns it.
+pub trait UniformValue<T: BufferContents>: Debug + Send + Sync + 'static {
+    /// Get the buffer contents for this uniforms value.
+    fn buffer_contents(&self) -> T;
+}
+
+impl<T: Debug + Clone + BufferContents> UniformValue<T> for T {
+    #[inline]
+    fn buffer_contents(&self) -> T {
+        self.clone()
+    }
+}
+
 struct UniformBuffer<T: ?Sized> {
     buffer: Subbuffer<T>,
     stale: bool,
+}
+
+impl<T: ?Sized> Debug for UniformBuffer<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniformBuffer")
+            .field("buffer", &"...")
+            .field("stale", &self.stale)
+            .finish()
+    }
 }
 
 pub type UniformReadGuard<'a, T> = RwLockReadGuard<'a, T>;
@@ -37,18 +63,26 @@ pub type UniformWriteGuard<'a, T> = RwLockWriteGuard<'a, T>;
 /// framebuffer. These buffers are eventually consistent. Whenever the value of this Uniform is
 /// written to, the buffers will be marked as stale. Stale buffers are updated on a frame-by-frame
 /// basis to the latest value when any descriptor sets that reference this uniform are used.
-#[derive(Debug)]
-pub struct Uniform<T: Clone + BufferContents> {
+pub struct Uniform<T: BufferContents, U: UniformValue<T> = T> {
     // NOTE: When locking both value and buffers, ALWAYS lock buffers first to avoid deadlocks
-    value: RwLock<T>,
+    value: RwLock<U>,
     buffers: Mutex<SmallVec<[UniformBuffer<T>; 3]>>,
 }
 
-impl<T: Clone + BufferContents> Uniform<T> {
+impl<T: BufferContents, U: UniformValue<T>> Debug for Uniform<T, U> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Uniform")
+            .field("value", &self.value)
+            .field("buffers", &self.buffers)
+            .finish()
+    }
+}
+
+impl<T: BufferContents, U: UniformValue<T>> Uniform<T, U> {
     /// Create a new uniform, using the target's framebuffer count.
     pub fn new(
         target: &Arc<dyn RenderTarget>,
-        value: T,
+        value: U,
     ) -> Result<Self, Validated<AllocateBufferError>> {
         let buffers = (0..target.framebuffer_count()).into_iter()
             .map(|_| {
@@ -62,7 +96,7 @@ impl<T: Clone + BufferContents> Uniform<T> {
                         memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                    value.clone(),
+                    value.buffer_contents(),
                 )?;
                 Ok(UniformBuffer {
                     buffer,
@@ -93,7 +127,7 @@ impl<T: Clone + BufferContents> Uniform<T> {
     /// # }
     /// ```
     #[inline]
-    pub fn read(&self) -> UniformReadGuard<'_, T> {
+    pub fn read(&self) -> UniformReadGuard<'_, U> {
         self.value.read()
     }
 
@@ -116,7 +150,7 @@ impl<T: Clone + BufferContents> Uniform<T> {
     /// # }
     /// ```
     #[inline]
-    pub fn write(&self) -> UniformWriteGuard<'_, T> {
+    pub fn write(&self) -> UniformWriteGuard<'_, U> {
         let mut buffers = self.buffers.lock();
         let lock = self.value.write();
         // Assume any write operation is going to mutate the data
@@ -127,7 +161,7 @@ impl<T: Clone + BufferContents> Uniform<T> {
     }
 }
 
-impl<T: BufferContents + Debug + Clone> VKDescriptorSource for Uniform<T> {
+impl<T: BufferContents, U: UniformValue<T>> VKDescriptorSource for Uniform<T, U> {
     fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
         let buffers = self.buffers.lock();
         let buffer = buffers.get(frame_idx)
@@ -146,7 +180,7 @@ impl<T: BufferContents + Debug + Clone> VKDescriptorSource for Uniform<T> {
             .expect("Frame count should match target's frame count");
         if buffer.stale {
             let mut write_guard = buffer.buffer.write().unwrap();
-            *write_guard = (*value).clone();
+            *write_guard = value.buffer_contents();
             buffer.stale = false;
         }
         // These buffers are never replaced, and so never need a descriptor recreated
@@ -171,19 +205,30 @@ struct UniformSetBuffer {
 /// Otherwise, this struct functions similarly to [Uniform].
 ///
 /// [dso]: vulkano::descriptor_set::DescriptorSetWithOffsets
-#[derive(Debug)]
-pub struct UniformSet<T: Clone + BufferContents, const CAP: usize> {
+pub struct UniformSet<T: BufferContents, const CAP: usize, U: UniformValue<T> = T> {
     // NOTE: When locking both uniforms and buffers, ALWAYS lock buffers first to avoid deadlocks
-    uniforms: RwLock<ArrayVec<T, CAP>>,
+    uniforms: RwLock<ArrayVec<U, CAP>>,
     buffers: Mutex<SmallVec<[UniformSetBuffer; 3]>>,
     align: usize,
+    _phantom: PhantomData<T>,
 }
 
-impl<T: Clone + BufferContents + NoUninit, const CAP: usize> UniformSet<T, CAP> {
-    fn fill_buffer(buffer: &mut UniformSetBuffer, uniforms: &ArrayVec<T, CAP>, align: usize) {
+impl<T: BufferContents, const CAP: usize, U: UniformValue<T>> Debug for UniformSet<T, CAP, U> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniformSet")
+            .field("uniforms", &self.uniforms)
+            .field("buffers", &self.buffers)
+            .field("align", &self.align)
+            .finish()
+    }
+}
+
+impl<T: BufferContents + NoUninit, const CAP: usize, U: UniformValue<T>> UniformSet<T, CAP, U> {
+    fn fill_buffer(buffer: &mut UniformSetBuffer, uniforms: &ArrayVec<U, CAP>, align: usize) {
         let mut write_guard = buffer.buffer.write().unwrap();
         for (val_idx, value) in uniforms.iter().enumerate() {
-            let bytes = bytemuck::bytes_of(value);
+            let buffer_value = value.buffer_contents();
+            let bytes = bytemuck::bytes_of(&buffer_value);
             for (idx, byte) in bytes.iter().enumerate() {
                 write_guard[(val_idx * align) + idx] = *byte;
             }
@@ -200,7 +245,7 @@ impl<T: Clone + BufferContents + NoUninit, const CAP: usize> UniformSet<T, CAP> 
     /// Create a new uniform set, using the target's framebuffer count.
     pub fn new(
         target: &Arc<dyn RenderTarget>,
-        values: impl IntoIterator<Item=T>,
+        values: impl IntoIterator<Item=U>,
     ) -> Result<Self, Validated<AllocateBufferError>> {
         let uniforms = values.into_iter().collect::<ArrayVec<_, CAP>>();
 
@@ -245,11 +290,12 @@ impl<T: Clone + BufferContents + NoUninit, const CAP: usize> UniformSet<T, CAP> 
             uniforms: RwLock::new(uniforms),
             buffers: Mutex::new(buffers),
             align,
+            _phantom: PhantomData,
         })
     }
 }
 
-impl<T: Clone + BufferContents, const CAP: usize> UniformSet<T, CAP> {
+impl<T: BufferContents, const CAP: usize, U: UniformValue<T>> UniformSet<T, CAP, U> {
     /// Get a read lock on this uniform set's values.
     ///
     /// ```
@@ -267,7 +313,7 @@ impl<T: Clone + BufferContents, const CAP: usize> UniformSet<T, CAP> {
     /// # }
     /// ```
     #[inline]
-    pub fn read(&self) -> UniformReadGuard<'_, ArrayVec<T, CAP>> {
+    pub fn read(&self) -> UniformReadGuard<'_, ArrayVec<U, CAP>> {
         self.uniforms.read()
     }
 
@@ -293,7 +339,7 @@ impl<T: Clone + BufferContents, const CAP: usize> UniformSet<T, CAP> {
     /// # }
     /// ```
     #[inline]
-    pub fn write(&self) -> UniformWriteGuard<'_, ArrayVec<T, CAP>> {
+    pub fn write(&self) -> UniformWriteGuard<'_, ArrayVec<U, CAP>> {
         let mut buffers = self.buffers.lock();
         let lock = self.uniforms.write();
         // Assume any write operation is going to mutate the data
@@ -304,7 +350,7 @@ impl<T: Clone + BufferContents, const CAP: usize> UniformSet<T, CAP> {
     }
 }
 
-impl<T: BufferContents + Debug + Clone + NoUninit, const CAP: usize> VKDescriptorSource for UniformSet<T, CAP> {
+impl<T: BufferContents + NoUninit, const CAP: usize, U: UniformValue<T>> VKDescriptorSource for UniformSet<T, CAP, U> {
     fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
         let buffers = self.buffers.lock();
         let buffer = buffers.get(frame_idx)
