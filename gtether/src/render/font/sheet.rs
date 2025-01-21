@@ -437,11 +437,11 @@ impl FontRenderer for FontSheetRenderer {
         let font_sheet = self.font_sheet.read();
         let mapper = font_sheet.mapper();
         let sizer = font_sheet.sizer();
-        let screen_size = self.target.dimensions();
+        let screen_size = self.target.extent();
         let screen_scale = glm::vec2(
             // 2.0 because Vulkan screen coords go from -1.0 to 1.0
-            2.0 / screen_size.width() as f32,
-            2.0 / screen_size.height() as f32,
+            2.0 / screen_size.x as f32,
+            2.0 / screen_size.y as f32,
         );
 
         let glyphs = buffer.into_iter()

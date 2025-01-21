@@ -183,49 +183,6 @@ impl Deref for Device {
     }
 }
 
-// TODO: Replace with glm
-/// Wrapper around an array of two u32s, that is used to represent width/height dimensions.
-pub struct Dimensions(pub [u32; 2]);
-
-impl Dimensions {
-    /// Calculate the width / height aspect ratio for these dimensions.
-    #[inline]
-    pub fn aspect_ratio(&self) -> f32 {
-        self.0[0] as f32 / self.0[1] as f32
-    }
-
-    #[inline]
-    pub fn width(&self) -> u32 { self.0[0] }
-
-    #[inline]
-    pub fn height(&self) -> u32 { self.0[1] }
-}
-
-impl From<Dimensions> for [u32; 2] {
-    #[inline]
-    fn from(dimensions: Dimensions) -> [u32; 2] { dimensions.0 }
-}
-
-impl From<Dimensions> for [u32; 3] {
-    #[inline]
-    fn from(dimensions: Dimensions) -> [u32; 3] { [dimensions.0[0], dimensions.0[1], 1] }
-}
-
-impl From<Dimensions> for [f32; 2] {
-    #[inline]
-    fn from(dimensions: Dimensions) -> [f32; 2] { dimensions.0.map(|v| v as f32) }
-}
-
-impl From<Dimensions> for glm::TVec2<u32> {
-    #[inline]
-    fn from(dimensions: Dimensions) -> Self { glm::vec2(dimensions.0[0], dimensions.0[1]) }
-}
-
-impl From<Dimensions> for glm::TVec2<f32> {
-    #[inline]
-    fn from(dimensions: Dimensions) -> Self { glm::vec2(dimensions.0[0] as f32, dimensions.0[1] as f32) }
-}
-
 /// Represents a target for rendering to.
 ///
 /// Custom render targets can be created by implementing this trait, but the gTether engine library
@@ -234,7 +191,7 @@ pub trait RenderTarget: Debug + Send + Sync + 'static {
     /// The [Surface] that is being rendered to.
     fn surface(&self) -> &Arc<Surface>;
     /// The [Dimensions] of the surface that is being rendered to.
-    fn dimensions(&self) -> Dimensions;
+    fn extent(&self) -> glm::TVec2<u32>;
     /// The scale factor that should be applied to the surface for e.g. text rendering.
     fn scale_factor(&self) -> f64;
     /// The [Device] for accessing device-specific structures.

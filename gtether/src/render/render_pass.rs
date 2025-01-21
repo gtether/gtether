@@ -73,7 +73,7 @@ impl AttachmentData {
     ) -> Vec<Vec<AttachmentType>> {
         let mut create_infos = vk_render_pass.attachments().iter()
             .map(|atch| ImageCreateInfo {
-                extent: target.dimensions().into(),
+                extent: target.extent().fixed_resize::<3, 1>(1).into(),
                 format: atch.format,
                 usage: ImageUsage::empty(),
                 ..Default::default()

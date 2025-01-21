@@ -84,12 +84,12 @@ impl ViewportType {
             Self::TopLeft => {
                 Viewport {
                     offset: [0.0, 0.0],
-                    extent: target.dimensions().into(),
+                    extent: target.extent().cast::<f32>().into(),
                     depth_range: 0.0..=1.0,
                 }
             },
             Self::BottomLeft => {
-                let extent: glm::TVec2<f32> = target.dimensions().into();
+                let extent = target.extent().cast::<f32>();
                 Viewport {
                     offset: [0.0, extent.y],
                     extent: [extent.x, -extent.y],
@@ -119,7 +119,7 @@ struct EngineGraphicsPipelineState {
 /// [re]: crate::render::Renderer
 /// [civs]: GraphicsPipelineCreateInfo::viewport_state
 /// [rt]: RenderTarget
-/// [rtd]: RenderTarget::dimensions
+/// [rtd]: RenderTarget::extent
 ///
 /// # Examples
 /// ```

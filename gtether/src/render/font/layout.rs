@@ -865,7 +865,7 @@ impl TextLayout {
         mut create_info: TextLayoutCreateInfo,
     ) -> Self {
         if create_info.canvas_size.is_none() {
-            create_info.canvas_size = Some(target.dimensions().into());
+            create_info.canvas_size = Some(target.extent().cast::<f32>());
         }
         Self::new(sizer, create_info, target.scale_factor() as f32)
     }

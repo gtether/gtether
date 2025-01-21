@@ -239,7 +239,7 @@ impl ConsoleGui {
         layout: &ConsoleGuiLayout,
         font_sizer: &Arc<dyn FontSizer>,
     ) -> (TextLayout, TextLayout) {
-        let screen_size: glm::TVec2<f32> = target.dimensions().into();
+        let screen_size = target.extent().cast::<f32>();
 
         let (bounds_min, bounds_max) = layout.bounds();
         let scaled_font_size = layout.font_size.scale(target.scale_factor() as f32);

@@ -180,8 +180,9 @@ impl CubeRenderer {
         renderer.event_bus().register(
             RendererEventType::Stale,
             move |event: &mut Event<RendererEventType, RendererEventData>| {
+                let extent = event.target().extent().cast::<f32>();
                 reset_vp.write().projection = glm::perspective(
-                    event.target().dimensions().aspect_ratio(),
+                    extent.x / extent.y,
                     glm::half_pi(),
                     0.01, 100.0,
                 );

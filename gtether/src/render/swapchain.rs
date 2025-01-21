@@ -165,7 +165,7 @@ impl Swapchain {
             SwapchainCreateInfo {
                 min_image_count: caps.min_image_count + 1, // Buffer count
                 image_format: target.format(),
-                image_extent: target.dimensions().into(),
+                image_extent: target.extent().into(),
                 image_usage: ImageUsage::COLOR_ATTACHMENT,
                 composite_alpha,
                 ..Default::default()
@@ -190,7 +190,7 @@ impl Swapchain {
     pub(in crate::render) fn recreate(&mut self, render_pass: &dyn EngineRenderPass) -> Result<(), VulkanError> {
         let (vk_swapchain, images) = self.vk_swapchain.recreate(
             SwapchainCreateInfo {
-                image_extent: self.target.dimensions().into(),
+                image_extent: self.target.extent().into(),
                 ..self.vk_swapchain.create_info()
             }
         ).map_err(Validated::unwrap)?;
