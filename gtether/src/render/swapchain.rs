@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tracing::{event, Level};
 
 use vulkano::command_buffer::CommandBufferExecFuture;
-use vulkano::device::Device as VKDevice;
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageUsage};
 use vulkano::render_pass::{Framebuffer as VKFramebuffer, FramebufferCreateInfo, RenderPass};
@@ -17,7 +16,7 @@ use crate::render::attachment::AttachmentType;
 use crate::render::render_pass::EngineRenderPass;
 use crate::render::RenderTarget;
 
-type FrameFence = FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>;
+type FrameFence = FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture + Send + Sync>, SwapchainAcquireFuture>>>>;
 
 /// Representation of a single rendering framebuffer
 ///
@@ -92,20 +91,20 @@ impl Framebuffer {
     }
 
     #[inline]
-    fn get_future(&self, device: Arc<VKDevice>) -> Box<dyn GpuFuture> {
+    pub fn get_future(&self) -> Box<dyn GpuFuture + Send + Sync> {
         if let Some(fence) = self.fence.borrow().deref().clone() {
-            fence.boxed()
+            fence.boxed_send_sync()
         } else {
-            let mut now = sync::now(device);
+            let mut now = sync::now(self.target.device().vk_device().clone());
             now.cleanup_finished();
-            now.boxed()
+            now.boxed_send_sync()
         }
     }
 
     #[inline]
     pub(in crate::render) fn flush_command(
         &self,
-        command_future: CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>,
+        command_future: CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture + Send + Sync>, SwapchainAcquireFuture>>,
     ) -> Result<(), VulkanError> {
         let mut suboptimal = false;
 
@@ -211,7 +210,7 @@ impl Swapchain {
     }
 
     pub(in crate::render) fn acquire_next_frame(&self)
-        -> Result<(&Framebuffer, bool, JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>),
+        -> Result<(&Framebuffer, bool, JoinFuture<Box<dyn GpuFuture + Send + Sync>, SwapchainAcquireFuture>),
             VulkanError> {
         let (image_idx, suboptimal, acquire_future) =
             swapchain::acquire_next_image(self.vk_swapchain.clone(), None)
@@ -222,9 +221,7 @@ impl Swapchain {
         self.framebuffers[image_idx as usize].wait_ready();
 
         let join_future = self.framebuffers[prev_idx]
-            .get_future(
-                self.target.device().vk_device().clone()
-            ).join(acquire_future);
+            .get_future().join(acquire_future);
 
         let frame = &self.framebuffers[image_idx as usize];
 
