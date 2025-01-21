@@ -1,16 +1,17 @@
-use std::marker::PhantomData;
 use async_trait::async_trait;
 use itertools::{izip, Itertools};
-use smol::prelude::*;
+use smol::io::BufReader;
+use std::marker::PhantomData;
 use std::sync::Arc;
+use tobj::futures::load_obj_buf;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::Validated;
 
 use crate::render::model::{Model, ModelVertex, ModelVertexNormal, ModelVertexNormalColor, ModelVertexNormalTex};
 use crate::render::Device;
-use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
 use crate::resource::manager::ResourceManager;
 use crate::resource::path::ResourcePath;
+use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
 
 pub struct ModelObjLoader<V: Vertex> {
     device: Arc<Device>,
@@ -26,15 +27,10 @@ impl<V: Vertex> ModelObjLoader<V> {
         }
     }
 
-    async fn load_obj_model(mut data: ResourceReadData) -> Result<tobj::Model, ResourceLoadError> {
-        let mut buffer = Vec::new();
-        // TODO: This reads the entire buffer into memory! Need to make a pull request to tobj crate
-        //  to support some sort of async reader instead
-        data.read_to_end(&mut buffer).await
-            .map_err(ResourceLoadError::from_error)?;
-        let mut reader = std::io::BufReader::new(buffer.as_slice());
+    async fn load_obj_model(data: ResourceReadData) -> Result<tobj::Model, ResourceLoadError> {
+        let mut reader = BufReader::new(data);
 
-        let (mut models, mat_result) = tobj::load_obj_buf_async(
+        let (mut models, mat_result) = load_obj_buf(
             &mut reader,
             &tobj::GPU_LOAD_OPTIONS,
             move |_| async move {
