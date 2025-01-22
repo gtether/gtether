@@ -74,6 +74,11 @@ impl Application for ReversiApp {
             ModelObjLoader::<ModelVertexNormal>::new(window.renderer().target().device().clone()),
             LoadPriority::Immediate,
         );
+        let model_piece = engine.resources().get_or_load(
+            "piece.obj",
+            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().target().device().clone()),
+            LoadPriority::Immediate,
+        );
 
         let transform = Arc::new(Uniform::new(
             window.renderer().target(),
@@ -148,7 +153,10 @@ impl Application for ReversiApp {
                 .color_attachment("color")
                 .color_attachment("normals")
                 .depth_stencil_attachment("depth")
-                .handler(board.bootstrap_renderer(model_tile.wait().unwrap()))
+                .handler(board.bootstrap_renderer(
+                    model_tile.wait().unwrap(),
+                    model_piece.wait().unwrap(),
+                ))
             .end_subpass()
             .begin_subpass()
                 .input_attachment("color")
@@ -199,6 +207,7 @@ fn main() {
         .source(ConstantResourceSource::builder()
             .resource("console_font", include_bytes!("../assets/RobotoMono/RobotoMono-VariableFont_wght.ttf"))
             .resource("tile.obj", include_bytes!("../assets/tile.obj"))
+            .resource("piece.obj", include_bytes!("../assets/piece.obj"))
             .build())
         .build();
 

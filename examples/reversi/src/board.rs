@@ -5,7 +5,7 @@ use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::RendererHandle;
+use gtether::render::{Device, RendererHandle};
 use gtether::resource::Resource;
 use parry3d::na::Point3;
 use parry3d::query::{Ray, RayCast};
@@ -150,12 +150,21 @@ impl Board {
     pub fn bootstrap_renderer(
         self: &Arc<Self>,
         model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
+        model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
     ) -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> BoardRenderer {
         let self_clone = self.clone();
         let transform = self.transform.clone();
         let camera = self.camera.clone();
         move |renderer, subpass, _| {
-            BoardRenderer::new(self_clone, transform, camera, model_tile, renderer, subpass)
+            BoardRenderer::new(
+                self_clone,
+                transform,
+                camera,
+                model_tile,
+                model_piece,
+                renderer,
+                subpass,
+            )
         }
     }
 }
@@ -186,6 +195,8 @@ mod board_frag {
 pub struct BoardRenderer {
     board: Arc<Board>,
     model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
+    model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
+    device: Arc<Device>,
     graphics: Arc<EngineGraphicsPipeline>,
     instances: Subbuffer<[TileInstance]>,
     descriptor_set: EngineDescriptorSet,
@@ -197,6 +208,7 @@ impl BoardRenderer {
         transform: Arc<Uniform<MN, ModelTransform>>,
         camera: Arc<Uniform<VP, Camera>>,
         model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
+        model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
         renderer: &RendererHandle,
         subpass: &Subpass,
     ) -> Self {
@@ -291,6 +303,8 @@ impl BoardRenderer {
         Self {
             board,
             model_tile,
+            model_piece,
+            device: target.device().clone(),
             graphics,
             instances,
             descriptor_set,
@@ -302,6 +316,7 @@ impl EngineRenderHandler for BoardRenderer {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         let graphics = self.graphics.vk_graphics();
         let model_tile = self.model_tile.read();
+        let model_piece = self.model_piece.read();
 
         builder
             .bind_pipeline_graphics(graphics.clone()).unwrap()
@@ -312,5 +327,31 @@ impl EngineRenderHandler for BoardRenderer {
                 self.descriptor_set.descriptor_set(frame.index()).unwrap(),
             ).unwrap();
         model_tile.draw_instanced(builder, self.instances.clone()).unwrap();
+
+        let piece_instances = self.board.selected_tile().into_iter()
+            .map(|tile| {
+                TileInstance {
+                    offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
+                    color: glm::vec3(0.2, 0.6 , 0.8),
+                }
+            });
+
+        if piece_instances.len() > 0 {
+            let piece_instance_buffer = Buffer::from_iter(
+                self.device.memory_allocator().clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                piece_instances,
+            ).unwrap();
+
+            model_piece.draw_instanced(builder, piece_instance_buffer).unwrap();
+        }
     }
 }
