@@ -126,6 +126,7 @@ pub struct BoardState {
     selected_pos: Option<glm::TVec2<usize>>,
     players: Vec<Player>,
     current_player_idx: usize,
+    turn_no: usize,
 }
 
 impl BoardState {
@@ -149,6 +150,7 @@ impl BoardState {
             selected_pos: None,
             players,
             current_player_idx: 0,
+            turn_no: 1,
         }
     }
 
@@ -180,6 +182,35 @@ impl BoardState {
         }
     }
 
+    pub fn valid_selection(&self, pos: glm::TVec2<usize>) -> bool {
+        if let Some(tile) = self.tile(pos) {
+            if tile.owner.is_some() {
+                // Obviously can't play on a tile that is already owned
+                return false;
+            }
+        } else {
+            // Also can't play on a tile that doesn't exist
+            return false;
+        }
+
+        if self.turn_no <= 4 {
+            // During first 4 turns, only center 4 spaces are valid
+            let center = glm::vec2(self.size.x / 2, self.size.y / 2);
+            if pos.x != center.x && pos.x != (center.x - 1) {
+                return false;
+            }
+            if pos.y != center.y && pos.y != (center.y - 1) {
+                return false;
+            }
+            true
+        } else {
+            // After the first 4 turns, every move must capture at least one piece
+            Direction::all().into_iter().any(|direction| {
+                self.valid_for_flip(pos, direction, self.current_player_idx)
+            })
+        }
+    }
+
     #[inline]
     pub fn player(&self, player_idx: usize) -> Option<&Player> {
         self.players.get(player_idx)
@@ -191,22 +222,28 @@ impl BoardState {
     }
 
     #[inline]
-    pub fn next_player(&mut self) {
+    pub fn end_turn(&mut self) {
         self.current_player_idx += 1;
         if self.current_player_idx >= self.players.len() {
             self.current_player_idx = 0;
         }
-        info!(player = ?self.current_player(), "Next player's turn");
+        self.turn_no += 1;
+        info!(player = ?self.current_player(), turn_no = ?self.turn_no, "Next turn");
     }
 
     fn valid_for_flip(&self, start_pos: glm::TVec2<usize>, direction: Direction, player_idx: usize) -> bool {
+        let mut pieces_flipped: usize = 0;
         for current_pos in direction.iter(start_pos, self.size) {
             if let Some(tile) = self.tile(current_pos) {
                 if let Some(owner) = tile.owner {
                     if owner == player_idx {
-                        // Found same owner, all tiles in-between are valid for flipping
-                        return true;
-                    } // Else it's some other owned tile, continue searching
+                        // Found same owner, all tiles in-between are valid for flipping, if there
+                        // are any
+                        return pieces_flipped > 0;
+                    } else {
+                        // Else it's some other owned tile, continue searching
+                        pieces_flipped += 1;
+                    }
                 } else {
                     // Found unowned space, not valid for a flip
                     return false;
@@ -268,9 +305,9 @@ impl BoardState {
     }
 
     #[inline]
-    pub fn place(&mut self, pos: glm::TVec2<usize>, player_idx: usize) -> bool {
-        if self.tile(pos).iter().any(|tile| tile.owner.is_none()) {
-            self.set(pos, player_idx)
+    pub fn place(&mut self, pos: glm::TVec2<usize>) -> bool {
+        if self.valid_selection(pos) {
+            self.set(pos, self.current_player_idx)
         } else {
             false
         }
@@ -323,17 +360,21 @@ impl Board {
                     let mut state = input_board.state.write();
                     let tile = state.tiles.iter().find(|tile| {
                         tile.aabb.intersects_ray(&transform.transform, &ray, f32::MAX)
-                    });
+                    }).map(|tile| tile.pos);
 
-                    state.selected_pos = tile.map(|tile| tile.pos);
+                    state.selected_pos = None;
+                    if let Some(pos) = tile {
+                        if state.valid_selection(pos) {
+                            state.selected_pos = Some(pos);
+                        }
+                    }
                 },
                 InputDelegateEvent::MouseButton(event) => {
                     if event.button == MouseButton::Left && event.state == ElementState::Pressed {
                         let mut state = input_board.state.write();
-                        let current_player_idx = state.current_player_idx;
                         if let Some(selected_pos) = state.selected_pos {
-                            if state.place(selected_pos, current_player_idx) {
-                                state.next_player();
+                            if state.place(selected_pos) {
+                                state.end_turn();
                             }
                         }
                     }
