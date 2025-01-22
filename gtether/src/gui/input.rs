@@ -144,8 +144,12 @@ pub enum InputDelegateEvent {
     Key(KeyEvent),
     /// A mouse button changed state.
     MouseButton(MouseButtonEvent),
+    /// The cursor moved. This happens after window-specific post-processing, and the value is the
+    /// current position of the cursor relative to the window.
+    CursorMoved(glm::TVec2<f64>),
     /// The mouse moved. This happens before window-specific post-processing, and so is more
-    /// suitable for motion controlled applications such as 3d camera movement.
+    /// suitable for motion controlled applications such as 3d camera movement. The value is the
+    /// delta amount that the mouse moved.
     MouseMotion(glm::TVec2<f64>),
 }
 
@@ -501,6 +505,8 @@ impl InputState {
             },
             InputEvent::CursorMoved(position) => {
                 self.state.set_mouse_position(position);
+
+                self.delegates.send_event(InputDelegateEvent::CursorMoved(position.clone()))
             },
             InputEvent::MouseMotion(motion) => {
                 self.delegates.send_event(InputDelegateEvent::MouseMotion(motion.clone()))
@@ -749,11 +755,13 @@ mod tests {
                 state: ElementState::Pressed,
                 position: glm::vec2(0.0, 0.0),
             }),
+            InputDelegateEvent::CursorMoved(glm::vec2(30.0, 166.6)),
             InputDelegateEvent::MouseButton(MouseButtonEvent {
                 button: MouseButton::Left,
                 state: ElementState::Released,
                 position: glm::vec2(30.0, 166.6),
             }),
+            InputDelegateEvent::CursorMoved(glm::vec2(72.0, 0.0)),
             InputDelegateEvent::MouseButton(MouseButtonEvent {
                 button: MouseButton::Middle,
                 state: ElementState::Pressed,

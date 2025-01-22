@@ -30,13 +30,14 @@ use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, La
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
 use crate::render::font::size::{FontSize, FontSizer};
 use crate::render::font::Font;
-use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::swapchain::Framebuffer;
 use crate::render::uniform::Uniform;
 use crate::render::{FlatVertex, RenderTarget, RendererEventData, RendererEventType, RendererHandle};
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
+use crate::render::descriptor_set::EngineDescriptorSet;
 
 /// General alignment configuration for a [ConsoleGui] section.
 #[derive(Debug, Clone)]
@@ -238,7 +239,7 @@ impl ConsoleGui {
         layout: &ConsoleGuiLayout,
         font_sizer: &Arc<dyn FontSizer>,
     ) -> (TextLayout, TextLayout) {
-        let screen_size: glm::TVec2<f32> = target.dimensions().into();
+        let screen_size = target.extent().cast::<f32>();
 
         let (bounds_min, bounds_max) = layout.bounds();
         let scaled_font_size = layout.font_size.scale(target.scale_factor() as f32);
@@ -463,8 +464,8 @@ mod background_solid_frag {
 
 struct ConsoleBackgroundSolidRenderer {
     graphics: Arc<EngineGraphicsPipeline>,
-    color: Arc<Uniform<BackgroundSolid>>,
     buffer: Subbuffer<[FlatVertex]>,
+    descriptor_set: EngineDescriptorSet,
 }
 
 impl ConsoleBackgroundSolidRenderer {
@@ -501,6 +502,7 @@ impl ConsoleBackgroundSolidRenderer {
                 .into_pipeline_layout_create_info(target.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
+        let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
 
         let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
@@ -525,23 +527,27 @@ impl ConsoleBackgroundSolidRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::TopLeft,
         );
 
-        let color = Uniform::new(
+        let color = Arc::new(Uniform::new(
+            target,
             bg,
-            renderer,
-            graphics.clone(),
-            0,
-        );
+        ).unwrap());
+
+        let descriptor_set = EngineDescriptorSet::builder(target)
+            .layout(descriptor_layout)
+            .descriptor_source(0, color)
+            .build().unwrap();
 
         Self {
             graphics,
-            color,
             buffer,
+            descriptor_set,
         }
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         let graphics = self.graphics.vk_graphics();
 
         builder
@@ -550,7 +556,7 @@ impl ConsoleBackgroundSolidRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.color.descriptor_set().clone(),
+                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
             .draw(
@@ -575,10 +581,10 @@ impl ConsoleBackgroundRenderer {
         }
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         match self {
             ConsoleBackgroundRenderer::Solid(renderer)
-                => renderer.build_commands(builder),
+                => renderer.build_commands(builder, frame),
         }
     }
 }
@@ -639,13 +645,13 @@ impl ConsoleRenderer {
 }
 
 impl EngineRenderHandler for ConsoleRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, _frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         if !self.gui.visible.load(Ordering::Relaxed) {
             // Nothing to draw
             return;
         }
 
-        self.background.build_commands(builder);
+        self.background.build_commands(builder, frame);
 
         let mut log_layout = self.gui.text_log.lock();
         let prompt_layout = self.gui.text_prompt.lock();
@@ -676,7 +682,7 @@ impl EngineRenderHandler for ConsoleRenderer {
             },
         }
 
-        let mut pass = self.font_compositor.begin_pass(builder);
+        let mut pass = self.font_compositor.begin_pass(builder, frame);
         pass.layout(&log_layout);
         pass.layout(&prompt_layout);
         pass.end_pass();

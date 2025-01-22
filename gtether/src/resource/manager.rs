@@ -23,7 +23,7 @@
 //! # fn wrapper<T: Send + Sync + 'static>(manager: &ResourceManager, loader1: impl ResourceLoader<T>, loader2: impl ResourceLoader<T>) {
 //! // Poll whether the resource is ready
 //! let res_handle = manager.get_or_load("key1", loader1, LoadPriority::Immediate);
-//! match res_handle.poll() {
+//! match res_handle.check() {
 //!     Ok(res_result) => { /* do something with the load result */ },
 //!     Err(res_handle) => { /* do something with the unready handle */ },
 //! }
@@ -31,7 +31,7 @@
 //! // Wait for the resource to be ready
 //! let res_handle = manager.get_or_load("key2", loader2, LoadPriority::Immediate);
 //! // Or .wait().await if within an async context
-//! let res_result = res_handle.wait_blocking();
+//! let res_result = res_handle.wait();
 //! # }
 //! ```
 //!
@@ -49,15 +49,15 @@
 //! let handle3 = manager.get_or_load("key", loader3, LoadPriority::Immediate);
 //!
 //! // Multiple handles should refer to same resource
-//! let res1 = handle1.wait().await.unwrap();
-//! let res2 = handle2.wait().await.unwrap();
+//! let res1 = handle1.await.unwrap();
+//! let res2 = handle2.await.unwrap();
 //! assert!(Arc::ptr_eq(&res1, &res2));
 //!
 //! // Dropping all strong references should cause remaining handles to trigger reloads
 //! drop(res1);
 //! drop(res2);
 //! // This should trigger a new load
-//! let res3 = handle3.wait().await.unwrap();
+//! let res3 = handle3.await.unwrap();
 //! # }
 //! ```
 //!
@@ -71,7 +71,9 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 use std::thread;
 use std::thread::JoinHandle;
 use strum::EnumCount;
@@ -149,6 +151,8 @@ impl From<LoadPriority> for TaskPriority {
     }
 }
 
+pub type ManagerTask<T> = Task<T>;
+
 struct ManagerExecutor {
     execs: Arc<[Executor<'static>; TaskPriority::COUNT]>,
     worker: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
@@ -193,7 +197,7 @@ impl ManagerExecutor {
         &self,
         priority: TaskPriority,
         future: impl Future<Output = T> + Send + 'static,
-    ) -> Task<T> {
+    ) -> ManagerTask<T> {
         self.execs[priority as usize].spawn(future)
     }
 }
@@ -226,6 +230,44 @@ enum ResourceFutureState<T: ?Sized + Send + Sync + 'static> {
         cache: Weak<CacheEntry>,
         load_fn: Box<dyn FnOnce() -> ResourceFuture<T>>,
     },
+    Awaiting{
+        future: Pin<Box<dyn Future<Output = CacheEntryGetResult<T>>>>,
+        load_fn: Box<dyn FnOnce() -> ResourceFuture<T>>,
+    },
+    Uninit,
+}
+
+impl<T: ?Sized + Send + Sync + 'static> ResourceFutureState<T> {
+    fn poll(self, cx: &mut Context<'_>) -> (ResourceFutureState<T>, Poll<ResourceLoadResult<T>>) {
+        match self {
+            Self::Immediate(inner) => (Self::Uninit, Poll::Ready(inner)),
+            Self::Delayed { cache, load_fn } => {
+                if let Some(strong_cache) = cache.upgrade() {
+                    Self::Awaiting {
+                        future: Box::pin(async move { strong_cache.wait().await }),
+                        load_fn,
+                    }.poll(cx)
+                } else {
+                    // CacheEntry expired, reload
+                    load_fn().state.poll(cx)
+                }
+            },
+            Self::Awaiting { mut future, load_fn } => {
+                match future.poll(cx) {
+                    Poll::Ready(cache_result) => match cache_result {
+                        CacheEntryGetResult::Ok(r)
+                            => (Self::Uninit, Poll::Ready(Ok(r))),
+                        CacheEntryGetResult::Err(e)
+                            => (Self::Uninit, Poll::Ready(Err(e))),
+                        // CacheEntry expired, reload
+                        CacheEntryGetResult::Expired => load_fn().state.poll(cx),
+                    },
+                    Poll::Pending => (Self::Awaiting { future, load_fn }, Poll::Pending),
+                }
+            },
+            Self::Uninit => panic!("Found uninit state in inner ResourceFuture"),
+        }
+    }
 }
 
 /// Handle for retrieving results when loading a [Resource][res].
@@ -285,6 +327,8 @@ where
             ResourceFutureState::Immediate(Ok(_)) => builder.field("Immediate", &ImmediateOk()),
             ResourceFutureState::Immediate(Err(e)) => builder.field("Immediate", &ImmediateErr(e)),
             ResourceFutureState::Delayed { cache, .. } => builder.field("Delayed", &Delayed(cache)),
+            ResourceFutureState::Awaiting { .. } => builder.field("Awaiting", &"<awaiting>"),
+            ResourceFutureState::Uninit => builder.field("Uninit", &"<uninit>"),
         };
         builder.finish()
     }
@@ -311,13 +355,21 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<T> {
         }
     }
 
+    fn with_state<R>(&mut self, func: impl FnOnce(ResourceFutureState<T>) -> (ResourceFutureState<T>, R)) -> R {
+        let mut state = ResourceFutureState::Uninit;
+        std::mem::swap(&mut self.state, &mut state);
+        let (mut state, result) = func(state);
+        std::mem::swap(&mut self.state, &mut state);
+        result
+    }
+
     /// Synchronously check whether this handle's [Resource][res] is done loading.
     ///
     /// If this handle's load task is complete, this yields the result of that load task. If the
     /// load task is not yet complete, yield the handle back.
     ///
     /// [res]: Resource
-    pub fn poll(self) -> Result<ResourceLoadResult<T>, Self> {
+    pub fn check(self) -> Result<ResourceLoadResult<T>, Self> {
         match self.state {
             ResourceFutureState::Immediate(inner) => Ok(inner),
             ResourceFutureState::Delayed{ cache, load_fn } => {
@@ -325,44 +377,36 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<T> {
                     match strong_cache.poll() {
                         Some(CacheEntryGetResult::Ok(r)) => Ok(Ok(r)),
                         Some(CacheEntryGetResult::Err(e)) => Ok(Err(e)),
-                        Some(CacheEntryGetResult::Expired) => load_fn().poll(),
+                        Some(CacheEntryGetResult::Expired) => load_fn().check(),
                         None => Err(Self { state: ResourceFutureState::Delayed { cache, load_fn }}),
                     }
                 } else {
                     // CacheEntry expired, reload
-                    load_fn().poll()
+                    load_fn().check()
                 }
             },
+            ResourceFutureState::Awaiting { .. }
+                => panic!("ResourceFuture checked while being awaited"),
+            ResourceFutureState::Uninit
+                => panic!("Found uninit state in inner ResourceFuture"),
         }
     }
 
-    /// Asynchronously wait for this handle's [Resource][res] to be done loading.
+    /// Synchronously wait for this handle's [Resource][res] to be done loading.
     ///
-    /// Will asynchronously await this handle's load task, and yield the result once it is complete.
-    ///
-    ///[res]: Resource
-    pub async fn wait(self) -> ResourceLoadResult<T> {
-        match self.state {
-            ResourceFutureState::Immediate(inner) => inner,
-            ResourceFutureState::Delayed{ cache, load_fn } => {
-                if let Some(strong_cache) = cache.upgrade() {
-                    match strong_cache.wait().await {
-                        CacheEntryGetResult::Ok(r) => Ok(r),
-                        CacheEntryGetResult::Err(e) => Err(e),
-                        CacheEntryGetResult::Expired => Box::pin(load_fn().wait()).await,
-                    }
-                } else {
-                    // CacheEntry expired, reload
-                    Box::pin(load_fn().wait()).await
-                }
-            },
-        }
-    }
-
-    /// Convenience method that wraps [ResourceFuture::wait()] in a synchronous block.
+    /// Blocks on awaiting this future.
     #[inline]
-    pub fn wait_blocking(self) -> ResourceLoadResult<T> {
-        future::block_on(self.wait())
+    pub fn wait(self) -> ResourceLoadResult<T> {
+        future::block_on(self)
+    }
+}
+
+impl<T: ?Sized + Send + Sync + 'static> Future for ResourceFuture<T> {
+    type Output = ResourceLoadResult<T>;
+
+    #[inline]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.with_state(|state| state.poll(cx))
     }
 }
 
@@ -398,7 +442,7 @@ impl From<Result<(), ResourceLoadError>> for CacheEntryUpdateResult {
     }
 }
 
-type CacheEntryStateUpdateFn = Box<dyn (Fn(ResourceReadData)
+type CacheEntryStateUpdateFn = Box<dyn (Fn(&Arc<ResourceManager>, ResourceReadData)
     -> Box<dyn Future<Output = CacheEntryUpdateResult> + Send>) + Send + Sync>;
 
 enum CacheEntryState {
@@ -519,6 +563,7 @@ impl CacheEntryState {
 
     async fn update(
         &mut self,
+        manager: &Arc<ResourceManager>,
         id: &ResourcePath,
         source: &Box<dyn ResourceSource>,
         new_idx: &SourceIndex,
@@ -539,7 +584,7 @@ impl CacheEntryState {
                         Ok(sub_data) => sub_data.seal(new_idx.idx()),
                         Err(e) => return CacheEntryUpdateResult::Err(e),
                     };
-                    match Box::into_pin(update(data.data)).await {
+                    match Box::into_pin(update(manager, data.data)).await {
                         CacheEntryUpdateResult::Ok => {},
                         CacheEntryUpdateResult::Expired => return CacheEntryUpdateResult::Expired,
                         CacheEntryUpdateResult::Err(e) => return CacheEntryUpdateResult::Err(e),
@@ -584,7 +629,8 @@ where
                     resource_type: TypeId::of::<T>(),
                     hash,
                     source_idx,
-                    update: Box::new(move |data| Box::new({
+                    update: Box::new(move |manager, data| Box::new({
+                        let async_manager = manager.clone();
                         let async_weak = weak.clone();
                         let async_id = id.clone();
                         let async_loader = loader.clone();
@@ -594,10 +640,9 @@ where
                                 let _update_lock = strong.update_lock.lock().await;
 
                                 let (resource_mut, drop_checker) = ResourceMut::from_resource(
-                                    async_id.clone(),
                                     strong.clone(),
                                 );
-                                match async_loader.update(resource_mut, data).await {
+                                match async_loader.update(&async_manager, async_id.clone(), resource_mut, data).await {
                                     Ok(_) => {
                                         match drop_checker.recv().await {
                                             Ok(_) => { debug!("Drop-checker received an unexpected message"); }
@@ -681,9 +726,13 @@ impl CacheEntry {
     }
 
     #[inline]
-    async fn update(&self, source: &Box<dyn ResourceSource>, new_idx: &SourceIndex)
-                    -> CacheEntryUpdateResult {
-        self.state.lock().await.update(&self.id, source, new_idx).await
+    async fn update(
+        &self,
+        manager: &Arc<ResourceManager>,
+        source: &Box<dyn ResourceSource>,
+        new_idx: &SourceIndex,
+    ) -> CacheEntryUpdateResult {
+        self.state.lock().await.update(manager, &self.id, source, new_idx).await
     }
 
     #[inline]
@@ -815,7 +864,7 @@ impl ResourceManager {
                 }
             };
 
-            let update_result = before_entry.update(source, &task_source_idx).await;
+            let update_result = before_entry.update(&task_self, source, &task_source_idx).await;
 
             let mut cache = task_self.cache.lock();
             let after_entry = match cache.get(&task_id) {
@@ -853,6 +902,21 @@ impl ResourceManager {
         None
     }
 
+    /// Spawn a new async task for the ResourceManager to execute in the background.
+    ///
+    /// The spawned task shares the same executor as all [Resource] load and update tasks. This
+    /// spawn() method is intended to be used _only_ for Resource loading adjacent tasks, such as
+    /// spawning a delayed load of some of a Resource's components. This is _not_ a general purpose
+    /// executor, and should not be used as such.
+    #[inline]
+    pub fn spawn<T: Send + 'static>(
+        &self,
+        priority: LoadPriority,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> ManagerTask<T> {
+        self.executor.spawn(priority.into(), future)
+    }
+
     fn load<T>(
         &self,
         cache: &mut MutexGuard<HashMap<ResourcePath, Arc<CacheEntry>>>,
@@ -873,7 +937,7 @@ impl ResourceManager {
             let _test_ctx_lock = task_self.test_ctx.sync_load.run().await;
             let (result, source_idx) = match task_self.find_data(&task_id).await {
                 Some(Ok(data)) => {
-                    match task_loader.load(data.data).await {
+                    match task_loader.load(&task_self, task_id.clone(), data.data).await {
                         Ok(v) => (Ok((Arc::new(Resource::new(v)), data.hash)), data.source_idx),
                         Err(e) => (Err(e), data.source_idx),
                     }
@@ -1082,12 +1146,28 @@ pub(in crate::resource) mod tests {
         }
     }
 
-    #[derive(Default)]
-    pub struct TestResourceLoader {}
+    pub struct TestResourceLoader {
+        expected_id: ResourcePath,
+    }
+
+    impl TestResourceLoader {
+        #[inline]
+        pub fn new(expected_id: impl Into<ResourcePath>) -> Self {
+            Self {
+                expected_id: expected_id.into(),
+            }
+        }
+    }
 
     #[async_trait]
     impl ResourceLoader<String> for TestResourceLoader {
-        async fn load(&self, mut data: ResourceReadData) -> Result<Box<String>, ResourceLoadError> {
+        async fn load(
+            &self,
+            _manager: &Arc<ResourceManager>,
+            id: ResourcePath,
+            mut data: ResourceReadData,
+        ) -> Result<Box<String>, ResourceLoadError> {
+            assert_eq!(id, self.expected_id);
             let mut output = String::new();
             data.read_to_string(&mut output).await
                 .map_err(|err| ResourceLoadError::from_error(err))
@@ -1181,8 +1261,8 @@ pub(in crate::resource) mod tests {
     fn test_resource_manager_not_found() {
         let (manager, _) = create_resource_manager::<1>();
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let err = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let err = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect_err("No resource data should be present for 'key'");
         assert_matches!(err, ResourceLoadError::NotFound(id) => {
             assert_eq!(id, ResourcePath::new("key"));
@@ -1191,8 +1271,8 @@ pub(in crate::resource) mod tests {
 
         // Result should be cached, and not trigger another load
         manager.test_ctx().clear();
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let err = fut.poll()
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let err = fut.check()
             .expect("Error should be cached and pollable")
             .expect_err("No resource data should be present for 'key'");
         assert_matches!(err, ResourceLoadError::NotFound(id) => {
@@ -1208,19 +1288,19 @@ pub(in crate::resource) mod tests {
 
         let fut = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
-            let fut = manager.get_or_load("invalid", TestResourceLoader::default(), LoadPriority::Immediate);
-            fut.poll().expect_err("Resource should not be loaded yet")
+            let fut = manager.get_or_load("invalid", TestResourceLoader::new("invalid"), LoadPriority::Immediate);
+            fut.check().expect_err("Resource should not be loaded yet")
         };
 
-        let error = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let error = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect_err("Resource should fail to load for 'invalid'");
         assert_matches!(error, ResourceLoadError::ReadError(_));
         manager.test_ctx().sync_load.assert_count(1);
 
         // Result should be cached, and not trigger another load
         manager.test_ctx().clear();
-        let fut = manager.get_or_load("invalid", TestResourceLoader::default(), LoadPriority::Immediate);
-        let error = fut.poll()
+        let fut = manager.get_or_load("invalid", TestResourceLoader::new("invalid"), LoadPriority::Immediate);
+        let error = fut.check()
             .expect("Error should be cached and pollable")
             .expect_err("Resource should still fail to load for 'invalid'");
         assert_matches!(error, ResourceLoadError::ReadError(_));
@@ -1234,19 +1314,19 @@ pub(in crate::resource) mod tests {
 
         let fut = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
-            let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-            fut.poll().expect_err("Resource should not be loaded yet")
+            let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+            fut.check().expect_err("Resource should not be loaded yet")
         };
 
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
         manager.test_ctx().sync_load.assert_count(1);
 
         // Result should be cached, and not trigger another load
         manager.test_ctx().clear();
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = fut.poll()
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = fut.check()
             .expect("Resource should be cached and pollable")
             .expect("Resource should still be loaded for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
@@ -1261,12 +1341,12 @@ pub(in crate::resource) mod tests {
         data_maps[0].assert_watch("key", false);
         let (fut1, fut2) = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
-            let fut1 = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-            let fut2 = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
+            let fut1 = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+            let fut2 = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
             (fut1, fut2)
         };
 
-        let value = future::block_on(timeout(fut1.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut1, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
         data_maps[0].assert_watch("key", true);
@@ -1274,7 +1354,7 @@ pub(in crate::resource) mod tests {
 
         drop(value);
 
-        let value = future::block_on(timeout(fut2.wait(), Duration::from_secs(1)))
+        let value = future::block_on(timeout(fut2, Duration::from_secs(1)))
             .expect("Resource should reload for 'key' after first handle was dropped");
         assert_eq!(*value.read(), "value".to_owned());
         manager.test_ctx().sync_load.assert_count(2);
@@ -1286,8 +1366,8 @@ pub(in crate::resource) mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         data_maps[0].assert_watch("key", true);
         manager.test_ctx().sync_update.assert_count(0);
@@ -1309,8 +1389,8 @@ pub(in crate::resource) mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         data_maps[0].assert_watch("key", true);
         manager.test_ctx().sync_update.assert_count(0);
@@ -1331,8 +1411,8 @@ pub(in crate::resource) mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"\xC0", "h_invalid");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let error = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let error = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect_err("Resource should fail to load for 'key'");
         assert_matches!(error, ResourceLoadError::ReadError(_));
         data_maps[0].assert_watch("key", true);
@@ -1344,8 +1424,8 @@ pub(in crate::resource) mod tests {
         }
 
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "new_value".to_owned());
         data_maps[0].assert_watch("key", true);
@@ -1358,8 +1438,8 @@ pub(in crate::resource) mod tests {
         data_maps[2].insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value_1".to_owned());
         manager.test_ctx().sync_update.assert_count(0);
@@ -1406,8 +1486,8 @@ pub(in crate::resource) mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
 

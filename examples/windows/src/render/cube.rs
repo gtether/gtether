@@ -1,12 +1,13 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use gtether::event::Event;
 use gtether::render::attachment::AttachmentMap;
-use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use gtether::render::descriptor_set::EngineDescriptorSet;
+use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{RendererEventData, RendererEventType, RendererHandle};
+use gtether::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -51,59 +52,63 @@ struct CubeVertex {
 pub struct CubeRenderer {
     graphics: Arc<EngineGraphicsPipeline>,
     vertex_buffer: Subbuffer<[CubeVertex]>,
-    mn: Arc<Uniform<MN>>,
-    vp: Arc<Uniform<VP>>,
+    descriptor_set: EngineDescriptorSet,
 }
 
 impl CubeRenderer {
-    fn new(renderer: &RendererHandle, subpass: &Subpass) -> Self {
+    fn new(
+        renderer: &RendererHandle,
+        subpass: &Subpass,
+        mn: Arc<Uniform<MN>>,
+        vp: Arc<Uniform<VP>>,
+    ) -> Self {
         let target = renderer.target();
 
         let color = [1.0, 1.0, 1.0];
 
         let vertices = [
             // Front
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
             CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [0.0,  0.0,  1.0], color },
             // Back
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
             CubeVertex { position: [-1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0,  0.0, -1.0], color },
             // Top
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
             CubeVertex { position: [-1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0,  1.0], normal: [ 0.0, -1.0,  0.0], color },
             // Bottom
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
             CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 0.0,  1.0,  0.0], color },
             // Left
-            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
-            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
             CubeVertex { position: [-1.0, -1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0,  1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0,  1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
+            CubeVertex { position: [-1.0, -1.0, -1.0], normal: [-1.0,  0.0,  0.0], color },
             // Right
-            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
-            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
             CubeVertex { position: [ 1.0, -1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0, -1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0,  1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
+            CubeVertex { position: [ 1.0, -1.0,  1.0], normal: [ 1.0,  0.0,  0.0], color },
         ];
 
         let vertex_buffer = Buffer::from_iter(
@@ -142,6 +147,7 @@ impl CubeRenderer {
                 .into_pipeline_layout_create_info(target.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
+        let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
 
         let create_info = GraphicsPipelineCreateInfo {
             depth_stencil_state: Some(DepthStencilState {
@@ -167,45 +173,38 @@ impl CubeRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
-        );
-
-        let mn = Uniform::new(
-            MN::default(),
-            renderer,
-            graphics.clone(),
-            1,
-        );
-
-        let vp = Uniform::new(
-            VP::default(),
-            renderer,
-            graphics.clone(),
-            0,
+            ViewportType::BottomLeft,
         );
 
         let reset_vp = vp.clone();
         renderer.event_bus().register(
             RendererEventType::Stale,
             move |event: &mut Event<RendererEventType, RendererEventData>| {
+                let extent = event.target().extent().cast::<f32>();
                 reset_vp.write().projection = glm::perspective(
-                    event.target().dimensions().aspect_ratio(),
+                    extent.x / extent.y,
                     glm::half_pi(),
                     0.01, 100.0,
                 );
             }
         );
 
+        let descriptor_set = EngineDescriptorSet::builder(target)
+            .layout(descriptor_layout)
+            .descriptor_source(0, vp)
+            .descriptor_source(1, mn)
+            .build().unwrap();
+
         Self {
             graphics,
             vertex_buffer,
-            mn,
-            vp,
+            descriptor_set,
         }
     }
 }
 
 impl EngineRenderHandler for CubeRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, _frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         let graphics = self.graphics.vk_graphics();
 
         builder
@@ -214,50 +213,44 @@ impl EngineRenderHandler for CubeRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                (
-                    self.vp.descriptor_set().clone(),
-                    self.mn.descriptor_set().clone(),
-                ),
+                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
             .draw(self.vertex_buffer.len() as u32, 1, 0, 0).unwrap();
     }
 }
 
-#[derive(Default)]
-pub struct CubeRendererRefs {
-    mn: OnceLock<Arc<Uniform<MN>>>,
-    vp: OnceLock<Arc<Uniform<VP>>>,
+pub struct CubeRendererBootstrap {
+    mn: Arc<Uniform<MN>>,
+    vp: Arc<Uniform<VP>>,
 }
 
-impl CubeRendererRefs {
+impl CubeRendererBootstrap {
     #[inline]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new(target: &Arc<dyn RenderTarget>) -> Arc<Self> {
+        Arc::new(Self {
+            mn: Arc::new(Uniform::new(
+                target,
+                MN::default(),
+            ).unwrap()),
+            vp: Arc::new(Uniform::new(
+                target,
+                VP::default(),
+            ).unwrap()),
+        })
     }
 
-    pub fn bootstrap(self: &Arc<CubeRendererRefs>)
+    pub fn bootstrap(self: &Arc<CubeRendererBootstrap>)
             -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> CubeRenderer {
         let self_clone = self.clone();
         move |renderer, subpass, _| {
-            let cube_renderer = CubeRenderer::new(renderer, subpass);
-            self_clone.mn.set(cube_renderer.mn.clone())
-                .expect(".bootstrap() should not be called twice");
-            self_clone.vp.set(cube_renderer.vp.clone())
-                .expect(".bootstrap() should not be called twice");
-            cube_renderer
+            CubeRenderer::new(renderer, subpass, self_clone.mn.clone(), self_clone.vp.clone())
         }
     }
 
     #[inline]
-    pub fn mn(&self) -> &Arc<Uniform<MN>> {
-        self.mn.get()
-            .expect("CubeRenderer not yet created")
-    }
+    pub fn mn(&self) -> &Arc<Uniform<MN>> { &self.mn }
 
     #[inline]
-    pub fn vp(&self) -> &Arc<Uniform<VP>> {
-        self.vp.get()
-            .expect("CubeRenderer not yet created")
-    }
+    pub fn vp(&self) -> &Arc<Uniform<VP>> { &self.vp }
 }

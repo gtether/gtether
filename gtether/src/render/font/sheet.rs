@@ -33,8 +33,10 @@ use crate::render::font::layout::PositionedChar;
 use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
 use crate::render::image::ImageSampler;
-use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::{Device, FlatVertex, RenderTarget, RendererEventType, RendererHandle};
+use crate::render::descriptor_set::EngineDescriptorSet;
+use crate::render::swapchain::Framebuffer;
 use crate::resource::manager::ResourceLoadResult;
 use crate::resource::{Resource, ResourceLoadError, ResourceMut, SubResourceLoader};
 
@@ -322,8 +324,8 @@ pub struct FontSheetRenderer {
     target: Arc<dyn RenderTarget>,
     font_sheet: Arc<Resource<FontSheet>>,
     graphics: Arc<EngineGraphicsPipeline>,
-    font_sampler: Arc<ImageSampler>,
     glyph_buffer: Subbuffer<[FlatVertex]>,
+    descriptor_set: EngineDescriptorSet,
 }
 
 impl FontSheetRenderer {
@@ -355,6 +357,7 @@ impl FontSheetRenderer {
                 .into_pipeline_layout_create_info(target.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
+        let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
 
         let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
@@ -379,13 +382,11 @@ impl FontSheetRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::TopLeft,
         );
 
-        let font_sampler = ImageSampler::new(
-            renderer,
-            graphics.clone(),
+        let font_sampler = Arc::new(ImageSampler::new(
             font_sheet.read().image_view().clone(),
-            0,
             Sampler::new(
                 target.device().vk_device().clone(),
                 SamplerCreateInfo {
@@ -394,7 +395,7 @@ impl FontSheetRenderer {
                     ..Default::default()
                 }
             ).unwrap(),
-        );
+        ));
         let update_font_sampler = font_sampler.clone();
         font_sheet.attach_update_callback_blocking(move |font_sheet| {
             let update_font_sampler = update_font_sampler.clone();
@@ -409,28 +410,38 @@ impl FontSheetRenderer {
             glm::vec2(1.0, 1.0),
         );
 
+        let descriptor_set = EngineDescriptorSet::builder(target)
+            .layout(descriptor_layout)
+            .descriptor_source(0, font_sampler)
+            .build().unwrap();
+
         Box::new(Self {
             target: target.clone(),
             font_sheet,
             graphics,
-            font_sampler,
             glyph_buffer,
+            descriptor_set,
         })
     }
 }
 
 impl FontRenderer for FontSheetRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, buffer: Vec<PositionedChar>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        buffer: Vec<PositionedChar>,
+        frame: &Framebuffer,
+    ) {
         let graphics = self.graphics.vk_graphics();
 
         let font_sheet = self.font_sheet.read();
         let mapper = font_sheet.mapper();
         let sizer = font_sheet.sizer();
-        let screen_size = self.target.dimensions();
+        let screen_size = self.target.extent();
         let screen_scale = glm::vec2(
             // 2.0 because Vulkan screen coords go from -1.0 to 1.0
-            2.0 / screen_size.width() as f32,
-            2.0 / screen_size.height() as f32,
+            2.0 / screen_size.x as f32,
+            2.0 / screen_size.y as f32,
         );
 
         let glyphs = buffer.into_iter()
@@ -481,7 +492,7 @@ impl FontRenderer for FontSheetRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.font_sampler.descriptor_set(),
+                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, (
                 self.glyph_buffer.clone(),

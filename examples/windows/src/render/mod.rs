@@ -1,52 +1,11 @@
 use std::fmt::Debug;
-use std::sync::Arc;
 
 use glm::{identity, TMat4, TVec3};
-use gtether::render::RenderTarget;
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::graphics::vertex_input::Vertex;
+use vulkano::buffer::BufferContents;
 
 pub mod cube;
 pub mod ambient;
 pub mod directional;
-
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-pub struct FlatVertex {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
-}
-
-impl FlatVertex {
-    #[inline]
-    fn square() -> [FlatVertex; 6] {
-        [
-            FlatVertex { position: [ -1.0, -1.0] },
-            FlatVertex { position: [ -1.0,  1.0] },
-            FlatVertex { position: [  1.0,  1.0] },
-            FlatVertex { position: [ -1.0, -1.0] },
-            FlatVertex { position: [  1.0,  1.0] },
-            FlatVertex { position: [  1.0, -1.0] },
-        ]
-    }
-
-    #[inline]
-    fn screen_buffer(target: &Arc<dyn RenderTarget>) -> Subbuffer<[Self]> {
-        Buffer::from_iter(
-            target.device().memory_allocator().clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            Self::square(),
-        ).unwrap()
-    }
-}
 
 #[derive(BufferContents, Debug, Clone)]
 #[repr(C)]

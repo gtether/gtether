@@ -105,4 +105,43 @@ release-example-windows:
   artifacts:
     expose_as: "example-windows"
     paths:
-      - "target/${TARGET}/release/${BIN_NAME}"
+      - "target/x86_64-unknown-linux-gnu/release/windows"
+      - "target/x86_64-pc-windows-gnu/release/windows.exe"
+
+release-example-reversi:
+  extends:
+    - .build-jobs
+  stage: release
+  parallel:
+    matrix:
+      - TARGET:
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-gnu
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != 'merge_request_event'
+      when: never
+    - if: $TARGET == "x86_64-unknown-linux-gnu"
+      variables:
+        BIN_NAME: reversi
+    - if: $TARGET == "x86_64-pc-windows-gnu"
+      variables:
+        BIN_NAME: reversi.exe
+  needs:
+    - job: build-gtether
+      parallel:
+        matrix:
+          - TARGET:
+              - x86_64-unknown-linux-gnu
+              - x86_64-pc-windows-gnu
+  script:
+    - cargo build --package reversi --release --target $TARGET
+  cache:
+    key: "${CI_COMMIT_REF_NAME}-${TARGET}"
+    policy: pull
+    paths:
+      - "target/"
+  artifacts:
+    expose_as: "example-reversi"
+    paths:
+      - "target/x86_64-unknown-linux-gnu/release/reversi"
+      - "target/x86_64-pc-windows-gnu/release/reversi.exe"

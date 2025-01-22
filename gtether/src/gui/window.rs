@@ -6,7 +6,6 @@ use tracing::{event, Level};
 
 use ump::Error;
 use vulkano::swapchain::Surface;
-use winit::dpi::PhysicalSize;
 use winit::error::ExternalError;
 use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -15,7 +14,7 @@ use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 use crate::gui::input::{InputEvent, InputState};
 use crate::render::render_pass::NoOpEngineRenderPass;
 use crate::render::Renderer;
-use crate::render::{Device, Dimensions, Instance, RenderTarget, RendererHandle};
+use crate::render::{Device, Instance, RenderTarget, RendererHandle};
 use crate::{EngineMetadata, NonExhaustive};
 
 pub use winit::window::WindowAttributes;
@@ -57,17 +56,15 @@ impl fmt::Debug for WindowRenderTarget {
     }
 }
 
-impl From<PhysicalSize<u32>> for Dimensions {
-    #[inline]
-    fn from(value: PhysicalSize<u32>) -> Self { Dimensions([value.width, value.height]) }
-}
-
 impl RenderTarget for WindowRenderTarget {
     #[inline]
     fn surface(&self) -> &Arc<Surface> { &self.surface }
 
     #[inline]
-    fn dimensions(&self) -> Dimensions { self.winit_window.inner_size().into() }
+    fn extent(&self) -> glm::TVec2<u32> {
+        let physical_size = self.winit_window.inner_size();
+        glm::vec2(physical_size.width, physical_size.height)
+    }
 
     #[inline]
     fn scale_factor(&self) -> f64 { self.winit_window.scale_factor() }
@@ -419,6 +416,7 @@ impl WindowManager {
         } else {
             if let Some(entry) = self.windows.get(&window_id) {
                 entry.window_handle.handle_event(WindowEventRequest::Window(event)).unwrap_or_else(|err| {
+                    // TODO: Handle ServerDisappeared error, as window needs to be force closed
                     event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
                     self.windows.remove(&window_id);
                 });
@@ -430,6 +428,7 @@ impl WindowManager {
         let mut invalid_window_ids = vec![];
         for (window_id, entry) in &self.windows {
             entry.window_handle.handle_event(WindowEventRequest::Device(event.clone())).unwrap_or_else(|err| {
+                // TODO: Handle ServerDisappeared error, as window needs to be force closed
                 event!(Level::ERROR, "Window {window_id:?} errored when handling event ({err:?}), dropping");
                 invalid_window_ids.push(window_id.clone());
             })

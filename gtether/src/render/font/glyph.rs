@@ -16,6 +16,8 @@ use crate::render::font::{CharImgData, Font};
 use crate::render::{RendererEventType, RendererHandle};
 use crate::render::font::size::{FontSizer, ScaledFontSize};
 use crate::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+use crate::resource::manager::ResourceManager;
+use crate::resource::path::ResourcePath;
 
 /// A glyph based font.
 ///
@@ -237,7 +239,12 @@ impl GlyphFontLoader {
 
 #[async_trait]
 impl ResourceLoader<dyn Font> for GlyphFontLoader {
-    async fn load(&self, mut data: ResourceReadData) -> Result<Box<dyn Font>, ResourceLoadError> {
+    async fn load(
+        &self,
+        _manager: &Arc<ResourceManager>,
+        _id: ResourcePath,
+        mut data: ResourceReadData,
+    ) -> Result<Box<dyn Font>, ResourceLoadError> {
         let mut buffer = Vec::new();
         data.read_to_end(&mut buffer).await
             .map_err(ResourceLoadError::from_error)?;
@@ -246,10 +253,16 @@ impl ResourceLoader<dyn Font> for GlyphFontLoader {
             .map_err(ResourceLoadError::from_error)
     }
 
-    async fn update(&self, resource: ResourceMut<dyn Font>, data: ResourceReadData)
+    async fn update(
+        &self,
+        manager: &Arc<ResourceManager>,
+        id: ResourcePath,
+        resource: ResourceMut<dyn Font>,
+        data: ResourceReadData,
+    )
                     -> Result<(), ResourceLoadError>
     {
-        let new_value = self.load(data).await?;
+        let new_value = self.load(manager, id, data).await?;
         self.renderer.event_bus().register_once(RendererEventType::PostRender, move |_| {
             resource.replace(new_value);
         }).wait().await

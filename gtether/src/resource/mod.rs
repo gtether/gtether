@@ -32,7 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::resource::manager::ResourceLoadResult;
+use crate::resource::manager::{ResourceLoadResult, ResourceManager};
 use crate::resource::path::ResourcePath;
 
 pub mod manager;
@@ -65,7 +65,7 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
                         // lock is acquired is when the update lock is held, which it should be
                         // while in this scope.
                         let parent_value = parent.read();
-                        let (resource_mut, drop_checker) = ResourceMut::from_resource(id.clone(), resource.clone());
+                        let (resource_mut, drop_checker) = ResourceMut::from_resource(resource.clone());
                         async_loader.update(resource_mut, &parent_value).await?;
                         match drop_checker.recv().await {
                             Ok(_) => { debug!("Drop-checker received an unexpected message"); }
@@ -275,13 +275,15 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
 /// Mutable handle for a [Resource].
 ///
 /// Mutable handles are created internally, and generally only accessible during resource update
-/// logic. They have an associated [id][rp], since they represent a resource that is currently
-/// [managed][rm].
+/// logic. They _can_ be stored beyond update methods, but doing so holds the update lock for the
+/// Resource, preventing further updates. It is only recommended to store a ResourceMut for very
+/// temporary periods, such as when syncing an update to a particular point in a system loop.
+///
+/// The update lock is dropped when the ResourceMut is dropped.
 ///
 /// [id]: ResourcePath
 /// [rm]: manager::ResourceManager
 pub struct ResourceMut<T: ?Sized + Send + Sync + 'static> {
-    id: ResourcePath,
     inner: Arc<Resource<T>>,
     #[allow(dead_code)] // This is simply being held for the duration of this struct
     drop_notice: smol::channel::Sender<()>,
@@ -292,23 +294,13 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceMut<T> {
     //  mutable access like this is only allowed within this module for inner mechanisms.
     #[inline]
     pub(in crate::resource) fn from_resource(
-        id: ResourcePath,
         resource: Arc<Resource<T>>
     ) -> (Self, smol::channel::Receiver<()>) {
         let (drop_notice, drop_checker) = smol::channel::bounded(1);
         (Self {
-            id,
             inner: resource,
             drop_notice,
         }, drop_checker)
-    }
-
-    /// The [id][rp] associated with this mutable handle.
-    ///
-    /// [id]: ResourcePath
-    #[inline]
-    pub fn id(&self) -> &ResourcePath {
-        &self.id
     }
 
     /// The underlying read-only [Resource] handle.
@@ -380,6 +372,20 @@ impl ResourceLoadError {
     }
 }
 
+impl<'a> From<&'a str> for ResourceLoadError {
+    #[inline]
+    fn from(value: &'a str) -> Self {
+        Self::ReadError(Box::<dyn Error + Send + Sync>::from(value).into())
+    }
+}
+
+impl From<String> for ResourceLoadError {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self::ReadError(Box::<dyn Error + Send + Sync>::from(value).into())
+    }
+}
+
 impl Display for ResourceLoadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -412,15 +418,18 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 ///
 /// # Examples
 /// ```
+/// use std::sync::Arc;
 /// use async_trait::async_trait;
 /// use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 /// use smol::prelude::*;
+/// use gtether::resource::manager::ResourceManager;
+/// use gtether::resource::path::ResourcePath;
 ///
 /// struct StringLoader {}
 ///
 /// #[async_trait]
 /// impl ResourceLoader<String> for StringLoader {
-///     async fn load(&self, mut data: ResourceReadData) -> Result<Box<String>, ResourceLoadError> {
+///     async fn load(&self, manager: &Arc<ResourceManager>, id: ResourcePath, mut data: ResourceReadData) -> Result<Box<String>, ResourceLoadError> {
 ///         let mut output = String::new();
 ///         data.read_to_string(&mut output).await
 ///             .map_err(ResourceLoadError::from_error)
@@ -439,7 +448,12 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
     /// Load and create a value from [raw data][rd].
     ///
     /// [rd]: ResourceReadData
-    async fn load(&self, data: ResourceReadData) -> Result<Box<T>, ResourceLoadError>;
+    async fn load(
+        &self,
+        manager: &Arc<ResourceManager>,
+        id: ResourcePath,
+        data: ResourceReadData,
+    ) -> Result<Box<T>, ResourceLoadError>;
 
     /// Given a [mutable resource handle][rm], load and update a resource from [raw data][rd].
     ///
@@ -448,10 +462,16 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
     ///
     /// [rm]: ResourceMut
     /// [rd]: ResourceReadData
-    async fn update(&self, resource: ResourceMut<T>, data: ResourceReadData)
+    async fn update(
+        &self,
+        manager: &Arc<ResourceManager>,
+        id: ResourcePath,
+        resource: ResourceMut<T>,
+        data: ResourceReadData,
+    )
         -> Result<(), ResourceLoadError>
     {
-        resource.replace(self.load(data).await?);
+        resource.replace(self.load(manager, id, data).await?);
         Ok(())
     }
 }
@@ -577,8 +597,8 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         value.attach_sub_resource_blocking(SubStringLoader::err())
@@ -590,8 +610,8 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
@@ -608,8 +628,8 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         let sub_value_1 = value.attach_sub_resource_blocking(SubStringLoader::no_update("subvalue1"))
@@ -631,8 +651,8 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::default(), LoadPriority::Immediate);
-        let value = future::block_on(timeout(fut.wait(), Duration::from_secs(1)))
+        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
         let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))

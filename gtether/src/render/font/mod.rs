@@ -36,7 +36,7 @@
 //!     "my_font",
 //!     GlyphFontLoader::new(renderer.clone()),
 //!     LoadPriority::Immediate
-//! ).wait_blocking().unwrap();
+//! ).wait().unwrap();
 //!
 //! let font_sheet = FontSheet::from_font(
 //!     &font,
@@ -59,11 +59,13 @@
 //! # use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 //! # use gtether::render::font::compositor::FontCompositor;
 //! # use gtether::render::font::layout::TextLayout;
+//! # use gtether::render::swapchain::Framebuffer;
 //! # let text_layout: TextLayout = return;
 //! # let font_compositor: FontCompositor = return;
 //! # let command_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> = return;
+//! # let frame: &Framebuffer = return;
 //! #
-//! let mut pass = font_compositor.begin_pass(command_builder);
+//! let mut pass = font_compositor.begin_pass(command_builder, frame);
 //! pass.layout(&text_layout);
 //! pass.end_pass();
 //! ```

@@ -9,6 +9,7 @@ edition = "2021"
 graphics = [
     "dep:ab_glyph",
     "dep:image",
+    "dep:tobj",
     "dep:vulkano",
     "dep:vulkano-shaders",
 ]
@@ -16,17 +17,23 @@ gui = ["graphics", "dep:winit"]
 
 [dependencies]
 ab_glyph = { workspace = true, optional = true }
+ahash = { workspace = true }
+arrayvec = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bytemuck = { workspace = true }
 chrono = { workspace = true }
 image = { workspace = true, optional = true }
+itertools = { workspace = true }
 nalgebra-glm = { workspace = true }
 parking_lot = { workspace = true }
 ringbuf = { workspace = true }
 sha2 = { workspace = true }
 shlex = { workspace = true }
+smallvec = { workspace = true }
 smol = { workspace = true }
 strum = { workspace = true }
+tobj = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 vulkano = { workspace = true, optional = true }

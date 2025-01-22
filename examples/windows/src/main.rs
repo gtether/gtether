@@ -26,9 +26,9 @@ use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
 use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
 
-use crate::render::ambient::{AmbientLight, AmbientRendererRefs};
-use crate::render::cube::CubeRendererRefs;
-use crate::render::directional::{DirectionalRendererRefs, PointLight};
+use crate::render::ambient::{AmbientLight, AmbientRendererBootstrap};
+use crate::render::cube::CubeRendererBootstrap;
+use crate::render::directional::{DirectionalRendererBootstrap, PointLight};
 use crate::render::{MN, VP};
 
 mod render;
@@ -56,11 +56,11 @@ impl Command for AmbientLightCommand {
 }
 
 #[derive(Debug)]
-struct PointLightListCommand {
-    point_lights: Arc<UniformSet<PointLight>>,
+struct PointLightListCommand<const CAP: usize> {
+    point_lights: Arc<UniformSet<PointLight, CAP>>,
 }
 
-impl Command for PointLightListCommand {
+impl<const CAP: usize> Command for PointLightListCommand<CAP> {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
 
@@ -73,11 +73,11 @@ impl Command for PointLightListCommand {
 }
 
 #[derive(Debug)]
-struct PointLightDeleteCommand {
-    point_lights: Arc<UniformSet<PointLight>>,
+struct PointLightDeleteCommand<const CAP: usize> {
+    point_lights: Arc<UniformSet<PointLight, CAP>>,
 }
 
-impl Command for PointLightDeleteCommand {
+impl<const CAP: usize> Command for PointLightDeleteCommand<CAP> {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         ParamCountCheck::Equal(1).check(parameters.len() as u32)?;
 
@@ -97,11 +97,11 @@ impl Command for PointLightDeleteCommand {
 }
 
 #[derive(Debug)]
-struct PointLightAddCommand {
-    point_lights: Arc<UniformSet<PointLight>>,
+struct PointLightAddCommand<const CAP: usize> {
+    point_lights: Arc<UniformSet<PointLight, CAP>>,
 }
 
-impl Command for PointLightAddCommand {
+impl<const CAP: usize> Command for PointLightAddCommand<CAP> {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         ParamCountCheck::OneOf(vec![
             ParamCountCheck::Equal(3),
@@ -128,10 +128,10 @@ impl Command for PointLightAddCommand {
         }
 
         let mut point_lights = self.point_lights.write();
-        point_lights.push(PointLight {
+        point_lights.try_push(PointLight {
             position: [x, y, z, 1.0],
             color: [r, g, b],
-        });
+        }).map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
 
         Ok(())
     }
@@ -250,53 +250,63 @@ impl Application for WindowsApp {
         });
         //window.set_cursor_visible(false);
 
-        let cube_renderer = CubeRendererRefs::new();
-        let ambient_renderer = AmbientRendererRefs::new();
-        let directional_renderer = DirectionalRendererRefs::new();
+        let target = window.renderer().target();
+
+        let cube_renderer = CubeRendererBootstrap::new(target);
+        let ambient_renderer = AmbientRendererBootstrap::new(target);
+        let directional_renderer = DirectionalRendererBootstrap::new(
+            target,
+            vec![
+                PointLight {
+                    position: [-4.0, -4.0, 0.0, 1.0],
+                    color: [0.8, 0.8, 0.8],
+                },
+            ]
+        );
 
         let console_font = engine.resources().get_or_load(
             "console_font",
             GlyphFontLoader::new(window.renderer().clone()),
             LoadPriority::Immediate,
-        ).wait_blocking().unwrap();
+        ).wait().unwrap();
         let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)
             .font(console_font)
             .build().unwrap();
 
         let render_pass = EngineRenderPassBuilder::new(window.renderer())
-            .attachment("color".into(), AttachmentDescription {
+            .attachment("color", AttachmentDescription {
                 format: Format::A2B10G10R10_UNORM_PACK32,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
-            }, Some([0.0, 0.0, 0.0, 1.0].into()))
-            .attachment("normals".into(), AttachmentDescription {
+            }, Some([0.0, 0.0, 0.0, 1.0]))
+            .attachment("normals", AttachmentDescription {
                 format: Format::R16G16B16A16_SFLOAT,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
-            }, Some([0.0, 0.0, 0.0, 1.0].into()))
-            .attachment("depth".into(), AttachmentDescription {
+            }, Some([0.0, 0.0, 0.0, 1.0]))
+            .attachment("depth", AttachmentDescription {
                 format: Format::D16_UNORM,
                 samples: SampleCount::Sample1,
                 load_op: AttachmentLoadOp::Clear,
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
-            }, Some(1.0.into()))
-            .final_color_attachment("final_color".into(), [0.0, 0.0, 0.0, 1.0].into())
+            }, Some(1.0))
+            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0])
             .begin_subpass()
-                .color_attachment("color".into())
-                .color_attachment("normals".into())
-                .depth_stencil_attachment("depth".into())
+                .color_attachment("color")
+                .color_attachment("normals")
+                .depth_stencil_attachment("depth")
                 .handler(cube_renderer.bootstrap())
             .end_subpass()
             .begin_subpass()
-                .input_attachment("color".into())
-                .input_attachment("normals".into())
-                .color_attachment("final_color".into())
+                .input_attachment("color")
+                .input_attachment("normals")
+                .color_attachment("final_color")
                 .handler(ambient_renderer.bootstrap())
                 .handler(directional_renderer.bootstrap())
                 .handler(console_gui.bootstrap_renderer())
@@ -318,13 +328,6 @@ impl Application for WindowsApp {
         })).unwrap();
 
         let point_lights = directional_renderer.lights().clone();
-        *point_lights.write() = vec![
-            PointLight {
-                position: [-4.0, -4.0, 0.0, 1.0],
-                color: [0.8, 0.8, 0.8],
-            },
-        ];
-
         let mut point_light_subcommands = CommandTree::default();
         point_light_subcommands.register_command("list", Box::new(PointLightListCommand {
             point_lights: point_lights.clone()

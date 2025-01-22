@@ -1,13 +1,15 @@
-use std::sync::{Arc, OnceLock};
-
-use gtether::render::attachment::{AttachmentMap, AttachmentSet};
-use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource};
+use bytemuck::NoUninit;
+use gtether::render::attachment::{AttachmentDescriptor, AttachmentMap};
+use gtether::render::descriptor_set::EngineDescriptorSet;
+use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::UniformSet;
-use gtether::render::RendererHandle;
+use gtether::render::{FlatVertex, RenderTarget, RendererHandle};
+use std::sync::Arc;
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+use vulkano::descriptor_set::layout::DescriptorType;
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -17,8 +19,6 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
-
-use crate::render::FlatVertex;
 
 mod directional_vert {
     vulkano_shaders::shader! {
@@ -34,7 +34,7 @@ mod directional_frag {
     }
 }
 
-#[derive(BufferContents, Default, Debug, Clone)]
+#[derive(BufferContents, NoUninit, Default, Debug, Clone, Copy)]
 #[repr(C)]
 pub struct PointLight {
     pub position: [f32; 4],
@@ -44,12 +44,16 @@ pub struct PointLight {
 pub struct DirectionalRenderer {
     graphics: Arc<EngineGraphicsPipeline>,
     screen_buffer: Subbuffer<[FlatVertex]>,
-    attachments: Arc<AttachmentSet>,
-    lights: Arc<UniformSet<PointLight>>,
+    descriptor_set: EngineDescriptorSet,
 }
 
 impl DirectionalRenderer {
-    fn new(renderer: &RendererHandle, subpass: &Subpass, attachments: &Arc<dyn AttachmentMap>) -> Self {
+    fn new(
+        renderer: &RendererHandle,
+        subpass: &Subpass,
+        attachments: &Arc<dyn AttachmentMap>,
+        lights: Arc<UniformSet<PointLight, 8>>,
+    ) -> Self {
         let target = renderer.target();
 
         let directional_vert = directional_vert::load(target.device().vk_device().clone())
@@ -69,12 +73,19 @@ impl DirectionalRenderer {
             PipelineShaderStageCreateInfo::new(directional_frag),
         ];
 
-        let layout = PipelineLayout::new(
-            target.device().vk_device().clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(target.device().vk_device().clone())
-                .unwrap(),
-        ).unwrap();
+        let layout = {
+            let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+            layout_create_info.set_layouts[0].bindings
+                .get_mut(&2).unwrap()
+                .descriptor_type = DescriptorType::UniformBufferDynamic;
+            PipelineLayout::new(
+                target.device().vk_device().clone(),
+                layout_create_info
+                    .into_pipeline_layout_create_info(target.device().vk_device().clone())
+                    .unwrap(),
+            ).unwrap()
+        };
+        let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
 
         let create_info = GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
@@ -106,28 +117,26 @@ impl DirectionalRenderer {
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
+            ViewportType::TopLeft,
         );
 
-        let attachments = AttachmentSet::new(
-            renderer,
-            graphics.clone(),
-            attachments.clone(),
-            vec!["color".into(), "normals".into()],
-            0,
-        );
-
-        let lights = UniformSet::new(
-            vec![],
-            renderer,
-            graphics.clone(),
-            1,
-        );
+        let descriptor_set = EngineDescriptorSet::builder(target)
+            .layout(descriptor_layout)
+            .descriptor_source(0, Arc::new(AttachmentDescriptor::new(
+                attachments.clone(),
+                "color",
+            )))
+            .descriptor_source(1, Arc::new(AttachmentDescriptor::new(
+                attachments.clone(),
+                "normals",
+            )))
+            .descriptor_source(2, lights)
+            .build().unwrap();
 
         Self {
             graphics,
-            screen_buffer: FlatVertex::screen_buffer(target),
-            attachments,
-            lights,
+            screen_buffer: FlatVertex::screen_buffer(target.device().memory_allocator().clone()),
+            descriptor_set,
         }
     }
 }
@@ -136,49 +145,49 @@ impl EngineRenderHandler for DirectionalRenderer {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         let graphics = self.graphics.vk_graphics();
 
-        for light_descriptor_set in self.lights.descriptor_sets() {
+        builder
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap();
+
+        let descriptor_sets = self.descriptor_set
+            .descriptor_set_with_offsets(frame.index())
+            .unwrap();
+        for descriptor_set in descriptor_sets {
             builder
-                .bind_pipeline_graphics(graphics.clone()).unwrap()
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     graphics.layout().clone(),
                     0,
-                    (
-                        self.attachments.descriptor_set(frame.index()).unwrap().clone(),
-                        light_descriptor_set.clone(),
-                    ),
+                    descriptor_set,
                 ).unwrap()
-                .bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap()
                 .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
         }
     }
 }
 
-#[derive(Default)]
-pub struct DirectionalRendererRefs {
-    lights: OnceLock<Arc<UniformSet<PointLight>>>
+pub struct DirectionalRendererBootstrap {
+    lights: Arc<UniformSet<PointLight, 8>>
 }
 
-impl DirectionalRendererRefs {
+impl DirectionalRendererBootstrap {
     #[inline]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new(target: &Arc<dyn RenderTarget>, lights: impl IntoIterator<Item=PointLight>) -> Arc<Self> {
+        Arc::new(Self {
+            lights: Arc::new(UniformSet::new(
+                target,
+                lights,
+            ).unwrap()),
+        })
     }
 
-    pub fn bootstrap(self: &Arc<DirectionalRendererRefs>)
+    pub fn bootstrap(self: &Arc<DirectionalRendererBootstrap>)
             -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> DirectionalRenderer {
         let self_clone = self.clone();
         move |renderer, subpass, attachments| {
-            let directional_renderer = DirectionalRenderer::new(renderer, subpass, attachments);
-            self_clone.lights.set(directional_renderer.lights.clone())
-                .expect(".bootstrap() should not be called twice");
-            directional_renderer
+            DirectionalRenderer::new(renderer, subpass, attachments, self_clone.lights.clone())
         }
     }
 
     #[inline]
-    pub fn lights(&self) -> &Arc<UniformSet<PointLight>> {
-        self.lights.get()
-            .expect("DirectionalRenderer not yet created")
-    }
+    pub fn lights(&self) -> &Arc<UniformSet<PointLight, 8>> { &self.lights }
 }
