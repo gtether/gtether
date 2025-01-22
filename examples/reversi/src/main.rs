@@ -4,7 +4,7 @@ use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::console::Console;
 use gtether::event::Event;
-use gtether::gui::input::{InputDelegate, InputDelegateEvent, MouseButton};
+use gtether::gui::input::InputDelegate;
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::model::obj::ModelObjLoader;
@@ -19,7 +19,6 @@ use std::cell::OnceCell;
 use std::sync::Arc;
 use std::time::Duration;
 use parry3d::na::Point3;
-use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -180,22 +179,7 @@ impl Application for ReversiApp {
     }
 
     fn tick(&self, _engine: &Engine<Self>, _delta: Duration) {
-        for event in self.input.get().unwrap().events() {
-            match event {
-                InputDelegateEvent::MouseButton(event) => {
-                    match event.button {
-                        MouseButton::Left => {
-                            let board = self.board.get().unwrap();
-                            let board_state = board.state();
-                            let tile = board_state.selected_tile();
-                            info!(?tile)
-                        },
-                        _ => {}
-                    }
-                },
-                _ => {}
-            }
-        }
+        /* noop */
     }
 }
 

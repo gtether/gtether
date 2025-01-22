@@ -17,7 +17,7 @@ use tracing::{debug, debug_span, info};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -28,6 +28,7 @@ use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
 use gtether::gui::input::{ElementState, InputDelegate, InputDelegateEvent, MouseButton};
+
 use crate::player::Player;
 use crate::render_util::{Camera, ModelTransform, MN, VP};
 
@@ -376,8 +377,8 @@ impl Board {
 struct TileInstance {
     #[format(R32G32B32_SFLOAT)]
     offset: glm::TVec3<f32>,
-    #[format(R32G32B32_SFLOAT)]
-    color: glm::TVec3<f32>,
+    #[format(R32G32B32A32_SFLOAT)]
+    color: glm::TVec4<f32>,
 }
 
 mod board_vert {
@@ -400,6 +401,7 @@ pub struct BoardRenderer {
     model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
     device: Arc<Device>,
     graphics: Arc<EngineGraphicsPipeline>,
+    selected_graphics: Arc<EngineGraphicsPipeline>,
     instances: Subbuffer<[TileInstance]>,
     descriptor_set: EngineDescriptorSet,
 }
@@ -462,18 +464,35 @@ impl BoardRenderer {
             ..GraphicsPipelineCreateInfo::layout(layout)
         };
 
+        let selected_create_info = GraphicsPipelineCreateInfo {
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend::alpha()),
+                    ..Default::default()
+                },
+            )),
+            ..create_info.clone()
+        };
+
         let graphics = EngineGraphicsPipeline::new(
             renderer,
             create_info,
             ViewportType::BottomLeft,
         );
 
+        let selected_graphics = EngineGraphicsPipeline::new(
+            renderer,
+            selected_create_info,
+            ViewportType::BottomLeft,
+        );
+
         let instances = board.state.read().tiles.iter()
             .map(|tile| {
                 let color = if (tile.pos.x + tile.pos.y) % 2 == 0 {
-                    glm::vec3(0.5, 0.5, 0.5)
+                    glm::vec4(0.5, 0.5, 0.5, 1.0)
                 } else {
-                    glm::vec3(0.8, 0.8, 0.8)
+                    glm::vec4(0.8, 0.8, 0.8, 1.0)
                 };
                 TileInstance {
                     offset: glm::vec3(tile.offset.x, 0.0, tile.offset.y),
@@ -508,6 +527,7 @@ impl BoardRenderer {
             model_piece,
             device: target.device().clone(),
             graphics,
+            selected_graphics,
             instances,
             descriptor_set,
         }
@@ -517,6 +537,7 @@ impl BoardRenderer {
 impl EngineRenderHandler for BoardRenderer {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         let graphics = self.graphics.vk_graphics();
+        let selected_graphics = self.selected_graphics.vk_graphics();
         let model_tile = self.model_tile.read();
         let model_piece = self.model_piece.read();
 
@@ -530,31 +551,39 @@ impl EngineRenderHandler for BoardRenderer {
             ).unwrap();
         model_tile.draw_instanced(builder, self.instances.clone()).unwrap();
 
-        let piece_instances = {
+        let (piece_instances, selected_instance) = {
             let board_state = self.board.state();
-            board_state.tiles.iter()
+            let pieces = board_state.tiles.iter()
                 .filter_map(|tile| {
                     if let Some(player_idx) = tile.owner {
                         let player = board_state.player(player_idx).unwrap();
+                        let color = player.color();
                         Some(TileInstance {
                             offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
-                            color: player.color(),
+                            color: glm::vec4(color.x, color.y, color.z, 1.0),
                         })
                     } else {
                         None
                     }
                 })
-                .chain(board_state.selected_tile().iter().filter_map(|tile| {
-                    if tile.owner.is_none() {
-                        Some(TileInstance {
-                            offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
-                            color: glm::vec3(0.2, 0.6, 0.8),
-                        })
-                    } else {
-                        None
-                    }
-                }))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+
+            let selected = if let Some(tile) = board_state.selected_tile() {
+                if tile.owner.is_none() {
+                    let player = board_state.current_player();
+                    let color = player.color();
+                    Some(TileInstance {
+                        offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
+                        color: glm::vec4(color.x, color.y, color.z, 0.75),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            (pieces, selected)
         };
 
         if piece_instances.len() > 0 {
@@ -573,6 +602,25 @@ impl EngineRenderHandler for BoardRenderer {
             ).unwrap();
 
             model_piece.draw_instanced(builder, piece_instance_buffer).unwrap();
+        }
+
+        if selected_instance.is_some() {
+            let selected_instance_buffer = Buffer::from_iter(
+                self.device.memory_allocator().clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                selected_instance,
+            ).unwrap();
+
+            builder.bind_pipeline_graphics(selected_graphics.clone()).unwrap();
+            model_piece.draw_instanced(builder, selected_instance_buffer).unwrap();
         }
     }
 }

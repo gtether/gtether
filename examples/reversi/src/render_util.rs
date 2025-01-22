@@ -255,7 +255,7 @@ impl DeferredLightingRenderer {
                         color_blend_op: BlendOp::Add,
                         src_alpha_blend_factor: BlendFactor::One,
                         dst_alpha_blend_factor: BlendFactor::One,
-                        alpha_blend_op: BlendOp::Max,
+                        alpha_blend_op: BlendOp::Min,
                     }),
                     ..Default::default()
                 },
