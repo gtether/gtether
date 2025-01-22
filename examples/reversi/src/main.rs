@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 extern crate nalgebra_glm as glm;
 
 use gtether::console::gui::ConsoleGui;
@@ -188,10 +190,13 @@ impl Application for ReversiApp {
 fn main() {
     let app = ReversiApp::new();
 
-    tracing_subscriber::fmt()
+    let subscriber_builder = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env()
             .add_directive(LevelFilter::WARN.into())
-            .add_directive("reversi=debug".parse().unwrap()))
+            .add_directive("reversi=debug".parse().unwrap()));
+    #[cfg(not(debug_assertions))]
+    let subscriber_builder = subscriber_builder.with_writer(std::io::sink);
+    subscriber_builder
         .finish()
         .with(ConsoleLogLayer::new(app.console.log()))
         .init();
