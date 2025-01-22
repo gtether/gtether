@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use parking_lot::{RwLock, RwLockReadGuard};
 use parry3d::bounding_volume::Aabb;
+use tracing::{debug, debug_span, info};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -49,6 +50,70 @@ impl Tile {
             offset,
             aabb,
             owner: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Direction {
+    #[inline]
+    pub fn offset(&self) -> glm::TVec2<i64> {
+        match self {
+            Self::Up => glm::vec2(0, 1),
+            Self::Down => glm::vec2(0, -1),
+            Self::Left => glm::vec2(-1, 0),
+            Self::Right => glm::vec2(1, 0),
+        }
+    }
+
+    #[inline]
+    pub fn all() -> [Direction; 4] {
+        [
+            Self::Up,
+            Self::Down,
+            Self::Left,
+            Self::Right,
+        ]
+    }
+
+    #[inline]
+    pub fn iter(self, current_pos: glm::TVec2<usize>, size: glm::TVec2<usize>) -> DirectionIter {
+        DirectionIter {
+            direction: self,
+            current_pos,
+            size,
+        }
+    }
+}
+
+pub struct DirectionIter {
+    direction: Direction,
+    current_pos: glm::TVec2<usize>,
+    size: glm::TVec2<usize>,
+}
+
+impl Iterator for DirectionIter {
+    type Item = glm::TVec2<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_pos.x < (self.size.x - 1) && self.current_pos.y < (self.size.y - 1) {
+            let new_pos = self.current_pos.cast::<i64>() + self.direction.offset();
+            if new_pos.x < 0 || new_pos.y < 0 {
+                None
+            } else {
+                self.current_pos = (self.current_pos.cast::<i64>() + self.direction.offset())
+                    .try_cast::<usize>()?;
+                Some(self.current_pos)
+            }
+        } else {
+            None
         }
     }
 }
@@ -130,6 +195,84 @@ impl BoardState {
         if self.current_player_idx >= self.players.len() {
             self.current_player_idx = 0;
         }
+        info!(player = ?self.current_player(), "Next player's turn");
+    }
+
+    fn valid_for_flip(&self, start_pos: glm::TVec2<usize>, direction: Direction, player_idx: usize) -> bool {
+        for current_pos in direction.iter(start_pos, self.size) {
+            if let Some(tile) = self.tile(current_pos) {
+                if let Some(owner) = tile.owner {
+                    if owner == player_idx {
+                        // Found same owner, all tiles in-between are valid for flipping
+                        return true;
+                    } // Else it's some other owned tile, continue searching
+                } else {
+                    // Found unowned space, not valid for a flip
+                    return false;
+                }
+            } else {
+                // Hit edge of board, not valid for a flip
+                return false;
+            }
+        }
+        // Hit edge of board, not valid for a flip
+        false
+    }
+
+    fn flip(&mut self, start_pos: glm::TVec2<usize>, direction: Direction, player_idx: usize) {
+        for current_pos in direction.iter(start_pos, self.size) {
+            if let Some(tile) = self.tile_mut(current_pos) {
+                if let Some(owner) = tile.owner {
+                    if owner == player_idx {
+                        // Found same owner, reached end of flipping
+                        return;
+                    } else {
+                        tile.owner = Some(player_idx);
+                    }
+                } else {
+                    // No owner, stop flipping
+                    return;
+                }
+            } else {
+                // Hit edge of board, stop flipping
+                return;
+            }
+        }
+    }
+
+    pub fn set(&mut self, pos: glm::TVec2<usize>, player_idx: usize) -> bool {
+        let _player_span = debug_span!("set_tile", center_pos = ?pos, ?player_idx);
+
+        if player_idx >= self.players.len() {
+            return false;
+        }
+
+        if let Some(tile) = self.tile_mut(pos) {
+            tile.owner = Some(player_idx);
+        } else {
+            return false;
+        }
+
+        for direction in Direction::all() {
+            let _direction_span = debug_span!("direction", ?direction);
+            if self.valid_for_flip(pos, direction, player_idx) {
+                info!("Flipping");
+                self.flip(pos, direction, player_idx);
+            } else {
+                debug!("Flip is NOT valid");
+            }
+        }
+
+        true
+    }
+
+    #[inline]
+    pub fn place(&mut self, pos: glm::TVec2<usize>, player_idx: usize) -> bool {
+        if self.tile(pos).iter().any(|tile| tile.owner.is_none()) {
+            self.set(pos, player_idx)
+        } else {
+            false
+        }
     }
 }
 
@@ -187,9 +330,8 @@ impl Board {
                     if event.button == MouseButton::Left && event.state == ElementState::Pressed {
                         let mut state = input_board.state.write();
                         let current_player_idx = state.current_player_idx;
-                        if let Some(tile) = state.selected_tile_mut() {
-                            if tile.owner.is_none() {
-                                tile.owner = Some(current_player_idx);
+                        if let Some(selected_pos) = state.selected_pos {
+                            if state.place(selected_pos, current_player_idx) {
                                 state.next_player();
                             }
                         }
