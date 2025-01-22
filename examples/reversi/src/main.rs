@@ -29,10 +29,12 @@ use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
 use crate::board::Board;
+use crate::player::Player;
 use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight};
 
 mod board;
 mod render_util;
+mod player;
 
 struct ReversiApp {
     console: Arc<Console>,
@@ -82,15 +84,15 @@ impl Application for ReversiApp {
 
         let transform = Arc::new(Uniform::new(
             window.renderer().target(),
-            ModelTransform::default(),
+            ModelTransform::new(),
         ).unwrap());
 
         let camera = Arc::new(Uniform::new(
             window.renderer().target(),
             Camera::new(
                 window.renderer().target(),
-                &Point3::new(0.0, 6.0, -3.0),
-                &Point3::new(0.0, 0.0, 0.0),
+                &Point3::new(0.0, 5.0, -2.0),
+                &Point3::new(0.0, 0.0, -0.5),
                 &glm::vec3(0.0, 1.0, 0.0),
             ),
         ).unwrap());
@@ -108,6 +110,10 @@ impl Application for ReversiApp {
             window.input_state().create_delegate(),
             transform.clone(),
             camera.clone(),
+            vec![
+                Player::new("Player1", glm::vec3(0.95, 0.95, 0.95)),
+                Player::new("Player2", glm::vec3(0.05, 0.05, 0.05)),
+            ],
             glm::vec2(8, 8),
         );
 
@@ -180,7 +186,8 @@ impl Application for ReversiApp {
                     match event.button {
                         MouseButton::Left => {
                             let board = self.board.get().unwrap();
-                            let tile = board.selected_tile();
+                            let board_state = board.state();
+                            let tile = board_state.selected_tile();
                             info!(?tile)
                         },
                         _ => {}

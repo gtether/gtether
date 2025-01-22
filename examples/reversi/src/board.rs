@@ -11,7 +11,7 @@ use parry3d::na::Point3;
 use parry3d::query::{Ray, RayCast};
 use std::sync::Arc;
 use std::thread;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use parry3d::bounding_volume::Aabb;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
@@ -26,7 +26,8 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
-use gtether::gui::input::{InputDelegate, InputDelegateEvent};
+use gtether::gui::input::{ElementState, InputDelegate, InputDelegateEvent, MouseButton};
+use crate::player::Player;
 use crate::render_util::{Camera, ModelTransform, MN, VP};
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ pub struct Tile {
     pos: glm::TVec2<usize>,
     offset: glm::TVec2<f32>,
     aabb: Aabb,
+    owner: Option<usize>,
 }
 
 impl Tile {
@@ -46,26 +48,22 @@ impl Tile {
             pos,
             offset,
             aabb,
+            owner: None,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct Board {
-    transform: Arc<Uniform<MN, ModelTransform>>,
-    camera: Arc<Uniform<VP, Camera>>,
+pub struct BoardState {
     size: glm::TVec2<usize>,
     tiles: Vec<Tile>,
-    selected_pos: RwLock<Option<glm::TVec2<usize>>>,
+    selected_pos: Option<glm::TVec2<usize>>,
+    players: Vec<Player>,
+    current_player_idx: usize,
 }
 
-impl Board {
-    pub fn new(
-        input: InputDelegate,
-        transform: Arc<Uniform<MN, ModelTransform>>,
-        camera: Arc<Uniform<VP, Camera>>,
-        size: glm::TVec2<usize>,
-    ) -> Arc<Self> {
+impl BoardState {
+    fn new(size: glm::TVec2<usize>, players: Vec<Player>) -> Self {
         let base_offset = glm::vec2(
             -(size.x as f32 / 2.0),
             -(size.y as f32 / 2.0),
@@ -79,12 +77,81 @@ impl Board {
             })
         }).flatten().collect::<Vec<_>>();
 
+        Self {
+            size,
+            tiles,
+            selected_pos: None,
+            players,
+            current_player_idx: 0,
+        }
+    }
+
+    #[inline]
+    pub fn tile(&self, pos: glm::TVec2<usize>) -> Option<&Tile> {
+        self.tiles.get(pos.x + (pos.y * self.size.x))
+    }
+
+    #[inline]
+    pub fn tile_mut(&mut self, pos: glm::TVec2<usize>) -> Option<&mut Tile> {
+        self.tiles.get_mut(pos.x + (pos.y * self.size.x))
+    }
+
+    #[inline]
+    pub fn selected_tile(&self) -> Option<&Tile> {
+        if let Some(selected_pos) = self.selected_pos {
+            self.tile(selected_pos)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn selected_tile_mut(&mut self) -> Option<&mut Tile> {
+        if let Some(selected_pos) = self.selected_pos {
+            self.tile_mut(selected_pos)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn player(&self, player_idx: usize) -> Option<&Player> {
+        self.players.get(player_idx)
+    }
+
+    #[inline]
+    pub fn current_player(&self) -> &Player {
+        &self.players[self.current_player_idx]
+    }
+
+    #[inline]
+    pub fn next_player(&mut self) {
+        self.current_player_idx += 1;
+        if self.current_player_idx >= self.players.len() {
+            self.current_player_idx = 0;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Board {
+    transform: Arc<Uniform<MN, ModelTransform>>,
+    camera: Arc<Uniform<VP, Camera>>,
+    state: RwLock<BoardState>,
+}
+
+impl Board {
+    pub fn new(
+        input: InputDelegate,
+        transform: Arc<Uniform<MN, ModelTransform>>,
+        camera: Arc<Uniform<VP, Camera>>,
+        players: Vec<Player>,
+        size: glm::TVec2<usize>,
+    ) -> Arc<Self> {
         let board = Arc::new(Self {
             transform,
             camera,
-            size,
-            tiles,
-            selected_pos: RwLock::new(None),
+            state: RwLock::new(BoardState::new(size, players)),
         });
 
         let input_board = board.clone();
@@ -109,12 +176,25 @@ impl Board {
                     let ray = Ray::new(near_point, (far_point - near_point).normalize())
                         .inverse_transform_by(&camera.view);
 
-                    let tile = input_board.tiles.iter().find(|tile| {
+                    let mut state = input_board.state.write();
+                    let tile = state.tiles.iter().find(|tile| {
                         tile.aabb.intersects_ray(&transform.transform, &ray, f32::MAX)
                     });
 
-                    *input_board.selected_pos.write() = tile.map(|tile| tile.pos);
+                    state.selected_pos = tile.map(|tile| tile.pos);
                 },
+                InputDelegateEvent::MouseButton(event) => {
+                    if event.button == MouseButton::Left && event.state == ElementState::Pressed {
+                        let mut state = input_board.state.write();
+                        let current_player_idx = state.current_player_idx;
+                        if let Some(tile) = state.selected_tile_mut() {
+                            if tile.owner.is_none() {
+                                tile.owner = Some(current_player_idx);
+                                state.next_player();
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }));
@@ -123,28 +203,8 @@ impl Board {
     }
 
     #[inline]
-    pub fn tile(&self, pos: glm::TVec2<usize>) -> Option<&Tile> {
-        if pos.x < self.size.x && pos.y < self.size.y {
-            Some(self.tiles.get(pos.x + (pos.y * self.size.x))
-                .expect(&format!(
-                    "Tiles count ({}) does not match size ({} * {})",
-                    self.tiles.len(),
-                    self.size.x,
-                    self.size.y,
-                )))
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn selected_tile(&self) -> Option<&Tile> {
-        let selected_pos = self.selected_pos.read();
-        if let Some(selected_pos) = *selected_pos {
-            self.tile(selected_pos)
-        } else {
-            None
-        }
+    pub fn state(&self) -> RwLockReadGuard<BoardState> {
+        self.state.read()
     }
 
     pub fn bootstrap_renderer(
@@ -266,10 +326,10 @@ impl BoardRenderer {
             ViewportType::BottomLeft,
         );
 
-        let instances = board.tiles.iter()
+        let instances = board.state.read().tiles.iter()
             .map(|tile| {
                 let color = if (tile.pos.x + tile.pos.y) % 2 == 0 {
-                    glm::vec3(0.2, 0.2, 0.2)
+                    glm::vec3(0.5, 0.5, 0.5)
                 } else {
                     glm::vec3(0.8, 0.8, 0.8)
                 };
@@ -328,13 +388,32 @@ impl EngineRenderHandler for BoardRenderer {
             ).unwrap();
         model_tile.draw_instanced(builder, self.instances.clone()).unwrap();
 
-        let piece_instances = self.board.selected_tile().into_iter()
-            .map(|tile| {
-                TileInstance {
-                    offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
-                    color: glm::vec3(0.2, 0.6 , 0.8),
-                }
-            });
+        let piece_instances = {
+            let board_state = self.board.state();
+            board_state.tiles.iter()
+                .filter_map(|tile| {
+                    if let Some(player_idx) = tile.owner {
+                        let player = board_state.player(player_idx).unwrap();
+                        Some(TileInstance {
+                            offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
+                            color: player.color(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .chain(board_state.selected_tile().iter().filter_map(|tile| {
+                    if tile.owner.is_none() {
+                        Some(TileInstance {
+                            offset: glm::vec3(tile.offset.x, 0.2, tile.offset.y),
+                            color: glm::vec3(0.2, 0.6, 0.8),
+                        })
+                    } else {
+                        None
+                    }
+                }))
+                .collect::<Vec<_>>()
+        };
 
         if piece_instances.len() > 0 {
             let piece_instance_buffer = Buffer::from_iter(

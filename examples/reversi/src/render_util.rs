@@ -28,7 +28,7 @@ pub struct MN {
     pub normals: glm::TMat4<f32>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModelTransform {
     pub transform: Isometry3<f32>,
 }
