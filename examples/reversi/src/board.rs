@@ -5,9 +5,14 @@ use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{RenderTarget, RendererHandle};
+use gtether::render::RendererHandle;
 use gtether::resource::Resource;
+use parry3d::na::Point3;
+use parry3d::query::{Ray, RayCast};
 use std::sync::Arc;
+use std::thread;
+use parking_lot::RwLock;
+use parry3d::bounding_volume::Aabb;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -21,41 +26,136 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use gtether::gui::input::{InputDelegate, InputDelegateEvent};
+use crate::render_util::{Camera, ModelTransform, MN, VP};
 
-use crate::render_util::{MN, VP};
+#[derive(Debug)]
+pub struct Tile {
+    pos: glm::TVec2<usize>,
+    offset: glm::TVec2<f32>,
+    aabb: Aabb,
+}
+
+impl Tile {
+    fn new(pos: glm::TVec2<usize>, offset: glm::TVec2<f32>) -> Self {
+        let aabb = Aabb::new(
+            Point3::new(offset.x, 0.0, offset.y),
+            Point3::new(offset.x + 1.0, 0.2, offset.y + 1.0),
+        );
+        Self {
+            pos,
+            offset,
+            aabb,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Board {
+    transform: Arc<Uniform<MN, ModelTransform>>,
+    camera: Arc<Uniform<VP, Camera>>,
     size: glm::TVec2<usize>,
-    model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
-    mn: Arc<Uniform<MN>>,
-    vp: Arc<Uniform<VP>>,
+    tiles: Vec<Tile>,
+    selected_pos: RwLock<Option<glm::TVec2<usize>>>,
 }
 
 impl Board {
     pub fn new(
-        target: &Arc<dyn RenderTarget>,
-        model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
+        input: InputDelegate,
+        transform: Arc<Uniform<MN, ModelTransform>>,
+        camera: Arc<Uniform<VP, Camera>>,
         size: glm::TVec2<usize>,
-        vp: Arc<Uniform<VP>>,
-    ) -> Self {
-        let mn = Arc::new(Uniform::new(
-            target,
-            MN::default(),
-        ).unwrap());
+    ) -> Arc<Self> {
+        let base_offset = glm::vec2(
+            -(size.x as f32 / 2.0),
+            -(size.y as f32 / 2.0),
+        );
+        let tiles = (0..size.y).map(move |y| {
+            (0..size.x).map(move |x| {
+                Tile::new(
+                    glm::vec2(x, y),
+                    base_offset + glm::vec2(x as f32, y as f32),
+                )
+            })
+        }).flatten().collect::<Vec<_>>();
 
-        Self {
+        let board = Arc::new(Self {
+            transform,
+            camera,
             size,
-            model_tile,
-            mn,
-            vp,
+            tiles,
+            selected_pos: RwLock::new(None),
+        });
+
+        let input_board = board.clone();
+        thread::spawn(move || input.start(|_, event| {
+            match event {
+                InputDelegateEvent::CursorMoved(pos) => {
+                    let transform = input_board.transform.read();
+                    let camera = input_board.camera.read();
+
+                    // Y is flipped because real-space uses a flipped Y compared to Vulkan screen space
+                    let screen_coords = glm::vec2(
+                        pos.x as f32 / camera.extent.x * 2.0 - 1.0,
+                        -(pos.y as f32 / camera.extent.y * 2.0 - 1.0),
+                    );
+
+                    let near_point = camera.projection.unproject_point(
+                        &Point3::new(screen_coords.x, screen_coords.y, -1.0)
+                    );
+                    let far_point = camera.projection.unproject_point(
+                        &Point3::new(screen_coords.x, screen_coords.y, 1.0)
+                    );
+                    let ray = Ray::new(near_point, (far_point - near_point).normalize())
+                        .inverse_transform_by(&camera.view);
+
+                    let tile = input_board.tiles.iter().find(|tile| {
+                        tile.aabb.intersects_ray(&transform.transform, &ray, f32::MAX)
+                    });
+
+                    *input_board.selected_pos.write() = tile.map(|tile| tile.pos);
+                },
+                _ => {}
+            }
+        }));
+
+        board
+    }
+
+    #[inline]
+    pub fn tile(&self, pos: glm::TVec2<usize>) -> Option<&Tile> {
+        if pos.x < self.size.x && pos.y < self.size.y {
+            Some(self.tiles.get(pos.x + (pos.y * self.size.x))
+                .expect(&format!(
+                    "Tiles count ({}) does not match size ({} * {})",
+                    self.tiles.len(),
+                    self.size.x,
+                    self.size.y,
+                )))
+        } else {
+            None
         }
     }
 
-    pub fn bootstrap_renderer(self: &Arc<Self>) -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> BoardRenderer {
+    #[inline]
+    pub fn selected_tile(&self) -> Option<&Tile> {
+        let selected_pos = self.selected_pos.read();
+        if let Some(selected_pos) = *selected_pos {
+            self.tile(selected_pos)
+        } else {
+            None
+        }
+    }
+
+    pub fn bootstrap_renderer(
+        self: &Arc<Self>,
+        model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
+    ) -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> BoardRenderer {
         let self_clone = self.clone();
+        let transform = self.transform.clone();
+        let camera = self.camera.clone();
         move |renderer, subpass, _| {
-            BoardRenderer::new(self_clone, renderer, subpass)
+            BoardRenderer::new(self_clone, transform, camera, model_tile, renderer, subpass)
         }
     }
 }
@@ -85,13 +185,21 @@ mod board_frag {
 
 pub struct BoardRenderer {
     board: Arc<Board>,
+    model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
     graphics: Arc<EngineGraphicsPipeline>,
     instances: Subbuffer<[TileInstance]>,
     descriptor_set: EngineDescriptorSet,
 }
 
 impl BoardRenderer {
-    fn new(board: Arc<Board>, renderer: &RendererHandle, subpass: &Subpass) -> Self {
+    fn new(
+        board: Arc<Board>,
+        transform: Arc<Uniform<MN, ModelTransform>>,
+        camera: Arc<Uniform<VP, Camera>>,
+        model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
+        renderer: &RendererHandle,
+        subpass: &Subpass,
+    ) -> Self {
         let target = renderer.target();
 
         let board_vert = board_vert::load(target.device().vk_device().clone())
@@ -146,27 +254,19 @@ impl BoardRenderer {
             ViewportType::BottomLeft,
         );
 
-        let instances = {
-            let base_offset = glm::vec3(
-                -(board.size.x as f32 / 2.0),
-                0.0,
-                -(board.size.y as f32 / 2.0),
-            );
-            let (width, height) = (board.size.x, board.size.y);
-            (0..width).into_iter().map(move |x| {
-                (0..height).into_iter().map(move |y| {
-                    let color = if (x + y) % 2 == 0 {
-                        glm::vec3(0.2, 0.2, 0.2)
-                    } else {
-                        glm::vec3(0.8, 0.8, 0.8)
-                    };
-                    TileInstance {
-                        offset: base_offset + glm::vec3(x as f32, 0.0, y as f32),
-                        color,
-                    }
-                })
-            }).flatten().collect::<Vec<_>>()
-        };
+        let instances = board.tiles.iter()
+            .map(|tile| {
+                let color = if (tile.pos.x + tile.pos.y) % 2 == 0 {
+                    glm::vec3(0.2, 0.2, 0.2)
+                } else {
+                    glm::vec3(0.8, 0.8, 0.8)
+                };
+                TileInstance {
+                    offset: glm::vec3(tile.offset.x, 0.0, tile.offset.y),
+                    color,
+                }
+            })
+            .collect::<Vec<_>>();
 
         let instances = Buffer::from_iter(
             target.device().memory_allocator().clone(),
@@ -184,12 +284,13 @@ impl BoardRenderer {
 
         let descriptor_set = EngineDescriptorSet::builder(target)
             .layout(descriptor_layout)
-            .descriptor_source(0, board.vp.clone())
-            .descriptor_source(1, board.mn.clone())
+            .descriptor_source(0, camera)
+            .descriptor_source(1, transform)
             .build().unwrap();
 
         Self {
             board,
+            model_tile,
             graphics,
             instances,
             descriptor_set,
@@ -200,7 +301,7 @@ impl BoardRenderer {
 impl EngineRenderHandler for BoardRenderer {
     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
         let graphics = self.graphics.vk_graphics();
-        let model_tile = self.board.model_tile.read();
+        let model_tile = self.model_tile.read();
 
         builder
             .bind_pipeline_graphics(graphics.clone()).unwrap()

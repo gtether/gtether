@@ -4,9 +4,10 @@ use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
-use gtether::render::uniform::{Uniform, UniformSet};
+use gtether::render::uniform::{Uniform, UniformSet, UniformValue};
 use gtether::render::{FlatVertex, RenderTarget, RendererHandle};
 use std::sync::Arc;
+use parry3d::na::{Isometry3, Perspective3, Point3};
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::layout::DescriptorType;
@@ -20,36 +21,84 @@ use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
 
-#[derive(BufferContents, Debug, Clone)]
+#[derive(BufferContents)]
 #[repr(C)]
 pub struct MN {
     pub model: glm::TMat4<f32>,
     pub normals: glm::TMat4<f32>,
 }
 
-impl MN {
-    #[inline]
-    pub fn new(model: glm::TMat4<f32>) -> Self {
+#[derive(Debug, Default)]
+pub struct ModelTransform {
+    pub transform: Isometry3<f32>,
+}
+
+impl ModelTransform {
+    pub fn new() -> Self {
         Self {
-            model,
-            normals: glm::inverse_transpose(model),
+            transform: Isometry3::identity(),
         }
     }
 }
 
-impl Default for MN {
+impl UniformValue<MN> for ModelTransform {
     #[inline]
-    fn default() -> Self { Self::new(glm::identity()) }
+    fn buffer_contents(&self) -> MN {
+        MN {
+            model: self.transform.to_homogeneous(),
+            normals: glm::inverse_transpose(self.transform.to_homogeneous()),
+        }
+    }
 }
 
-#[derive(BufferContents, Debug, Clone)]
+#[derive(BufferContents)]
 #[repr(C)]
 pub struct VP {
-    pub view: glm::TMat4<f32>,
-    pub projection: glm::TMat4<f32>,
+    pub matrix: glm::TMat4<f32>,
 }
 
-impl VP {
+#[derive(Debug)]
+pub struct Camera {
+    pub extent: glm::TVec2<f32>,
+    pub view: Isometry3<f32>,
+    pub projection: Perspective3<f32>,
+}
+
+impl Camera {
+    pub fn new(
+        render_target: &Arc<dyn RenderTarget>,
+        eye: &Point3<f32>,
+        target: &Point3<f32>,
+        up: &glm::TVec3<f32>,
+    ) -> Self {
+        let extent = render_target.extent().cast::<f32>();
+        Self {
+            extent,
+            view: Isometry3::look_at_rh(eye, target, up),
+            projection: Perspective3::new(
+                extent.x / extent.y,
+                glm::half_pi(),
+                0.01, 100.0,
+            ),
+        }
+    }
+
+    pub fn update(&mut self, render_target: &Arc<dyn RenderTarget>) {
+        self.extent = render_target.extent().cast::<f32>();
+        self.projection.set_aspect(self.extent.x / self.extent.y);
+    }
+}
+
+impl UniformValue<VP> for Camera {
+    #[inline]
+    fn buffer_contents(&self) -> VP {
+        VP {
+            matrix: self.projection.as_matrix() * self.view.to_homogeneous(),
+        }
+    }
+}
+
+/*impl VP {
     #[allow(unused)]
     #[inline]
     pub fn look_at(eye: &glm::TVec3<f32>, center: &glm::TVec3<f32>, up: &glm::TVec3<f32>) -> Self {
@@ -58,17 +107,7 @@ impl VP {
             projection: glm::identity(),
         }
     }
-}
-
-impl Default for VP {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            view: glm::identity(),
-            projection: glm::identity(),
-        }
-    }
-}
+}*/
 
 #[derive(BufferContents, Debug, Clone)]
 #[repr(C)]

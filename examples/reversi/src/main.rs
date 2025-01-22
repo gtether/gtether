@@ -4,6 +4,7 @@ use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::console::Console;
 use gtether::event::Event;
+use gtether::gui::input::{InputDelegate, InputDelegateEvent, MouseButton};
 use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::model::obj::ModelObjLoader;
@@ -17,6 +18,8 @@ use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
 use std::cell::OnceCell;
 use std::sync::Arc;
 use std::time::Duration;
+use parry3d::na::Point3;
+use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -26,7 +29,7 @@ use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
 use crate::board::Board;
-use crate::render_util::{DeferredLightingRendererBootstrap, PointLight, VP};
+use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight};
 
 mod board;
 mod render_util;
@@ -35,6 +38,7 @@ struct ReversiApp {
     console: Arc<Console>,
     window: OnceCell<WindowHandle>,
     board: OnceCell<Arc<Board>>,
+    input: OnceCell<InputDelegate>,
 }
 
 impl ReversiApp {
@@ -47,6 +51,7 @@ impl ReversiApp {
             console,
             window: OnceCell::new(),
             board: OnceCell::new(),
+            input: OnceCell::new(),
         }
     }
 }
@@ -70,36 +75,36 @@ impl Application for ReversiApp {
             LoadPriority::Immediate,
         );
 
-        let vp = Arc::new(Uniform::new(
+        let transform = Arc::new(Uniform::new(
             window.renderer().target(),
-            VP::default(),
+            ModelTransform::default(),
         ).unwrap());
-        *vp.write() = VP::look_at(
-            &glm::vec3(0.0, 6.0, -3.0),
-            &glm::vec3(0.0, 0.0, 0.0),
-            &glm::vec3(0.0, 1.0, 0.0),
-        );
+
+        let camera = Arc::new(Uniform::new(
+            window.renderer().target(),
+            Camera::new(
+                window.renderer().target(),
+                &Point3::new(0.0, 6.0, -3.0),
+                &Point3::new(0.0, 0.0, 0.0),
+                &glm::vec3(0.0, 1.0, 0.0),
+            ),
+        ).unwrap());
         {
-            let vp = vp.clone();
+            let camera = camera.clone();
             window.renderer().event_bus().register(
                 RendererEventType::Stale,
                 move |event: &mut Event<RendererEventType, RendererEventData>| {
-                    let extent = event.target().extent().cast::<f32>();
-                    vp.write().projection = glm::perspective(
-                        extent.x / extent.y,
-                        glm::half_pi(),
-                        0.01, 100.0,
-                    );
+                    camera.write().update(event.target());
                 }
             );
         }
 
-        let board = Arc::new(Board::new(
-            window.renderer().target(),
-            model_tile.wait().unwrap(),
+        let board = Board::new(
+            window.input_state().create_delegate(),
+            transform.clone(),
+            camera.clone(),
             glm::vec2(8, 8),
-            vp.clone(),
-        ));
+        );
 
         let deferred_lighting_renderer = DeferredLightingRendererBootstrap::new(
             window.renderer().target(),
@@ -143,7 +148,7 @@ impl Application for ReversiApp {
                 .color_attachment("color")
                 .color_attachment("normals")
                 .depth_stencil_attachment("depth")
-                .handler(board.bootstrap_renderer())
+                .handler(board.bootstrap_renderer(model_tile.wait().unwrap()))
             .end_subpass()
             .begin_subpass()
                 .input_attachment("color")
@@ -155,12 +160,27 @@ impl Application for ReversiApp {
             .build();
         window.renderer().set_render_pass(render_pass).unwrap();
 
+        self.input.set(window.input_state().create_delegate()).unwrap();
         self.window.set(window).unwrap();
         self.board.set(board).unwrap();
     }
 
     fn tick(&self, _engine: &Engine<Self>, _delta: Duration) {
-        // noop
+        for event in self.input.get().unwrap().events() {
+            match event {
+                InputDelegateEvent::MouseButton(event) => {
+                    match event.button {
+                        MouseButton::Left => {
+                            let board = self.board.get().unwrap();
+                            let tile = board.selected_tile();
+                            info!(?tile)
+                        },
+                        _ => {}
+                    }
+                },
+                _ => {}
+            }
+        }
     }
 }
 
