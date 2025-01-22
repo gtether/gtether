@@ -105,7 +105,8 @@ release-example-windows:
   artifacts:
     expose_as: "example-windows"
     paths:
-      - "target/${TARGET}/release/${BIN_NAME}"
+      - "target/x86_64-unknown-linux-gnu/release/windows"
+      - "target/x86_64-pc-windows-gnu/release/windows.exe"
 
 release-example-reversi:
   extends:
@@ -142,4 +143,5 @@ release-example-reversi:
   artifacts:
     expose_as: "example-reversi"
     paths:
-      - "target/${TARGET}/release/${BIN_NAME}"
+      - "target/x86_64-unknown-linux-gnu/release/reversi"
+      - "target/x86_64-pc-windows-gnu/release/reversi.exe"
