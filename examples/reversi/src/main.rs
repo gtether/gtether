@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
-
+use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
 use crate::board::Board;
 use crate::player::Player;
 use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight};
@@ -36,6 +36,19 @@ use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransfo
 mod board;
 mod render_util;
 mod player;
+
+#[derive(Debug)]
+struct ResetCommand {
+    board: Arc<Board>,
+}
+
+impl Command for ResetCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
+        self.board.reset();
+        Ok(())
+    }
+}
 
 struct ReversiApp {
     console: Arc<Console>,
@@ -61,6 +74,8 @@ impl ReversiApp {
 
 impl Application for ReversiApp {
     fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {
+        let mut cmd_registry = self.console.registry();
+
         let window = registry.window.create_window(CreateWindowInfo {
             attributes: WindowAttributes::default()
                 .with_title("Reversi"),
@@ -117,6 +132,10 @@ impl Application for ReversiApp {
             ],
             glm::vec2(8, 8),
         );
+
+        cmd_registry.register_command("reset", Box::new(ResetCommand {
+            board: board.clone(),
+        })).unwrap();
 
         let deferred_lighting_renderer = DeferredLightingRendererBootstrap::new(
             window.renderer().target(),

@@ -384,6 +384,17 @@ impl BoardState {
             false
         }
     }
+
+    pub fn reset(&mut self) {
+        for tile in self.tiles.iter_mut() {
+            tile.owner = None;
+        }
+        self.selected_pos = None;
+        self.current_player_idx = 0;
+        self.turn_no = 1;
+        self.game_state = GameState::InProgress;
+        self.update_valid_moves_cache();
+    }
 }
 
 #[derive(Debug)]
@@ -461,6 +472,11 @@ impl Board {
     #[inline]
     pub fn state(&self) -> RwLockReadGuard<BoardState> {
         self.state.read()
+    }
+
+    #[inline]
+    pub fn reset(&self) {
+        self.state.write().reset();
     }
 
     pub fn bootstrap_renderer(
