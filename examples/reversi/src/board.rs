@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use gtether::render::attachment::AttachmentMap;
 use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::model::{Model, ModelVertexNormal};
@@ -5,13 +6,14 @@ use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{Device, RendererHandle};
+use gtether::render::{Device, RenderTarget, RendererEventData, RendererEventType, RendererHandle};
 use gtether::resource::Resource;
+use itertools::Itertools;
 use parry3d::na::Point3;
 use parry3d::query::{Ray, RayCast};
 use std::sync::Arc;
 use std::thread;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use parry3d::bounding_volume::Aabb;
 use tracing::{debug, debug_span, info};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -27,10 +29,22 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use gtether::event::{Event, EventHandler};
 use gtether::gui::input::{ElementState, InputDelegate, InputDelegateEvent, MouseButton};
-
+use gtether::render::font::compositor::FontCompositor;
+use gtether::render::font::Font;
+use gtether::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
+use gtether::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
+use gtether::render::font::size::{FontSize, FontSizer};
 use crate::player::Player;
 use crate::render_util::{Camera, ModelTransform, MN, VP};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum GameState {
+    InProgress,
+    Draw,
+    PlayerWon(Player),
+}
 
 #[derive(Debug)]
 pub struct Tile {
@@ -104,9 +118,9 @@ impl Iterator for DirectionIter {
     type Item = glm::TVec2<usize>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_pos.x < (self.size.x - 1) && self.current_pos.y < (self.size.y - 1) {
+        if self.current_pos.x < self.size.x && self.current_pos.y < self.size.y {
             let new_pos = self.current_pos.cast::<i64>() + self.direction.offset();
-            if new_pos.x < 0 || new_pos.y < 0 {
+            if new_pos.x < 0 || new_pos.y < 0 || new_pos.x >= self.size.x as i64 || new_pos.y >= self.size.y as i64 {
                 None
             } else {
                 self.current_pos = (self.current_pos.cast::<i64>() + self.direction.offset())
@@ -127,6 +141,8 @@ pub struct BoardState {
     players: Vec<Player>,
     current_player_idx: usize,
     turn_no: usize,
+    valid_moves_cache: Vec<glm::TVec2<usize>>,
+    game_state: GameState,
 }
 
 impl BoardState {
@@ -144,14 +160,19 @@ impl BoardState {
             })
         }).flatten().collect::<Vec<_>>();
 
-        Self {
+        let mut state = Self {
             size,
             tiles,
             selected_pos: None,
             players,
             current_player_idx: 0,
             turn_no: 1,
-        }
+            valid_moves_cache: Vec::new(),
+            game_state: GameState::InProgress,
+        };
+        state.update_valid_moves_cache();
+
+        state
     }
 
     #[inline]
@@ -183,6 +204,11 @@ impl BoardState {
     }
 
     pub fn valid_selection(&self, pos: glm::TVec2<usize>) -> bool {
+        if self.game_state != GameState::InProgress {
+            // Game has already ended
+            return false;
+        }
+
         if let Some(tile) = self.tile(pos) {
             if tile.owner.is_some() {
                 // Obviously can't play on a tile that is already owned
@@ -221,7 +247,19 @@ impl BoardState {
         &self.players[self.current_player_idx]
     }
 
-    #[inline]
+    fn update_valid_moves_cache(&mut self) {
+        self.valid_moves_cache.clear();
+        for x in 0..self.size.x {
+            for y in 0..self.size.y {
+                let pos = glm::vec2(x, y);
+                if self.valid_selection(pos) {
+                    self.valid_moves_cache.push(pos);
+                }
+            }
+        }
+        debug!(valid_move_count = ?self.valid_moves_cache.len(), "Updated valid moves cache");
+    }
+
     pub fn end_turn(&mut self) {
         self.current_player_idx += 1;
         if self.current_player_idx >= self.players.len() {
@@ -229,6 +267,40 @@ impl BoardState {
         }
         self.turn_no += 1;
         info!(player = ?self.current_player(), turn_no = ?self.turn_no, "Next turn");
+        self.update_valid_moves_cache();
+        if self.valid_moves_cache.is_empty() {
+            self.end_game();
+        }
+    }
+
+    pub fn end_game(&mut self) {
+        let mut player_counts = HashMap::<usize, usize>::new();
+        for x in 0..self.size.x {
+            for y in 0..self.size.y {
+                if let Some(tile) = self.tile(glm::vec2(x, y)) {
+                    if let Some(owner) = tile.owner {
+                        *player_counts.entry(owner).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut high_scores = player_counts.into_iter()
+            .max_set_by(|(_, count_a), (_, count_b)| {
+                count_a.cmp(count_b)
+            });
+        if high_scores.len() == 1 {
+            let (player_idx, _) = high_scores.pop().unwrap();
+            let player = self.player(player_idx).unwrap().clone();
+            self.game_state = GameState::PlayerWon(player);
+        } else {
+            self.game_state = GameState::Draw;
+        }
+        info!(state = ?self.game_state, "Game ended");
+    }
+
+    #[inline]
+    pub fn game_state(&self) -> GameState {
+        self.game_state.clone()
     }
 
     fn valid_for_flip(&self, start_pos: glm::TVec2<usize>, direction: Direction, player_idx: usize) -> bool {
@@ -408,6 +480,21 @@ impl Board {
                 model_piece,
                 renderer,
                 subpass,
+            )
+        }
+    }
+
+    pub fn bootstrap_text_renderer(
+        self: &Arc<Self>,
+        font: Arc<Resource<dyn Font>>,
+    ) -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> BoardTextRenderer {
+        let self_clone = self.clone();
+        move |renderer, subpass, _| {
+            BoardTextRenderer::new(
+                renderer,
+                subpass,
+                font,
+                self_clone,
             )
         }
     }
@@ -663,5 +750,128 @@ impl EngineRenderHandler for BoardRenderer {
             builder.bind_pipeline_graphics(selected_graphics.clone()).unwrap();
             model_piece.draw_instanced(builder, selected_instance_buffer).unwrap();
         }
+    }
+}
+
+struct BoardTextRendererLayout {
+    font_sheet: Arc<Resource<FontSheet>>,
+    layout: Mutex<TextLayout>,
+}
+
+impl BoardTextRendererLayout {
+    fn create_layout(
+        target: &Arc<dyn RenderTarget>,
+        font_sizer: &Arc<dyn FontSizer>,
+    ) -> TextLayout {
+        let screen_size = target.extent().cast::<f32>();
+
+        TextLayout::for_render_target(
+            target,
+            font_sizer.clone(),
+            TextLayoutCreateInfo {
+                alignment: LayoutAlignment {
+                    horizontal: LayoutHorizontalAlignment::Center,
+                    vertical: LayoutVerticalAlignment::Center,
+                },
+                size: FontSize::Pt(32.0),
+                canvas_offset: glm::vec2(0.0, 0.3 * screen_size.y),
+                canvas_size: Some(glm::vec2(screen_size.x, 0.3 * screen_size.y)),
+                ..Default::default()
+            }
+        )
+    }
+
+    fn new(renderer: &RendererHandle, font_sheet: Arc<Resource<FontSheet>>) -> Arc<Self> {
+        let layout = Self::create_layout(
+            renderer.target(),
+            font_sheet.read().sizer(),
+        );
+        let render_layout = Arc::new(Self {
+            font_sheet,
+            layout: Mutex::new(layout),
+        });
+        renderer.event_bus().register(RendererEventType::Stale, render_layout.clone());
+        render_layout
+    }
+}
+
+impl EventHandler<RendererEventType, RendererEventData> for BoardTextRendererLayout {
+    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
+        assert_eq!(event.event_type(), &RendererEventType::Stale);
+        let new_layout = Self::create_layout(
+            event.target(),
+            self.font_sheet.read().sizer(),
+        );
+        *self.layout.lock() = new_layout;
+    }
+}
+
+pub struct BoardTextRenderer {
+    board: Arc<Board>,
+    font: Arc<Resource<dyn Font>>,
+    font_sheet: Arc<Resource<FontSheet>>,
+    font_compositor: FontCompositor,
+    layout: Arc<BoardTextRendererLayout>,
+}
+
+impl BoardTextRenderer {
+    fn new(
+        renderer: &RendererHandle,
+        subpass: &Subpass,
+        font: Arc<Resource<dyn Font>>,
+        board: Arc<Board>,
+    ) -> Self {
+        let font_sheet = FontSheet::from_font(
+            &font,
+            renderer.clone(),
+            64.0,
+            Arc::new(UnicodeFontSheetMap::basic_latin()),
+        ).unwrap();
+
+        let font_compositor = FontCompositor::new(
+            FontSheetRenderer::new(
+                renderer,
+                subpass,
+                font_sheet.clone(),
+            )
+        );
+
+        let layout = BoardTextRendererLayout::new(renderer, font_sheet.clone());
+
+        Self {
+            board,
+            font,
+            font_sheet,
+            font_compositor,
+            layout,
+        }
+    }
+}
+
+impl EngineRenderHandler for BoardTextRenderer {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+        let mut pass = self.font_compositor.begin_pass(builder, frame);
+
+        let mut layout = self.layout.layout.lock();
+        layout.clear();
+        match self.board.state().game_state() {
+            GameState::Draw => {
+                layout
+                    .color(glm::vec3(1.0, 1.0, 1.0))
+                    .text("Game ends in a Draw");
+                pass.layout(&layout);
+            },
+            GameState::PlayerWon(player) => {
+                layout
+                    .color(player.color())
+                    .text(player.name())
+                    .color(glm::vec3(1.0, 1.0, 1.0))
+                    .text(" Wins!");
+                pass.layout(&layout);
+            },
+            _ => {}
+        }
+
+        pass.end_pass();
     }
 }

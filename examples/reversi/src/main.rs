@@ -126,9 +126,10 @@ impl Application for ReversiApp {
             ]
         );
 
+        let console_font = console_font.wait().unwrap();
         let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)
-            .font(console_font.wait().unwrap())
+            .font(console_font.clone())
             .build().unwrap();
 
         let render_pass = EngineRenderPassBuilder::new(window.renderer())
@@ -168,6 +169,7 @@ impl Application for ReversiApp {
                 .input_attachment("normals")
                 .color_attachment("final_color")
                 .handler(deferred_lighting_renderer.bootstrap())
+                .handler(board.bootstrap_text_renderer(console_font))
                 .handler(console_gui.bootstrap_renderer())
             .end_subpass()
             .build();

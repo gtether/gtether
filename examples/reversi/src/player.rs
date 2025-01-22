@@ -1,8 +1,16 @@
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Player {
     name: String,
     color: glm::TVec3<f32>,
 }
+
+impl PartialEq for Player {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Player {}
 
 impl Player {
     #[inline]

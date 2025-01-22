@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 bytemuck = { workspace = true }
 gtether = { workspace = true, features = ["gui"] }
+itertools = { workspace = true }
 nalgebra-glm = { workspace = true }
 parking_lot = { workspace = true }
 parry3d = { workspace = true }
