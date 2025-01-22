@@ -755,11 +755,13 @@ mod tests {
                 state: ElementState::Pressed,
                 position: glm::vec2(0.0, 0.0),
             }),
+            InputDelegateEvent::CursorMoved(glm::vec2(30.0, 166.6)),
             InputDelegateEvent::MouseButton(MouseButtonEvent {
                 button: MouseButton::Left,
                 state: ElementState::Released,
                 position: glm::vec2(30.0, 166.6),
             }),
+            InputDelegateEvent::CursorMoved(glm::vec2(72.0, 0.0)),
             InputDelegateEvent::MouseButton(MouseButtonEvent {
                 button: MouseButton::Middle,
                 state: ElementState::Pressed,
