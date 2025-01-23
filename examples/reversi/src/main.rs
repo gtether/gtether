@@ -30,10 +30,12 @@ use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
 use crate::board::Board;
+use crate::bot::minimax::MinimaxAlgorithm;
 use crate::player::Player;
 use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight};
 
 mod board;
+mod bot;
 mod render_util;
 mod player;
 
@@ -127,8 +129,12 @@ impl Application for ReversiApp {
             transform.clone(),
             camera.clone(),
             vec![
-                Player::new("Player1", glm::vec3(0.95, 0.95, 0.95)),
-                Player::new("Player2", glm::vec3(0.05, 0.05, 0.05)),
+                Arc::new(Player::human("Player1", glm::vec3(0.05, 0.05, 0.05))),
+                Arc::new(Player::bot(
+                    "Player2",
+                    glm::vec3(0.95, 0.95, 0.95),
+                    MinimaxAlgorithm::new(5),
+                )),
             ],
             glm::vec2(8, 8),
         );

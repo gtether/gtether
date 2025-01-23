@@ -12,5 +12,6 @@ parking_lot = { workspace = true }
 parry3d = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+ump = { workspace = true }
 vulkano = { workspace = true }
 vulkano-shaders = { workspace = true }

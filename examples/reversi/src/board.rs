@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use parry3d::bounding_volume::Aabb;
-use tracing::{debug, debug_span, info};
+use tracing::{debug, info};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -43,10 +43,10 @@ use crate::render_util::{Camera, ModelTransform, MN, VP};
 pub enum GameState {
     InProgress,
     Draw,
-    PlayerWon(Player),
+    PlayerWon(Arc<Player>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tile {
     pos: glm::TVec2<usize>,
     offset: glm::TVec2<f32>,
@@ -66,6 +66,11 @@ impl Tile {
             aabb,
             owner: None,
         }
+    }
+
+    #[inline]
+    pub fn owner(&self) -> Option<usize> {
+        self.owner
     }
 }
 
@@ -133,20 +138,23 @@ impl Iterator for DirectionIter {
     }
 }
 
-#[derive(Debug)]
+pub type ValidMovesIter<'a> = core::slice::Iter<'a, glm::TVec2<usize>>;
+
+#[derive(Debug, Clone)]
 pub struct BoardState {
     size: glm::TVec2<usize>,
     tiles: Vec<Tile>,
     selected_pos: Option<glm::TVec2<usize>>,
-    players: Vec<Player>,
+    players: Vec<Arc<Player>>,
     current_player_idx: usize,
     turn_no: usize,
     valid_moves_cache: Vec<glm::TVec2<usize>>,
+    score_cache: HashMap<usize, usize>,
     game_state: GameState,
 }
 
 impl BoardState {
-    fn new(size: glm::TVec2<usize>, players: Vec<Player>) -> Self {
+    fn new(size: glm::TVec2<usize>, players: Vec<Arc<Player>>) -> Self {
         let base_offset = glm::vec2(
             -(size.x as f32 / 2.0),
             -(size.y as f32 / 2.0),
@@ -168,11 +176,18 @@ impl BoardState {
             current_player_idx: 0,
             turn_no: 1,
             valid_moves_cache: Vec::new(),
+            score_cache: HashMap::new(),
             game_state: GameState::InProgress,
         };
         state.update_valid_moves_cache();
+        state.update_score_cache();
 
         state
+    }
+
+    #[inline]
+    pub fn size(&self) -> glm::TVec2<usize> {
+        self.size
     }
 
     #[inline]
@@ -238,12 +253,17 @@ impl BoardState {
     }
 
     #[inline]
-    pub fn player(&self, player_idx: usize) -> Option<&Player> {
+    pub fn player(&self, player_idx: usize) -> Option<&Arc<Player>> {
         self.players.get(player_idx)
     }
 
     #[inline]
-    pub fn current_player(&self) -> &Player {
+    pub fn current_player_idx(&self) -> usize {
+        self.current_player_idx
+    }
+
+    #[inline]
+    pub fn current_player(&self) -> &Arc<Player> {
         &self.players[self.current_player_idx]
     }
 
@@ -257,7 +277,37 @@ impl BoardState {
                 }
             }
         }
-        debug!(valid_move_count = ?self.valid_moves_cache.len(), "Updated valid moves cache");
+    }
+
+    #[inline]
+    pub fn valid_moves(&self) -> ValidMovesIter<'_> {
+        self.valid_moves_cache.iter()
+    }
+
+    fn update_score_cache(&mut self) {
+        self.score_cache.clear();
+        for x in 0..self.size.x {
+            for y in 0..self.size.y {
+                if let Some(tile) = self.tile(glm::vec2(x, y)) {
+                    if let Some(owner) = tile.owner {
+                        *self.score_cache.entry(owner).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn score(&self, player_idx: usize) -> usize {
+        self.score_cache.get(&player_idx).cloned().unwrap_or_default()
+    }
+
+    #[inline]
+    pub fn total_pieces(&self) -> usize {
+        // Total count of pieces is equivalent to sum of all player scores
+        (0..self.players.len())
+            .map(|player_idx| self.score(player_idx))
+            .sum()
     }
 
     pub fn end_turn(&mut self) {
@@ -266,25 +316,16 @@ impl BoardState {
             self.current_player_idx = 0;
         }
         self.turn_no += 1;
-        info!(player = ?self.current_player(), turn_no = ?self.turn_no, "Next turn");
         self.update_valid_moves_cache();
+        self.update_score_cache();
         if self.valid_moves_cache.is_empty() {
             self.end_game();
         }
     }
 
     pub fn end_game(&mut self) {
-        let mut player_counts = HashMap::<usize, usize>::new();
-        for x in 0..self.size.x {
-            for y in 0..self.size.y {
-                if let Some(tile) = self.tile(glm::vec2(x, y)) {
-                    if let Some(owner) = tile.owner {
-                        *player_counts.entry(owner).or_default() += 1;
-                    }
-                }
-            }
-        }
-        let mut high_scores = player_counts.into_iter()
+        let mut high_scores = (0..self.players.len())
+            .map(|player_idx| (player_idx, self.score(player_idx)))
             .max_set_by(|(_, count_a), (_, count_b)| {
                 count_a.cmp(count_b)
             });
@@ -295,7 +336,6 @@ impl BoardState {
         } else {
             self.game_state = GameState::Draw;
         }
-        info!(state = ?self.game_state, "Game ended");
     }
 
     #[inline]
@@ -351,8 +391,6 @@ impl BoardState {
     }
 
     pub fn set(&mut self, pos: glm::TVec2<usize>, player_idx: usize) -> bool {
-        let _player_span = debug_span!("set_tile", center_pos = ?pos, ?player_idx);
-
         if player_idx >= self.players.len() {
             return false;
         }
@@ -364,12 +402,8 @@ impl BoardState {
         }
 
         for direction in Direction::all() {
-            let _direction_span = debug_span!("direction", ?direction);
             if self.valid_for_flip(pos, direction, player_idx) {
-                info!("Flipping");
                 self.flip(pos, direction, player_idx);
-            } else {
-                debug!("Flip is NOT valid");
             }
         }
 
@@ -394,6 +428,7 @@ impl BoardState {
         self.turn_no = 1;
         self.game_state = GameState::InProgress;
         self.update_valid_moves_cache();
+        self.update_score_cache();
     }
 }
 
@@ -409,7 +444,7 @@ impl Board {
         input: InputDelegate,
         transform: Arc<Uniform<MN, ModelTransform>>,
         camera: Arc<Uniform<VP, Camera>>,
-        players: Vec<Player>,
+        players: Vec<Arc<Player>>,
         size: glm::TVec2<usize>,
     ) -> Arc<Self> {
         let board = Arc::new(Self {
@@ -446,19 +481,27 @@ impl Board {
                     }).map(|tile| tile.pos);
 
                     state.selected_pos = None;
-                    if let Some(pos) = tile {
-                        if state.valid_selection(pos) {
-                            state.selected_pos = Some(pos);
+                    if state.current_player().player_type().has_manual_input() {
+                        if let Some(pos) = tile {
+                            if state.valid_selection(pos) {
+                                state.selected_pos = Some(pos);
+                            }
                         }
                     }
                 },
                 InputDelegateEvent::MouseButton(event) => {
                     if event.button == MouseButton::Left && event.state == ElementState::Pressed {
-                        let mut state = input_board.state.write();
-                        if let Some(selected_pos) = state.selected_pos {
-                            if state.place(selected_pos) {
-                                state.end_turn();
+                        let selected_pos = {
+                            let state = input_board.state.read();
+                            if state.current_player().player_type().has_manual_input() {
+                                state.selected_pos
+                            } else {
+                                None
                             }
+                        };
+
+                        if let Some(selected_pos) = selected_pos {
+                            input_board.play(selected_pos);
                         }
                     }
                 }
@@ -472,6 +515,31 @@ impl Board {
     #[inline]
     pub fn state(&self) -> RwLockReadGuard<BoardState> {
         self.state.read()
+    }
+
+    #[inline]
+    pub fn play(self: &Arc<Self>, pos: glm::TVec2<usize>) {
+        debug!(?pos, "Attempting play");
+        let next_player = {
+            let mut state = self.state.write();
+            if state.place(pos) {
+                state.end_turn();
+
+                if state.game_state == GameState::InProgress {
+                    let next_player = state.current_player().clone();
+                    info!(turn_no = state.turn_no, player = ?next_player, "Begin turn");
+                    Some(next_player)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(next_player) = next_player {
+            next_player.begin_turn(self);
+        }
     }
 
     #[inline]
@@ -824,7 +892,9 @@ impl EventHandler<RendererEventType, RendererEventData> for BoardTextRendererLay
 
 pub struct BoardTextRenderer {
     board: Arc<Board>,
+    #[allow(unused)]
     font: Arc<Resource<dyn Font>>,
+    #[allow(unused)]
     font_sheet: Arc<Resource<FontSheet>>,
     font_compositor: FontCompositor,
     layout: Arc<BoardTextRendererLayout>,
