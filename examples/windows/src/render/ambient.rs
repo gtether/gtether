@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use gtether::render::attachment::{AttachmentDescriptor, AttachmentMap};
 use gtether::render::descriptor_set::EngineDescriptorSet;
+use gtether::render::frame::FrameManagerExt;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
-use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{FlatVertex, RenderTarget, RendererHandle};
+use gtether::render::{FlatVertex, Renderer};
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState};
@@ -65,18 +64,15 @@ pub struct AmbientRenderer {
 
 impl AmbientRenderer {
     fn new(
-        renderer: &RendererHandle,
+        renderer: &Arc<Renderer>,
         subpass: &Subpass,
-        attachments: &Arc<dyn AttachmentMap>,
         light: Arc<Uniform<AmbientLight>>
     ) -> Self {
-        let target = renderer.target();
-
-        let ambient_vert = ambient_vert::load(target.device().vk_device().clone())
+        let ambient_vert = ambient_vert::load(renderer.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let ambient_frag = ambient_frag::load(target.device().vk_device().clone())
+        let ambient_frag = ambient_frag::load(renderer.device().vk_device().clone())
             .expect("Failed to create fragment shader module")
             .entry_point("main").unwrap();
 
@@ -90,9 +86,9 @@ impl AmbientRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            target.device().vk_device().clone(),
+            renderer.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
         let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
@@ -130,25 +126,22 @@ impl AmbientRenderer {
             ViewportType::TopLeft,
         );
 
-        let descriptor_set = EngineDescriptorSet::builder(target)
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
-            .descriptor_source(0, Arc::new(AttachmentDescriptor::new(
-                attachments.clone(),
-                "color",
-            )))
+            .descriptor_source(0, renderer.frame_manager().attachment_descriptor("color"))
             .descriptor_source(1, light)
-            .build().unwrap();
+            .build();
 
         Self {
             graphics,
-            screen_buffer: FlatVertex::screen_buffer(target.device().memory_allocator().clone()),
+            screen_buffer: FlatVertex::screen_buffer(renderer.device().memory_allocator().clone()),
             descriptor_set,
         }
     }
 }
 
 impl EngineRenderHandler for AmbientRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         let graphics = self.graphics.vk_graphics();
 
         builder
@@ -157,7 +150,7 @@ impl EngineRenderHandler for AmbientRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+                self.descriptor_set.descriptor_set().unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap()
             .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
@@ -170,20 +163,21 @@ pub struct AmbientRendererBootstrap {
 
 impl AmbientRendererBootstrap {
     #[inline]
-    pub fn new(target: &Arc<dyn RenderTarget>) -> Arc<Self> {
+    pub fn new(renderer: &Arc<Renderer>) -> Arc<Self> {
         Arc::new(Self {
             light: Arc::new(Uniform::new(
-                target,
+                renderer.device().clone(),
+                renderer.frame_manager(),
                 AmbientLight::default(),
             ).unwrap()),
         })
     }
 
     pub fn bootstrap(self: &Arc<AmbientRendererBootstrap>)
-            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> AmbientRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> AmbientRenderer {
         let self_clone = self.clone();
-        move |renderer, subpass, attachments| {
-            AmbientRenderer::new(renderer, subpass, attachments, self_clone.light.clone())
+        move |renderer, subpass| {
+            AmbientRenderer::new(renderer, subpass, self_clone.light.clone())
         }
     }
 

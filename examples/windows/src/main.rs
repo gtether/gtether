@@ -250,12 +250,12 @@ impl Application for WindowsApp {
         });
         //window.set_cursor_visible(false);
 
-        let target = window.renderer().target();
+        let renderer = window.renderer();
 
-        let cube_renderer = CubeRendererBootstrap::new(target);
-        let ambient_renderer = AmbientRendererBootstrap::new(target);
+        let cube_renderer = CubeRendererBootstrap::new(renderer);
+        let ambient_renderer = AmbientRendererBootstrap::new(renderer);
         let directional_renderer = DirectionalRendererBootstrap::new(
-            target,
+            renderer,
             vec![
                 PointLight {
                     position: [-4.0, -4.0, 0.0, 1.0],
@@ -274,7 +274,7 @@ impl Application for WindowsApp {
             .font(console_font)
             .build().unwrap();
 
-        let render_pass = EngineRenderPassBuilder::new(window.renderer())
+        let render_pass = EngineRenderPassBuilder::new(renderer.clone())
             .attachment("color", AttachmentDescription {
                 format: Format::A2B10G10R10_UNORM_PACK32,
                 samples: SampleCount::Sample1,
@@ -296,7 +296,7 @@ impl Application for WindowsApp {
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
             }, Some(1.0))
-            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0])
+            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0]).unwrap()
             .begin_subpass()
                 .color_attachment("color")
                 .color_attachment("normals")
@@ -311,8 +311,8 @@ impl Application for WindowsApp {
                 .handler(directional_renderer.bootstrap())
                 .handler(console_gui.bootstrap_renderer())
             .end_subpass()
-            .build();
-        window.renderer().set_render_pass(render_pass).unwrap();
+            .build().unwrap();
+        window.renderer().set_render_pass(render_pass);
 
         let mn = cube_renderer.mn().clone();
         *mn.write() = MN::new(model);

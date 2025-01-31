@@ -8,19 +8,19 @@ use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::Validated;
 
 use crate::render::model::{Model, ModelVertex, ModelVertexNormal, ModelVertexNormalColor, ModelVertexNormalTex};
-use crate::render::Device;
+use crate::render::EngineDevice;
 use crate::resource::manager::ResourceManager;
 use crate::resource::path::ResourcePath;
 use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
 
 pub struct ModelObjLoader<V: Vertex> {
-    device: Arc<Device>,
+    device: Arc<EngineDevice>,
     _vertex_type: PhantomData<V>,
 }
 
 impl<V: Vertex> ModelObjLoader<V> {
     #[inline]
-    pub fn new(device: Arc<Device>) -> Self {
+    pub fn new(device: Arc<EngineDevice>) -> Self {
         Self {
             device,
             _vertex_type: PhantomData,

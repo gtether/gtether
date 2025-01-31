@@ -5,7 +5,7 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::{Validated, ValidationError};
 
-use crate::render::Device;
+use crate::render::EngineDevice;
 
 pub mod obj;
 
@@ -50,7 +50,7 @@ pub struct ModelVertexNormalTex {
 pub trait Index: BufferContents {
     #[inline]
     fn create_subbuffer<I>(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         iter: I,
     ) -> Result<Subbuffer<[Self]>, Validated<AllocateBufferError>>
     where
@@ -73,7 +73,7 @@ pub trait Index: BufferContents {
     }
 
     fn create_index_buffer<I>(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         iter: I,
     ) -> Result<IndexBuffer, Validated<AllocateBufferError>>
     where
@@ -84,7 +84,7 @@ pub trait Index: BufferContents {
 impl Index for u8 {
     #[inline]
     fn create_index_buffer<I>(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         iter: I,
     ) -> Result<IndexBuffer, Validated<AllocateBufferError>>
     where
@@ -98,7 +98,7 @@ impl Index for u8 {
 impl Index for u16 {
     #[inline]
     fn create_index_buffer<I>(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         iter: I,
     ) -> Result<IndexBuffer, Validated<AllocateBufferError>>
     where
@@ -112,7 +112,7 @@ impl Index for u16 {
 impl Index for u32 {
     #[inline]
     fn create_index_buffer<I>(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         iter: I,
     ) -> Result<IndexBuffer, Validated<AllocateBufferError>>
     where
@@ -142,7 +142,7 @@ impl<V: Vertex> Model<V> {
     }
 
     pub fn from_raw<I, IV, II>(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         vertices: IV,
         indices: Option<II>,
     ) -> Result<Self, Validated<AllocateBufferError>>

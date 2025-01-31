@@ -14,15 +14,18 @@
 //! These utilities are entirely optional, and you are free to roll your own logic for Vulkan
 //! descriptor sets.
 
-use std::fmt::{Debug, Formatter};
+use std::convert::Infallible;
+use std::fmt::Debug;
 use std::sync::Arc;
-use parking_lot::Mutex;
+use educe::Educe;
+use parking_lot::MappedMutexGuard;
 use smallvec::SmallVec;
 use vulkano::descriptor_set::{DescriptorSet, DescriptorSetWithOffsets, PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::descriptor_set::layout::DescriptorSetLayout;
 use vulkano::{Validated, VulkanError};
 
-use crate::render::{Device, RenderTarget};
+use crate::render::{EngineDevice, Renderer};
+use crate::render::frame::{Frame, FrameManager, FrameSet};
 
 /// Iterator for descriptor memory offset values
 ///
@@ -311,17 +314,12 @@ struct Descriptor {
     source: Arc<dyn VKDescriptorSource>,
 }
 
+#[derive(Educe)]
+#[educe(Debug)]
 struct EngineDescriptorSetFrame {
+    #[educe(Debug(ignore))]
     descriptor_set: Arc<PersistentDescriptorSet>,
     descriptor_hashes: SmallVec<[u64; 8]>,
-}
-
-impl Debug for EngineDescriptorSetFrame {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineDescriptorSetFrame")
-            .field("descriptor_hashes", &self.descriptor_hashes)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Helper struct for maintaining a Vulkan descriptor set.
@@ -332,22 +330,19 @@ impl Debug for EngineDescriptorSetFrame {
 /// automatically checks [hashes](VKDescriptorSource#hashing) for descriptors, and will first
 /// recreate the descriptor set from its sources as needed.
 ///
+/// Descriptor set creation is lazy. When this struct is first created, and when the framebuffers
+/// it relies on change, there will be no descriptor sets initialized. Instead, descriptor sets will
+/// be created when [queried](EngineDescriptorSet::descriptor_set) if they haven't been already.
+/// This means you can create descriptor sets for render passes that are not currently active in the
+/// renderer, as long as they are only bound when the relevant render pass _is_ active.
+///
 /// See [EngineDescriptorSetBuilder] for examples of how to create an EngineDescriptorSet.
+#[derive(Debug)]
 pub struct EngineDescriptorSet {
-    device: Arc<Device>,
+    device: Arc<EngineDevice>,
     layout: Arc<DescriptorSetLayout>,
-    descriptors: SmallVec<[Descriptor; 8]>,
-    frames: Mutex<SmallVec<[EngineDescriptorSetFrame; 3]>>,
-}
-
-impl Debug for EngineDescriptorSet {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineDescriptorSet")
-            .field("layout", &self.layout)
-            .field("descriptors", &self.descriptors)
-            .field("frames", &self.frames)
-            .finish_non_exhaustive()
-    }
+    descriptors: Arc<SmallVec<[Descriptor; 8]>>,
+    frames: Arc<FrameSet<Option<EngineDescriptorSetFrame>, Infallible>>,
 }
 
 impl EngineDescriptorSet {
@@ -355,12 +350,12 @@ impl EngineDescriptorSet {
     ///
     /// This is the recommended way to create EngineDescriptorSets.
     #[inline]
-    pub fn builder(target: &Arc<dyn RenderTarget>) -> EngineDescriptorSetBuilder {
-        EngineDescriptorSetBuilder::new(target.clone())
+    pub fn builder(renderer: Arc<Renderer>) -> EngineDescriptorSetBuilder {
+        EngineDescriptorSetBuilder::new(renderer)
     }
 
     fn create_frame(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         layout: Arc<DescriptorSetLayout>,
         frame_idx: usize,
         descriptors: &SmallVec<[Descriptor; 8]>,
@@ -383,36 +378,55 @@ impl EngineDescriptorSet {
         })
     }
 
+    fn new(
+        device: Arc<EngineDevice>,
+        frame_manager: Arc<dyn FrameManager>,
+        layout: Arc<DescriptorSetLayout>,
+        descriptors: SmallVec<[Descriptor; 8]>,
+    ) -> Self {
+        let descriptors = Arc::new(descriptors);
+        let frames = FrameSet::new(
+            frame_manager,
+            |_| Ok(None),
+        ).unwrap();
+
+        Self {
+            device,
+            layout,
+            descriptors,
+            frames,
+        }
+    }
+
     /// The descriptor set layout used to create descriptor sets.
     #[inline]
     pub fn layout(&self) -> &Arc<DescriptorSetLayout> { &self.layout }
 
-    fn descriptor_set_impl(&self, frame_idx: usize)
+    fn descriptor_set_impl(&self, frame: &mut MappedMutexGuard<Frame<Option<EngineDescriptorSetFrame>>>)
             -> Result<Arc<PersistentDescriptorSet>, Validated<VulkanError>> {
-        let mut frames = self.frames.lock();
-        let frame = frames.get(frame_idx)
-            .expect("Frame count should match target's frame count");
-
         let mut stale = false;
-        for (idx, descriptor) in self.descriptors.iter().enumerate() {
-            let old_hash = frame.descriptor_hashes[idx];
-            let new_hash = descriptor.source.update_descriptor_source(frame_idx);
-            if new_hash != old_hash {
-                stale = true;
+        if let Some(frame_data) = &***frame {
+            for (idx, descriptor) in self.descriptors.iter().enumerate() {
+                let old_hash = frame_data.descriptor_hashes[idx];
+                let new_hash = descriptor.source.update_descriptor_source(frame.index());
+                if new_hash != old_hash {
+                    stale = true;
+                }
             }
+        } else {
+            stale = true;
         }
 
         if stale {
-            frames[frame_idx] = Self::create_frame(
+            ***frame = Some(Self::create_frame(
                 &self.device,
                 self.layout.clone(),
-                frame_idx,
+                frame.index(),
                 &self.descriptors,
-            )?;
-            Ok(frames[frame_idx].descriptor_set.clone())
-        } else {
-            Ok(frame.descriptor_set.clone())
+            )?);
         }
+
+        Ok(frame.as_ref().unwrap().descriptor_set.clone())
     }
 
     /// Get a Vulkan descriptor set for a given `frame_idx`.
@@ -433,7 +447,6 @@ impl EngineDescriptorSet {
     ///
     /// use gtether::render::descriptor_set::EngineDescriptorSet;
     /// use gtether::render::render_pass::EngineRenderHandler;
-    /// use gtether::render::swapchain::Framebuffer;
     ///
     /// struct MyRenderHandler {
     ///     graphics: Arc<GraphicsPipeline>,
@@ -441,23 +454,24 @@ impl EngineDescriptorSet {
     /// }
     ///
     /// impl EngineRenderHandler for MyRenderHandler {
-    ///     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    ///     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
     ///         builder
     ///             .bind_descriptor_sets(
     ///                 PipelineBindPoint::Graphics,
     ///                 self.graphics.layout().clone(),
     ///                 0,
-    ///                 self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+    ///                 self.descriptor_set.descriptor_set().unwrap(),
     ///             ).unwrap()
     ///             /* other bind and draw calls */;
     ///     }
     /// }
     /// ```
-    pub fn descriptor_set(&self, frame_idx: usize)
+    pub fn descriptor_set(&self)
             -> Result<DescriptorSetWithOffsets, Validated<VulkanError>> {
-        let base_descriptor_set = self.descriptor_set_impl(frame_idx)?;
+        let mut frame = self.frames.current();
+        let base_descriptor_set = self.descriptor_set_impl(&mut frame)?;
         let offsets = self.descriptors.iter()
-            .map(|descriptor| descriptor.source.descriptor_offsets(frame_idx))
+            .map(|descriptor| descriptor.source.descriptor_offsets(frame.index()))
             .flatten()
             .map(|_| 0);
         Ok(base_descriptor_set.offsets(offsets))
@@ -478,7 +492,6 @@ impl EngineDescriptorSet {
     ///
     /// use gtether::render::descriptor_set::EngineDescriptorSet;
     /// use gtether::render::render_pass::EngineRenderHandler;
-    /// use gtether::render::swapchain::Framebuffer;
     ///
     /// struct MyRenderHandler {
     ///     graphics: Arc<GraphicsPipeline>,
@@ -486,9 +499,9 @@ impl EngineDescriptorSet {
     /// }
     ///
     /// impl EngineRenderHandler for MyRenderHandler {
-    ///     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    ///     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
     ///         let descriptor_sets = self.descriptor_set
-    ///             .descriptor_set_with_offsets(frame.index()).unwrap();
+    ///             .descriptor_set_with_offsets().unwrap();
     ///         for descriptor_set in descriptor_sets {
     ///             builder
     ///                 .bind_descriptor_sets(
@@ -502,11 +515,12 @@ impl EngineDescriptorSet {
     ///     }
     /// }
     /// ```
-    pub fn descriptor_set_with_offsets(&self, frame_idx: usize)
+    pub fn descriptor_set_with_offsets(&self)
             -> Result<DescriptorSetWithOffsetsIter, Validated<VulkanError>> {
-        let base_descriptor_set = self.descriptor_set_impl(frame_idx)?;
+        let mut frame = self.frames.current();
+        let base_descriptor_set = self.descriptor_set_impl(&mut frame)?;
         let offset_iters = self.descriptors.iter()
-            .map(|descriptor| descriptor.source.descriptor_offsets(frame_idx))
+            .map(|descriptor| descriptor.source.descriptor_offsets(frame.index()))
             .flatten();
         Ok(DescriptorSetWithOffsetsIter::new(base_descriptor_set, offset_iters))
     }
@@ -521,19 +535,19 @@ impl EngineDescriptorSet {
 /// use vulkano::{Validated, VulkanError};
 ///
 /// use gtether::render::descriptor_set::{EngineDescriptorSet, VKDescriptorSource};
-/// use gtether::render::RenderTarget;
+/// use gtether::render::Renderer;
 /// #
 /// # fn get_descriptor_source_a() -> Arc<dyn VKDescriptorSource> { unreachable!() }
 /// # fn get_descriptor_source_b() -> Arc<dyn VKDescriptorSource> { unreachable!() }
 ///
 /// fn create_descriptor_set(
-///     target: &Arc<dyn RenderTarget>,
+///     renderer: Arc<Renderer>,
 ///     layout: Arc<DescriptorSetLayout>,
 /// ) -> Result<EngineDescriptorSet, Validated<VulkanError>> {
 ///     let descriptor_source_a: Arc<dyn VKDescriptorSource> = get_descriptor_source_a();
 ///     let descriptor_source_b: Arc<dyn VKDescriptorSource> = get_descriptor_source_b();
 ///
-///     EngineDescriptorSet::builder(target)
+///     EngineDescriptorSet::builder(renderer)
 ///         .layout(layout)
 ///         .descriptor_source(0, descriptor_source_a)
 ///         .descriptor_source(1, descriptor_source_b)
@@ -541,7 +555,7 @@ impl EngineDescriptorSet {
 /// }
 /// ```
 pub struct EngineDescriptorSetBuilder {
-    target: Arc<dyn RenderTarget>,
+    renderer: Arc<Renderer>,
     layout: Option<Arc<DescriptorSetLayout>>,
     descriptors: SmallVec<[Descriptor; 8]>,
 }
@@ -551,9 +565,9 @@ impl EngineDescriptorSetBuilder {
     ///
     /// It is recommended to use [EngineDescriptorSet::builder()] instead.
     #[inline]
-    pub fn new(target: Arc<dyn RenderTarget>) -> Self {
+    pub fn new(renderer: Arc<Renderer>) -> Self {
         Self {
-            target,
+            renderer,
             layout: None,
             descriptors: SmallVec::new(),
         }
@@ -583,22 +597,16 @@ impl EngineDescriptorSetBuilder {
     /// # Errors
     ///
     /// This can error when the underlying Vulkan descriptor set/s fail to create.
-    pub fn build(&self) -> Result<EngineDescriptorSet, Validated<VulkanError>> {
+    pub fn build(&self) -> EngineDescriptorSet {
         let layout = self.layout.clone()
             .expect(".layout() must be set");
         let descriptors = self.descriptors.clone();
 
-        let frames = (0..self.target.framebuffer_count() as usize).into_iter()
-            .map(|frame_idx| {
-                EngineDescriptorSet::create_frame(self.target.device(), layout.clone(), frame_idx, &descriptors)
-            })
-            .collect::<Result<SmallVec<_>, _>>()?;
-
-        Ok(EngineDescriptorSet {
-            device: self.target.device().clone(),
+        EngineDescriptorSet::new(
+            self.renderer.device().clone(),
+            self.renderer.frame_manager(),
             layout,
             descriptors,
-            frames: Mutex::new(frames),
-        })
+        )
     }
 }

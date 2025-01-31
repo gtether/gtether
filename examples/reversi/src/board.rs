@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use gtether::render::attachment::AttachmentMap;
 use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::model::{Model, ModelVertexNormal};
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
-use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{Device, RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use gtether::render::{EngineDevice, RenderTarget, Renderer, RendererEventData, RendererEventType};
 use gtether::resource::Resource;
 use itertools::Itertools;
 use parry3d::na::Point3;
@@ -551,11 +549,11 @@ impl Board {
         self: &Arc<Self>,
         model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
         model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
-    ) -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> BoardRenderer {
+    ) -> impl FnOnce(&Arc<Renderer>, &Subpass) -> BoardRenderer {
         let self_clone = self.clone();
         let transform = self.transform.clone();
         let camera = self.camera.clone();
-        move |renderer, subpass, _| {
+        move |renderer, subpass| {
             BoardRenderer::new(
                 self_clone,
                 transform,
@@ -571,9 +569,9 @@ impl Board {
     pub fn bootstrap_text_renderer(
         self: &Arc<Self>,
         font: Arc<Resource<dyn Font>>,
-    ) -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> BoardTextRenderer {
+    ) -> impl FnOnce(&Arc<Renderer>, &Subpass) -> BoardTextRenderer {
         let self_clone = self.clone();
-        move |renderer, subpass, _| {
+        move |renderer, subpass| {
             BoardTextRenderer::new(
                 renderer,
                 subpass,
@@ -611,7 +609,7 @@ pub struct BoardRenderer {
     board: Arc<Board>,
     model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
     model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
-    device: Arc<Device>,
+    device: Arc<EngineDevice>,
     graphics: Arc<EngineGraphicsPipeline>,
     selected_graphics: Arc<EngineGraphicsPipeline>,
     instances: Subbuffer<[TileInstance]>,
@@ -625,16 +623,14 @@ impl BoardRenderer {
         camera: Arc<Uniform<VP, Camera>>,
         model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
         model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
-        renderer: &RendererHandle,
+        renderer: &Arc<Renderer>,
         subpass: &Subpass,
     ) -> Self {
-        let target = renderer.target();
-
-        let board_vert = board_vert::load(target.device().vk_device().clone())
+        let board_vert = board_vert::load(renderer.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let board_frag = board_frag::load(target.device().vk_device().clone())
+        let board_frag = board_frag::load(renderer.device().vk_device().clone())
             .expect("Failed to create fragment shader module")
             .entry_point("main").unwrap();
 
@@ -648,9 +644,9 @@ impl BoardRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            target.device().vk_device().clone(),
+            renderer.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
         let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
@@ -714,7 +710,7 @@ impl BoardRenderer {
             .collect::<Vec<_>>();
 
         let instances = Buffer::from_iter(
-            target.device().memory_allocator().clone(),
+            renderer.device().memory_allocator().clone(),
             BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER,
                 ..Default::default()
@@ -727,17 +723,17 @@ impl BoardRenderer {
             instances,
         ).unwrap();
 
-        let descriptor_set = EngineDescriptorSet::builder(target)
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
             .descriptor_source(0, camera)
             .descriptor_source(1, transform)
-            .build().unwrap();
+            .build();
 
         Self {
             board,
             model_tile,
             model_piece,
-            device: target.device().clone(),
+            device: renderer.device().clone(),
             graphics,
             selected_graphics,
             instances,
@@ -747,7 +743,7 @@ impl BoardRenderer {
 }
 
 impl EngineRenderHandler for BoardRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         let graphics = self.graphics.vk_graphics();
         let selected_graphics = self.selected_graphics.vk_graphics();
         let model_tile = self.model_tile.read();
@@ -759,7 +755,7 @@ impl EngineRenderHandler for BoardRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+                self.descriptor_set.descriptor_set().unwrap(),
             ).unwrap();
         model_tile.draw_instanced(builder, self.instances.clone()).unwrap();
 
@@ -865,7 +861,7 @@ impl BoardTextRendererLayout {
         )
     }
 
-    fn new(renderer: &RendererHandle, font_sheet: Arc<Resource<FontSheet>>) -> Arc<Self> {
+    fn new(renderer: &Arc<Renderer>, font_sheet: Arc<Resource<FontSheet>>) -> Arc<Self> {
         let layout = Self::create_layout(
             renderer.target(),
             font_sheet.read().sizer(),
@@ -902,7 +898,7 @@ pub struct BoardTextRenderer {
 
 impl BoardTextRenderer {
     fn new(
-        renderer: &RendererHandle,
+        renderer: &Arc<Renderer>,
         subpass: &Subpass,
         font: Arc<Resource<dyn Font>>,
         board: Arc<Board>,
@@ -935,8 +931,8 @@ impl BoardTextRenderer {
 }
 
 impl EngineRenderHandler for BoardTextRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
-        let mut pass = self.font_compositor.begin_pass(builder, frame);
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+        let mut pass = self.font_compositor.begin_pass(builder);
 
         let mut layout = self.layout.layout.lock();
         layout.clear();

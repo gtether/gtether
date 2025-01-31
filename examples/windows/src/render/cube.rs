@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
 use gtether::event::Event;
-use gtether::render::attachment::AttachmentMap;
 use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
-use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::Uniform;
-use gtether::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use gtether::render::{Renderer, RendererEventData, RendererEventType};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -57,13 +55,11 @@ pub struct CubeRenderer {
 
 impl CubeRenderer {
     fn new(
-        renderer: &RendererHandle,
+        renderer: &Arc<Renderer>,
         subpass: &Subpass,
         mn: Arc<Uniform<MN>>,
         vp: Arc<Uniform<VP>>,
     ) -> Self {
-        let target = renderer.target();
-
         let color = [1.0, 1.0, 1.0];
 
         let vertices = [
@@ -112,7 +108,7 @@ impl CubeRenderer {
         ];
 
         let vertex_buffer = Buffer::from_iter(
-            target.device().memory_allocator().clone(),
+            renderer.device().memory_allocator().clone(),
             BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER,
                 ..Default::default()
@@ -124,11 +120,11 @@ impl CubeRenderer {
             vertices,
         ).unwrap();
 
-        let deferred_vert = deferred_vert::load(target.device().vk_device().clone())
+        let deferred_vert = deferred_vert::load(renderer.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let deferred_frag = deferred_frag::load(target.device().vk_device().clone())
+        let deferred_frag = deferred_frag::load(renderer.device().vk_device().clone())
             .expect("Failed to create fragment shader module")
             .entry_point("main").unwrap();
 
@@ -142,9 +138,9 @@ impl CubeRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            target.device().vk_device().clone(),
+            renderer.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
         let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
@@ -189,11 +185,11 @@ impl CubeRenderer {
             }
         );
 
-        let descriptor_set = EngineDescriptorSet::builder(target)
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
             .descriptor_source(0, vp)
             .descriptor_source(1, mn)
-            .build().unwrap();
+            .build();
 
         Self {
             graphics,
@@ -204,7 +200,7 @@ impl CubeRenderer {
 }
 
 impl EngineRenderHandler for CubeRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         let graphics = self.graphics.vk_graphics();
 
         builder
@@ -213,7 +209,7 @@ impl EngineRenderHandler for CubeRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+                self.descriptor_set.descriptor_set().unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
             .draw(self.vertex_buffer.len() as u32, 1, 0, 0).unwrap();
@@ -227,23 +223,25 @@ pub struct CubeRendererBootstrap {
 
 impl CubeRendererBootstrap {
     #[inline]
-    pub fn new(target: &Arc<dyn RenderTarget>) -> Arc<Self> {
+    pub fn new(renderer: &Arc<Renderer>) -> Arc<Self> {
         Arc::new(Self {
             mn: Arc::new(Uniform::new(
-                target,
+                renderer.device().clone(),
+                renderer.frame_manager(),
                 MN::default(),
             ).unwrap()),
             vp: Arc::new(Uniform::new(
-                target,
+                renderer.device().clone(),
+                renderer.frame_manager(),
                 VP::default(),
             ).unwrap()),
         })
     }
 
     pub fn bootstrap(self: &Arc<CubeRendererBootstrap>)
-            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> CubeRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> CubeRenderer {
         let self_clone = self.clone();
-        move |renderer, subpass, _| {
+        move |renderer, subpass| {
             CubeRenderer::new(renderer, subpass, self_clone.mn.clone(), self_clone.vp.clone())
         }
     }

@@ -1,11 +1,9 @@
 use bytemuck::NoUninit;
-use gtether::render::attachment::{AttachmentDescriptor, AttachmentMap};
 use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
-use gtether::render::swapchain::Framebuffer;
 use gtether::render::uniform::{Uniform, UniformSet, UniformValue};
-use gtether::render::{FlatVertex, RenderTarget, RendererHandle};
+use gtether::render::{FlatVertex, RenderTarget, Renderer};
 use std::sync::Arc;
 use parry3d::na::{Isometry3, Perspective3, Point3};
 use vulkano::buffer::{BufferContents, Subbuffer};
@@ -20,6 +18,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use gtether::render::frame::FrameManagerExt;
 
 #[derive(BufferContents)]
 #[repr(C)]
@@ -178,20 +177,17 @@ pub struct DeferredLightingRenderer {
 
 impl DeferredLightingRenderer {
     fn new(
-        renderer: &RendererHandle,
+        renderer: &Arc<Renderer>,
         subpass: &Subpass,
-        attachments: &Arc<dyn AttachmentMap>,
         ambient_light: Arc<Uniform<AmbientLight>>,
         point_lights: Arc<UniformSet<PointLight, 8>>,
     ) -> Self {
-        let target = renderer.target();
-
         let (ambient_vertex_input_state, ambient_stages) = {
-            let vert = ambient_vert::load(target.device().vk_device().clone())
+            let vert = ambient_vert::load(renderer.device().vk_device().clone())
                 .expect("Failed to create vertex shader module")
                 .entry_point("main").unwrap();
 
-            let frag = ambient_frag::load(target.device().vk_device().clone())
+            let frag = ambient_frag::load(renderer.device().vk_device().clone())
                 .expect("Failed to create fragment shader module")
                 .entry_point("main").unwrap();
 
@@ -208,11 +204,11 @@ impl DeferredLightingRenderer {
         };
 
         let (directional_vertex_input_state, directional_stages) = {
-            let vert = directional_vert::load(target.device().vk_device().clone())
+            let vert = directional_vert::load(renderer.device().vk_device().clone())
                 .expect("Failed to create vertex shader module")
                 .entry_point("main").unwrap();
 
-            let frag = directional_frag::load(target.device().vk_device().clone())
+            let frag = directional_frag::load(renderer.device().vk_device().clone())
                 .expect("Failed to create fragment shader module")
                 .entry_point("main").unwrap();
 
@@ -237,9 +233,9 @@ impl DeferredLightingRenderer {
                 .get_mut(&3).unwrap()
                 .descriptor_type = DescriptorType::UniformBufferDynamic;
             PipelineLayout::new(
-                target.device().vk_device().clone(),
+                renderer.device().vk_device().clone(),
                 layout_create_info
-                    .into_pipeline_layout_create_info(target.device().vk_device().clone()).unwrap(),
+                    .into_pipeline_layout_create_info(renderer.device().vk_device().clone()).unwrap(),
             ).unwrap()
         };
         let descriptor_layout = pipeline_layout.set_layouts().get(0).unwrap().clone();
@@ -289,24 +285,16 @@ impl DeferredLightingRenderer {
         );
 
         let screen_buffer = FlatVertex::screen_buffer(
-            target.device().memory_allocator().clone()
+            renderer.device().memory_allocator().clone()
         );
 
-        let attachment_color = Arc::new(AttachmentDescriptor::new(
-            attachments.clone(),
-            "color",
-        ));
-        let attachment_normals = Arc::new(AttachmentDescriptor::new(
-            attachments.clone(),
-            "normals",
-        ));
-        let descriptor_set = EngineDescriptorSet::builder(target)
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
-            .descriptor_source(0, attachment_color)
-            .descriptor_source(1, attachment_normals)
+            .descriptor_source(0, renderer.frame_manager().attachment_descriptor("color"))
+            .descriptor_source(1, renderer.frame_manager().attachment_descriptor("normals"))
             .descriptor_source(2, ambient_light)
             .descriptor_source(3, point_lights)
-            .build().unwrap();
+            .build();
 
         Self {
             pipeline_layout,
@@ -319,7 +307,7 @@ impl DeferredLightingRenderer {
 }
 
 impl EngineRenderHandler for DeferredLightingRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         let ambient_graphics = self.ambient_graphics.vk_graphics();
         let directional_graphics = self.directional_graphics.vk_graphics();
 
@@ -331,13 +319,13 @@ impl EngineRenderHandler for DeferredLightingRenderer {
                 PipelineBindPoint::Graphics,
                 self.pipeline_layout.clone(),
                 0,
-                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+                self.descriptor_set.descriptor_set().unwrap(),
             ).unwrap()
             .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
 
         builder.bind_pipeline_graphics(directional_graphics.clone()).unwrap();
         let descriptor_sets = self.descriptor_set
-            .descriptor_set_with_offsets(frame.index()).unwrap();
+            .descriptor_set_with_offsets().unwrap();
         for descriptor_set in descriptor_sets {
             builder
                 .bind_descriptor_sets(
@@ -358,27 +346,28 @@ pub struct DeferredLightingRendererBootstrap {
 
 impl DeferredLightingRendererBootstrap {
     #[inline]
-    pub fn new(target: &Arc<dyn RenderTarget>, lights: impl IntoIterator<Item=PointLight>) -> Arc<Self> {
+    pub fn new(renderer: &Arc<Renderer>, lights: impl IntoIterator<Item=PointLight>) -> Arc<Self> {
         Arc::new(Self {
             ambient_light: Arc::new(Uniform::new(
-                target,
+                renderer.device().clone(),
+                renderer.frame_manager(),
                 AmbientLight::default(),
             ).unwrap()),
             point_lights: Arc::new(UniformSet::new(
-                target,
+                renderer.device().clone(),
+                renderer.frame_manager(),
                 lights,
             ).unwrap()),
         })
     }
 
     pub fn bootstrap(self: &Arc<Self>)
-            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> DeferredLightingRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DeferredLightingRenderer {
         let self_clone = self.clone();
-        move |renderer, subpass, attachments| {
+        move |renderer, subpass| {
             DeferredLightingRenderer::new(
                 renderer,
                 subpass,
-                attachments,
                 self_clone.ambient_light.clone(),
                 self_clone.point_lights.clone(),
             )

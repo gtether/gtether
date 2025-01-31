@@ -13,7 +13,7 @@ pub use ab_glyph::InvalidFont;
 
 use crate::render::font::sheet::FontSheetMap;
 use crate::render::font::{CharImgData, Font};
-use crate::render::{RendererEventType, RendererHandle};
+use crate::render::{Renderer, RendererEventType};
 use crate::render::font::size::{FontSizer, ScaledFontSize};
 use crate::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 use crate::resource::manager::ResourceManager;
@@ -228,13 +228,13 @@ impl Font for GlyphFont {
 ///
 /// [rdr]: RendererHandle
 pub struct GlyphFontLoader {
-    renderer: RendererHandle,
+    renderer: Arc<Renderer>,
 }
 
 impl GlyphFontLoader {
     /// Create a new [GlyphFontLoader].
     #[inline]
-    pub fn new(renderer: RendererHandle) -> Self { Self { renderer } }
+    pub fn new(renderer: Arc<Renderer>) -> Self { Self { renderer } }
 }
 
 #[async_trait]

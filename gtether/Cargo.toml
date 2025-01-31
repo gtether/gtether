@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytemuck = { workspace = true }
 chrono = { workspace = true }
+educe = { workspace = true }
 image = { workspace = true, optional = true }
 itertools = { workspace = true }
 nalgebra-glm = { workspace = true }

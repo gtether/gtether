@@ -19,7 +19,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::GraphicsPipeline;
 
 use crate::event::{Event, EventHandler};
-use crate::render::{RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use crate::render::{EngineDevice, RenderTarget, Renderer, RendererEventData, RendererEventType};
 
 /// Helper trait for retrieving a Vulkano [GraphicsPipeline].
 pub trait VKGraphicsPipelineSource: Send + Sync {
@@ -123,16 +123,17 @@ struct EngineGraphicsPipelineState {
 ///
 /// # Examples
 /// ```
-/// # use vulkano::pipeline::graphics::vertex_input::VertexInputState;
+/// # use std::sync::Arc;
+/// use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 /// use vulkano::pipeline::{PipelineLayout, PipelineShaderStageCreateInfo};
 /// use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 /// use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 /// # use vulkano::render_pass::Subpass;
 /// # use vulkano::shader::EntryPoint;
 /// use gtether::render::pipeline::{EngineGraphicsPipeline, ViewportType};
-/// # use gtether::render::RendererHandle;
+/// # use gtether::render::Renderer;
 ///
-/// # fn wrapper(renderer: &RendererHandle, subpass: &Subpass, vertex_shader: EntryPoint, fragment_shader: EntryPoint, vertex_input_state: Option<VertexInputState>) {
+/// # fn wrapper(renderer: &Arc<Renderer>, subpass: &Subpass, vertex_shader: EntryPoint, fragment_shader: EntryPoint, vertex_input_state: Option<VertexInputState>) {
 /// // Assuming some existing vertex/fragment shaders + vertex input state
 /// let stages = [
 ///     PipelineShaderStageCreateInfo::new(vertex_shader),
@@ -140,9 +141,9 @@ struct EngineGraphicsPipelineState {
 /// ];
 ///
 /// let layout = PipelineLayout::new(
-///     renderer.target().device().vk_device().clone(),
+///     renderer.device().vk_device().clone(),
 ///     PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-///         .into_pipeline_layout_create_info(renderer.target().device().vk_device().clone())
+///         .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
 ///         .unwrap(),
 /// ).unwrap();
 ///
@@ -164,6 +165,7 @@ struct EngineGraphicsPipelineState {
 #[derive(Debug)]
 pub struct EngineGraphicsPipeline {
     target: Arc<dyn RenderTarget>,
+    device: Arc<EngineDevice>,
     create_info: GraphicsPipelineCreateInfo,
     viewport_type: ViewportType,
     inner: Mutex<EngineGraphicsPipelineState>,
@@ -174,12 +176,13 @@ impl EngineGraphicsPipeline {
     ///
     /// See [top-level documentation](Self) for more.
     pub fn new(
-        renderer: &RendererHandle,
+        renderer: &Arc<Renderer>,
         create_info: GraphicsPipelineCreateInfo,
         viewport_type: ViewportType,
     ) -> Arc<Self> {
         let graphics = Arc::new(Self {
             target: renderer.target().clone(),
+            device: renderer.device().clone(),
             create_info,
             viewport_type,
             inner: Mutex::new(EngineGraphicsPipelineState::default()),
@@ -199,7 +202,7 @@ impl VKGraphicsPipelineSource for EngineGraphicsPipeline {
             let viewport = self.viewport_type.viewport(&self.target);
 
             let pipeline = GraphicsPipeline::new(
-                self.target.device().vk_device().clone(),
+                self.device.vk_device().clone(),
                 None,
                 GraphicsPipelineCreateInfo {
                     viewport_state: Some(ViewportState {

@@ -34,9 +34,8 @@ use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
 use crate::render::image::ImageSampler;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
-use crate::render::{Device, FlatVertex, RenderTarget, RendererEventType, RendererHandle};
+use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererEventType};
 use crate::render::descriptor_set::EngineDescriptorSet;
-use crate::render::swapchain::Framebuffer;
 use crate::resource::manager::ResourceLoadResult;
 use crate::resource::{Resource, ResourceLoadError, ResourceMut, SubResourceLoader};
 
@@ -158,7 +157,7 @@ impl FontSheet {
     #[inline]
     pub fn from_font(
         font: &Arc<Resource<dyn Font>>,
-        renderer: RendererHandle,
+        renderer: Arc<Renderer>,
         px_scale: f32,
         mapper: Arc<dyn FontSheetMap>,
     ) -> ResourceLoadResult<FontSheet> {
@@ -183,7 +182,7 @@ impl FontSheet {
 }
 
 struct FontSheetLoader {
-    renderer: RendererHandle,
+    renderer: Arc<Renderer>,
     px_scale: f32,
     mapper: Arc<dyn FontSheetMap>,
 }
@@ -192,7 +191,7 @@ impl FontSheetLoader {
     // Encapsulated in separate function to hide AutoCommandBufferBuilder from the async context,
     // because for SOME reason it thinks it gets used across an await boundary - wut.
     fn build_upload_buffer(
-        device: &Arc<Device>,
+        device: &Arc<EngineDevice>,
         upload_buffer: Subbuffer<[u8]>,
         image: Arc<Image>,
     ) -> Result<Arc<PrimaryAutoCommandBuffer>, ResourceLoadError> {
@@ -216,15 +215,13 @@ impl FontSheetLoader {
 #[async_trait]
 impl SubResourceLoader<FontSheet, dyn Font> for FontSheetLoader {
     async fn load(&self, parent: &dyn Font) -> Result<Box<FontSheet>, ResourceLoadError> {
-        let device = self.renderer.target().device();
-
         let char_img_data = parent.char_img_data(self.px_scale, self.mapper.as_ref());
         let img_size = char_img_data.img_size();
         let img_byte_size = char_img_data.img_byte_size();
         let sizer = char_img_data.sizer();
 
         let image = Image::new(
-            device.memory_allocator().clone(),
+            self.renderer.device().memory_allocator().clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R8G8B8A8_SRGB,
@@ -237,7 +234,7 @@ impl SubResourceLoader<FontSheet, dyn Font> for FontSheetLoader {
         ).map_err(Validated::unwrap).map_err(ResourceLoadError::from_error)?;
 
         let upload_buffer = Buffer::new_slice(
-            device.memory_allocator().clone(),
+            self.renderer.device().memory_allocator().clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
                 ..Default::default()
@@ -260,13 +257,13 @@ impl SubResourceLoader<FontSheet, dyn Font> for FontSheetLoader {
         }
 
         let cmd_buffer = Self::build_upload_buffer(
-            device,
+            self.renderer.device(),
             upload_buffer,
             image.clone(),
         )?;
 
         cmd_buffer
-            .execute(device.queue().clone())
+            .execute(self.renderer.device().queue().clone())
             .map_err(ResourceLoadError::from_error)?
             .then_signal_fence_and_flush()
             .map_err(Validated::unwrap).map_err(ResourceLoadError::from_error)?
@@ -322,6 +319,7 @@ mod text_frag {
 /// [FontRenderer] for [FontSheet].
 pub struct FontSheetRenderer {
     target: Arc<dyn RenderTarget>,
+    device: Arc<EngineDevice>,
     font_sheet: Arc<Resource<FontSheet>>,
     graphics: Arc<EngineGraphicsPipeline>,
     glyph_buffer: Subbuffer<[FlatVertex]>,
@@ -330,14 +328,12 @@ pub struct FontSheetRenderer {
 
 impl FontSheetRenderer {
     /// Create a [FontSheetRenderer] from a [FontSheet].
-    pub fn new(renderer: &RendererHandle, subpass: &Subpass, font_sheet: Arc<Resource<FontSheet>>) -> Box<dyn FontRenderer> {
-        let target = renderer.target();
-
-        let text_vert = text_vert::load(target.device().vk_device().clone())
+    pub fn new(renderer: &Arc<Renderer>, subpass: &Subpass, font_sheet: Arc<Resource<FontSheet>>) -> Box<dyn FontRenderer> {
+        let text_vert = text_vert::load(renderer.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let text_frag = text_frag::load(target.device().vk_device().clone())
+        let text_frag = text_frag::load(renderer.device().vk_device().clone())
             .expect("Failed to create fragment shader module")
             .entry_point("main").unwrap();
 
@@ -352,9 +348,9 @@ impl FontSheetRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            target.device().vk_device().clone(),
+            renderer.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
         let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
@@ -388,7 +384,7 @@ impl FontSheetRenderer {
         let font_sampler = Arc::new(ImageSampler::new(
             font_sheet.read().image_view().clone(),
             Sampler::new(
-                target.device().vk_device().clone(),
+                renderer.device().vk_device().clone(),
                 SamplerCreateInfo {
                     mag_filter: Filter::Linear,
                     min_filter: Filter::Linear,
@@ -405,18 +401,19 @@ impl FontSheetRenderer {
         });
 
         let glyph_buffer = FlatVertex::buffer(
-            target.device().memory_allocator().clone(),
+            renderer.device().memory_allocator().clone(),
             glm::vec2(0.0, 0.0),
             glm::vec2(1.0, 1.0),
         );
 
-        let descriptor_set = EngineDescriptorSet::builder(target)
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
             .descriptor_source(0, font_sampler)
-            .build().unwrap();
+            .build();
 
         Box::new(Self {
-            target: target.clone(),
+            target: renderer.target().clone(),
+            device: renderer.device().clone(),
             font_sheet,
             graphics,
             glyph_buffer,
@@ -430,7 +427,6 @@ impl FontRenderer for FontSheetRenderer {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-        frame: &Framebuffer,
     ) {
         let graphics = self.graphics.vk_graphics();
 
@@ -472,7 +468,7 @@ impl FontRenderer for FontSheetRenderer {
 
         // TODO: Reuse the buffer somehow?
         let instance_buffer = Buffer::from_iter(
-            self.target.device().memory_allocator().clone(),
+            self.device.memory_allocator().clone(),
             BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER,
                 ..Default::default()
@@ -492,7 +488,7 @@ impl FontRenderer for FontSheetRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+                self.descriptor_set.descriptor_set().unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, (
                 self.glyph_buffer.clone(),

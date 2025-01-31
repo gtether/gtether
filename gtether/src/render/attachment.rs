@@ -1,21 +1,20 @@
 //! Utilities for Vulkan attachments.
 //!
 //! This module contains helper utilities for working with Vulkan attachments. This includes things
-//! like a [trait][am] for mapping between friendly names and their attachments in a render pass, as
-//! well as an [AttachmentDescriptor] for generating descriptors for attachments between subpasses.
-//!
-//! [am]: AttachmentMap
+//! like an [AttachmentDescriptor] for generating descriptors for attachments between subpasses.
 //!
 //! Many of these utilities are entirely optional, and you are free to roll your own logic for
 //! Vulkan attachments where applicable.
 
-use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
 use ahash::RandomState;
+use std::fmt::Debug;
+use std::sync::Arc;
+use educe::Educe;
 use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::image::view::ImageView;
 
 use crate::render::descriptor_set::VKDescriptorSource;
+use crate::render::frame::FrameManager;
 
 /// Represents a particular attachment for a render pass
 #[derive(Debug)]
@@ -41,13 +40,13 @@ impl AttachmentType {
     /// # Examples
     /// ```
     /// # use std::sync::Arc;
-    /// # use gtether::render::attachment::AttachmentMap;
-    /// # let attachment_map: Arc<dyn AttachmentMap> = return;
-    /// # let frame_index: usize = return;
+    /// # use vulkano::image::view::ImageView;
+    /// use gtether::render::attachment::AttachmentType;
     /// #
-    /// let image_view = attachment_map
-    ///     .get_attachment("my_transient_attachment".to_owned(), frame_index).unwrap()
-    ///     .unwrap_transient();
+    /// # let image_view: Arc<ImageView> = return;
+    ///
+    /// let attachment = AttachmentType::Transient(image_view.clone());
+    /// assert_eq!(image_view, attachment.unwrap_transient());
     /// ```
     pub fn unwrap_transient(self) -> Arc<ImageView> {
         match self {
@@ -67,20 +66,6 @@ impl Clone for AttachmentType {
     }
 }
 
-/// Mapping of attachments to their friendly name.
-pub trait AttachmentMap: Send + Sync {
-    /// Retrieves an attachment by name and framebuffer index.
-    ///
-    /// If there are no attachments associated by that name, or the framebuffer index is out of
-    /// bounds, returns None.
-    fn get_attachment(&self, name: String, frame_index: usize) -> Option<AttachmentType>;
-
-    /// Retrieves all attachments (in order) for a particular framebuffer index.
-    ///
-    /// If the framebuffer index is out of bounds, returns None.
-    fn get_attachments_for_frame(&self, frame_index: usize) -> Option<Vec<AttachmentType>>;
-}
-
 /// Represents a [WriteDescriptor][wd] for a single attachment between subpasses.
 ///
 /// # Examples
@@ -88,15 +73,16 @@ pub trait AttachmentMap: Send + Sync {
 /// use std::sync::Arc;
 /// use vulkano::descriptor_set::layout::DescriptorSetLayout;
 ///
-/// use gtether::render::attachment::{AttachmentDescriptor, AttachmentMap};
+/// use gtether::render::attachment::AttachmentDescriptor;
 /// use gtether::render::descriptor_set::EngineDescriptorSet;
-/// use gtether::render::RenderTarget;
+/// use gtether::render::frame::{FrameManager, FrameManagerExt};
+/// use gtether::render::Renderer;
 /// #
 /// # fn get_descriptor_layout() -> Arc<DescriptorSetLayout> { unreachable!() }
 ///
-/// fn create_renderer(
-///     target: &Arc<dyn RenderTarget>,
-///     attachments: &Arc<dyn AttachmentMap>,
+/// fn create_render_handler(
+///     renderer: Arc<Renderer>,
+///     frame_manager: Arc<dyn FrameManager>,
 ///     // other relevant parameters
 /// ) {
 ///     // Other setup, such as creating pipelines/etc
@@ -104,36 +90,33 @@ pub trait AttachmentMap: Send + Sync {
 ///     // Something in previous setup creates a descriptor set layout
 ///     let descriptor_set_layout: Arc<DescriptorSetLayout> = get_descriptor_layout();
 ///
-///     let descriptor_set = EngineDescriptorSet::builder(target)
+///     let descriptor_set = EngineDescriptorSet::builder(renderer)
 ///         .layout(descriptor_set_layout)
-///         .descriptor_source(0, Arc::new(AttachmentDescriptor::new(attachments.clone(), "my_attachment")))
+///         .descriptor_source(0, Arc::new(AttachmentDescriptor::new(frame_manager.clone(), "foo")))
+///         // Or, using a shortcut
+///         .descriptor_source(1, frame_manager.attachment_descriptor("bar"))
 ///         .build();
 /// }
 /// ```
 ///
 /// [wd]: WriteDescriptorSet
+#[derive(Educe)]
+#[educe(Debug)]
 pub struct AttachmentDescriptor {
-    attachment_map: Arc<dyn AttachmentMap>,
+    frames: Arc<dyn FrameManager>,
     input_name: String,
+    #[educe(Debug(ignore))]
     random_state: RandomState,
-}
-
-impl Debug for AttachmentDescriptor {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AttachmentDescriptor")
-            .field("input_name", &self.input_name)
-            .finish_non_exhaustive()
-    }
 }
 
 impl AttachmentDescriptor {
     /// Create a new AttachmentDescriptor for a particular attachment name.
     pub fn new(
-        attachment_map: Arc<dyn AttachmentMap>,
+        frames: Arc<dyn FrameManager>,
         input_name: impl Into<String>,
     ) -> Self {
         Self {
-            attachment_map,
+            frames,
             input_name: input_name.into(),
             random_state: RandomState::new(),
         }
@@ -142,8 +125,10 @@ impl AttachmentDescriptor {
 
 impl VKDescriptorSource for AttachmentDescriptor {
     fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
-        let image_view = self.attachment_map
-            .get_attachment(self.input_name.clone(), frame_idx).unwrap()
+        let image_view = self.frames
+            .framebuffer(frame_idx).unwrap()
+            .get_attachment(self.input_name.clone())
+                .expect(&format!("No attachment '{}'", &self.input_name))
             .unwrap_transient();
         (
             WriteDescriptorSet::image_view(binding, image_view.clone()),
@@ -153,8 +138,9 @@ impl VKDescriptorSource for AttachmentDescriptor {
 
     fn update_descriptor_source(&self, frame_idx: usize) -> u64 {
         // This COULD be expensive; need to keep an eye on it
-        let image_view = self.attachment_map
-            .get_attachment(self.input_name.clone(), frame_idx).unwrap()
+        let image_view = self.frames
+            .framebuffer(frame_idx).unwrap()
+            .get_attachment(self.input_name.clone()).unwrap()
             .unwrap_transient();
         self.random_state.hash_one(image_view)
     }

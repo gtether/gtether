@@ -91,22 +91,24 @@ impl Application for ReversiApp {
         );
         let model_tile = engine.resources().get_or_load(
             "tile.obj",
-            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().target().device().clone()),
+            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().device().clone()),
             LoadPriority::Immediate,
         );
         let model_piece = engine.resources().get_or_load(
             "piece.obj",
-            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().target().device().clone()),
+            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().device().clone()),
             LoadPriority::Immediate,
         );
 
         let transform = Arc::new(Uniform::new(
-            window.renderer().target(),
+            window.renderer().device().clone(),
+            window.renderer().frame_manager(),
             ModelTransform::new(),
         ).unwrap());
 
         let camera = Arc::new(Uniform::new(
-            window.renderer().target(),
+            window.renderer().device().clone(),
+            window.renderer().frame_manager(),
             Camera::new(
                 window.renderer().target(),
                 &Point3::new(0.0, 5.0, -2.0),
@@ -144,7 +146,7 @@ impl Application for ReversiApp {
         })).unwrap();
 
         let deferred_lighting_renderer = DeferredLightingRendererBootstrap::new(
-            window.renderer().target(),
+            window.renderer(),
             vec![
                 PointLight {
                     position: glm::vec4(-4.0, 10.0, 4.0, 1.0),
@@ -159,7 +161,7 @@ impl Application for ReversiApp {
             .font(console_font.clone())
             .build().unwrap();
 
-        let render_pass = EngineRenderPassBuilder::new(window.renderer())
+        let render_pass = EngineRenderPassBuilder::new(window.renderer().clone())
             .attachment("color", AttachmentDescription {
                 format: Format::A2B10G10R10_UNORM_PACK32,
                 samples: SampleCount::Sample1,
@@ -181,7 +183,7 @@ impl Application for ReversiApp {
                 store_op: AttachmentStoreOp::DontCare,
                 ..Default::default()
             }, Some(1.0))
-            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0])
+            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0]).unwrap()
             .begin_subpass()
                 .color_attachment("color")
                 .color_attachment("normals")
@@ -199,8 +201,8 @@ impl Application for ReversiApp {
                 .handler(board.bootstrap_text_renderer(console_font))
                 .handler(console_gui.bootstrap_renderer())
             .end_subpass()
-            .build();
-        window.renderer().set_render_pass(render_pass).unwrap();
+            .build().unwrap();
+        window.renderer().set_render_pass(render_pass);
 
         self.input.set(window.input_state().create_delegate()).unwrap();
         self.window.set(window).unwrap();

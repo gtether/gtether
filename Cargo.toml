@@ -19,6 +19,7 @@ async-trait = "0.1"
 base64 = "0.22"
 bytemuck = "1.21"
 chrono = "0.4"
+educe = "0.6"
 image = "0.25"
 itertools = "0.14"
 nalgebra-glm = { version = "0.19.0", features = ["convert-bytemuck"]}

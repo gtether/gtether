@@ -14,17 +14,15 @@
 //! # use gtether::render::font::compositor::FontRenderer;
 //! # use gtether::render::font::layout::TextLayout;
 //! # use gtether::render::RenderTarget;
-//! # use gtether::render::swapchain::Framebuffer;
 //! #
 //! # let font_renderer: Box<dyn FontRenderer> = return;
 //! # let builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> = return;
-//! # let frame: &Framebuffer = return;
 //! # let layout_a: TextLayout = return;
 //! # let layout_b: TextLayout = return;
 //!
 //! let font_compositor = FontCompositor::new(font_renderer);
 //!
-//! let mut font_pass = font_compositor.begin_pass(builder, frame);
+//! let mut font_pass = font_compositor.begin_pass(builder);
 //!
 //! font_pass
 //!     .layout(&layout_a)
@@ -36,7 +34,6 @@
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 
 use crate::render::font::layout::{PositionedChar, TextLayout};
-use crate::render::swapchain::Framebuffer;
 
 /// Render helper for a concrete font representation.
 ///
@@ -48,7 +45,6 @@ pub trait FontRenderer: Send + Sync + 'static {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-        frame: &Framebuffer,
     );
 }
 
@@ -71,9 +67,8 @@ impl FontCompositor {
     pub fn begin_pass<'a>(
         &'a self,
         builder: &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        frame: &'a Framebuffer,
     ) -> FontCompositorPass<'a> {
-        FontCompositorPass::new(self, builder, frame)
+        FontCompositorPass::new(self, builder)
     }
 }
 
@@ -81,7 +76,6 @@ impl FontCompositor {
 pub struct FontCompositorPass<'a> {
     compositor: &'a FontCompositor,
     builder: &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    frame: &'a Framebuffer,
     layouts: Vec<&'a TextLayout>,
 }
 
@@ -89,12 +83,10 @@ impl<'a> FontCompositorPass<'a> {
     fn new(
         compositor: &'a FontCompositor,
         builder: &'a mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        frame: &'a Framebuffer,
     ) -> Self {
         Self {
             compositor,
             builder,
-            frame,
             layouts: Vec::new(),
         }
     }
@@ -111,6 +103,6 @@ impl<'a> FontCompositorPass<'a> {
             .map(|layout| layout.iter_build())
             .flatten()
             .collect::<Vec<_>>();
-        self.compositor.renderer.build_commands(self.builder, layout_chars, self.frame);
+        self.compositor.renderer.build_commands(self.builder, layout_chars);
     }
 }

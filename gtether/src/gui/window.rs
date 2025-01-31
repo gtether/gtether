@@ -1,4 +1,3 @@
-use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt, thread};
@@ -12,47 +11,29 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
 use crate::gui::input::{InputEvent, InputState};
-use crate::render::render_pass::NoOpEngineRenderPass;
 use crate::render::Renderer;
-use crate::render::{Device, Instance, RenderTarget, RendererHandle};
+use crate::render::{EngineDevice, Instance, RenderTarget};
 use crate::{EngineMetadata, NonExhaustive};
 
 pub use winit::window::WindowAttributes;
 
+#[derive(Debug)]
 struct WindowRenderTarget {
     winit_window: Arc<WinitWindow>,
     surface: Arc<Surface>,
-    device: Arc<Device>,
 }
 
 impl WindowRenderTarget {
-    fn new(winit_window: Arc<WinitWindow>, instance: Arc<Instance>) -> Self {
+    fn new(winit_window: Arc<WinitWindow>, instance: Arc<Instance>) -> Arc<dyn RenderTarget> {
         let surface = Surface::from_window(
             instance.vk_instance().clone(),
             winit_window.clone(),
         ).unwrap();
 
-        let device = Arc::new(Device::for_surface(
-            instance.clone(),
-            surface.clone(),
-        ));
-
-        Self {
+        Arc::new(Self {
             winit_window,
             surface,
-            device,
-        }
-    }
-
-    #[inline]
-    fn winit_window(&self) -> &Arc<WinitWindow> { &self.winit_window }
-}
-
-impl fmt::Debug for WindowRenderTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WindowRenderTarget")
-            .field("window_id", &self.winit_window.id())
-            .finish()
+        })
     }
 }
 
@@ -68,9 +49,6 @@ impl RenderTarget for WindowRenderTarget {
 
     #[inline]
     fn scale_factor(&self) -> f64 { self.winit_window.scale_factor() }
-
-    #[inline]
-    fn device(&self) -> &Arc<Device> { &self.device }
 }
 
 /// Parameters to create a new window.
@@ -120,7 +98,7 @@ enum WindowEventRequest {
 #[derive(Clone)]
 pub struct WindowHandle {
     id: WindowId,
-    renderer: RendererHandle,
+    renderer: Arc<Renderer>,
     input: Arc<InputState>,
     sender_modify: ump::Client<WindowModifyRequest, (), ()>,
     sender_event: ump::Client<WindowEventRequest, (), ()>,
@@ -139,11 +117,9 @@ impl WindowHandle {
     #[inline]
     pub fn id(&self) -> WindowId { self.id }
 
-    /// The [handle][rh] for this window's [Renderer].
-    ///
-    /// [rh]: RendererHandle
+    /// A reference to this window's [Renderer].
     #[inline]
-    pub fn renderer(&self) -> &RendererHandle { &self.renderer }
+    pub fn renderer(&self) -> &Arc<Renderer> { &self.renderer }
 
     /// The current [InputState] for this window.
     #[inline]
@@ -176,8 +152,8 @@ impl WindowHandle {
 }
 
 struct Window {
-    target: Arc<WindowRenderTarget>,
-    renderer: Renderer,
+    winit_window: Arc<WinitWindow>,
+    renderer: Arc<Renderer>,
     input: Arc<InputState>,
     cursor_visible: bool,
     endpoint_modify: ump::Server<WindowModifyRequest, (), ()>,
@@ -205,45 +181,38 @@ impl Window {
 
         let window_id = winit_window.id();
 
-        let target = Arc::new(WindowRenderTarget::new(
-            winit_window,
+        let target = WindowRenderTarget::new(
+            winit_window.clone(),
             instance.clone(),
+        );
+        let device = Arc::new(EngineDevice::for_surface(
+            instance.clone(),
+            target.surface().clone(),
         ));
+        let renderer = Arc::new(Renderer::new(
+            target,
+            device,
+        ).unwrap());
 
-        let pair: Arc<(Mutex<Option<WindowHandle>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
-        let thread_pair = pair.clone();
+        let input = Arc::new(InputState::default());
+
+        let window_handle = WindowHandle {
+            id: window_id,
+            renderer: renderer.clone(),
+            input: input.clone(),
+            sender_modify,
+            sender_event,
+        };
 
         let join_handle = thread::Builder::new().name(title).spawn(move || {
-            let &(ref lock, ref cvar) = &*thread_pair;
-
-            let dyn_target: Arc<dyn RenderTarget> = target.clone();
-            let render_pass = NoOpEngineRenderPass::new(&dyn_target);
-            let (renderer, renderer_handle) = Renderer::new(&dyn_target, render_pass);
-
-            let input = Arc::new(InputState::default());
-
             let mut window = Self {
-                target,
+                winit_window,
                 renderer,
-                input: input.clone(),
+                input,
                 cursor_visible: true,
                 endpoint_modify,
                 endpoint_event,
             };
-
-            let window_handle = WindowHandle {
-                id: window_id,
-                renderer: renderer_handle,
-                input,
-                sender_modify,
-                sender_event,
-            };
-
-            {
-                let mut handle = lock.lock();
-                *handle = Some(window_handle);
-            }
-            cvar.notify_one();
 
             loop {
                 if !window.tick().is_ok() {
@@ -252,24 +221,17 @@ impl Window {
             }
         }).unwrap();
 
-        let &(ref lock, ref cvar) = &*pair;
-        let mut handle = lock.lock();
-        if handle.is_none() {
-            cvar.wait_while(&mut handle, |handle| handle.is_none());
-        }
-        let window_handle = handle.as_ref().unwrap().clone();
-
         (window_handle, join_handle)
     }
 
     fn set_cursor_visible(&mut self, cursor_visible: bool) {
-        self.target.winit_window.set_cursor_visible(cursor_visible);
+        self.winit_window.set_cursor_visible(cursor_visible);
         let result = if cursor_visible {
-            self.target.winit_window.set_cursor_grab(CursorGrabMode::None)
+            self.winit_window.set_cursor_grab(CursorGrabMode::None)
         } else {
-            self.target.winit_window.set_cursor_grab(CursorGrabMode::Confined).or_else(|e| {
+            self.winit_window.set_cursor_grab(CursorGrabMode::Confined).or_else(|e| {
                 if matches!(e, ExternalError::NotSupported(..)) {
-                    self.target.winit_window.set_cursor_grab(CursorGrabMode::Locked)
+                    self.winit_window.set_cursor_grab(CursorGrabMode::Locked)
                 } else {
                     Err(e)
                 }
@@ -307,7 +269,7 @@ impl Window {
 
         while let Some((event, rctx))
                 = self.endpoint_event.try_pop().map_err(Self::map_ump_error)? {
-            let window_id = self.target.winit_window().id();
+            let window_id = self.winit_window.id();
             match event {
                 WindowEventRequest::Window(event) => match event {
                     WindowEvent::CloseRequested => {

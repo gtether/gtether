@@ -24,7 +24,6 @@ use crate::console::Console;
 use crate::event::{Event, EventHandler};
 use crate::gui::input::{InputDelegateEvent, InputDelegateLock};
 use crate::gui::window::WindowHandle;
-use crate::render::attachment::AttachmentMap;
 use crate::render::font::compositor::FontCompositor;
 use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
@@ -32,9 +31,8 @@ use crate::render::font::size::{FontSize, FontSizer};
 use crate::render::font::Font;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
-use crate::render::swapchain::Framebuffer;
 use crate::render::uniform::Uniform;
-use crate::render::{FlatVertex, RenderTarget, RendererEventData, RendererEventType, RendererHandle};
+use crate::render::{FlatVertex, RenderTarget, Renderer, RendererEventData, RendererEventType};
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
 use crate::render::descriptor_set::EngineDescriptorSet;
@@ -396,9 +394,9 @@ impl ConsoleGui {
     ///
     /// [rpb]: crate::render::render_pass::EngineRenderPassBuilder
     pub fn bootstrap_renderer(self: &Arc<Self>)
-            -> impl FnOnce(&RendererHandle, &Subpass, &Arc<dyn AttachmentMap>) -> ConsoleRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> ConsoleRenderer {
         let self_clone = self.clone();
-        |renderer, subpass, _| {
+        |renderer, subpass| {
             ConsoleRenderer::new(renderer, subpass, self_clone)
         }
     }
@@ -469,21 +467,19 @@ struct ConsoleBackgroundSolidRenderer {
 }
 
 impl ConsoleBackgroundSolidRenderer {
-    fn new(renderer: &RendererHandle, subpass: &Subpass, gui: &Arc<ConsoleGui>, bg: BackgroundSolid) -> Self {
-        let target = renderer.target();
-
+    fn new(renderer: &Arc<Renderer>, subpass: &Subpass, gui: &Arc<ConsoleGui>, bg: BackgroundSolid) -> Self {
         let (min, max) = gui.layout.screen_bounds();
         let buffer = FlatVertex::buffer(
-            target.device().memory_allocator().clone(),
+            renderer.device().memory_allocator().clone(),
             min,
             max,
         );
 
-        let background_vert = background_vert::load(target.device().vk_device().clone())
+        let background_vert = background_vert::load(renderer.device().vk_device().clone())
             .expect("Failed to create vertex shader module")
             .entry_point("main").unwrap();
 
-        let background_frag = background_solid_frag::load(target.device().vk_device().clone())
+        let background_frag = background_solid_frag::load(renderer.device().vk_device().clone())
             .expect("Failed to create fragment shader module")
             .entry_point("main").unwrap();
 
@@ -497,9 +493,9 @@ impl ConsoleBackgroundSolidRenderer {
         ];
 
         let layout = PipelineLayout::new(
-            target.device().vk_device().clone(),
+            renderer.device().vk_device().clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(target.device().vk_device().clone())
+                .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
                 .unwrap(),
         ).unwrap();
         let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
@@ -531,14 +527,15 @@ impl ConsoleBackgroundSolidRenderer {
         );
 
         let color = Arc::new(Uniform::new(
-            target,
+            renderer.device().clone(),
+            renderer.frame_manager(),
             bg,
         ).unwrap());
 
-        let descriptor_set = EngineDescriptorSet::builder(target)
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
             .descriptor_source(0, color)
-            .build().unwrap();
+            .build();
 
         Self {
             graphics,
@@ -547,7 +544,7 @@ impl ConsoleBackgroundSolidRenderer {
         }
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         let graphics = self.graphics.vk_graphics();
 
         builder
@@ -556,7 +553,7 @@ impl ConsoleBackgroundSolidRenderer {
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set(frame.index()).unwrap(),
+                self.descriptor_set.descriptor_set().unwrap(),
             ).unwrap()
             .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
             .draw(
@@ -573,7 +570,7 @@ enum ConsoleBackgroundRenderer {
 }
 
 impl ConsoleBackgroundRenderer {
-    fn new(renderer: &RendererHandle, subpass: &Subpass, gui: &Arc<ConsoleGui>) -> Self {
+    fn new(renderer: &Arc<Renderer>, subpass: &Subpass, gui: &Arc<ConsoleGui>) -> Self {
         match &gui.background {
             ConsoleGuiBackground::Solid(bg) => ConsoleBackgroundRenderer::Solid(
                 ConsoleBackgroundSolidRenderer::new(renderer, subpass, gui, bg.clone())
@@ -581,10 +578,10 @@ impl ConsoleBackgroundRenderer {
         }
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         match self {
             ConsoleBackgroundRenderer::Solid(renderer)
-                => renderer.build_commands(builder, frame),
+                => renderer.build_commands(builder),
         }
     }
 }
@@ -609,7 +606,7 @@ impl ConsoleRenderer {
     ///
     /// [rp]: crate::render::render_pass::EngineRenderPassBuilder
     /// [bs]: ConsoleGui::bootstrap_renderer
-    pub fn new(renderer: &RendererHandle, subpass: &Subpass, gui: Arc<ConsoleGui>) -> Self {
+    pub fn new(renderer: &Arc<Renderer>, subpass: &Subpass, gui: Arc<ConsoleGui>) -> Self {
         let background = ConsoleBackgroundRenderer::new(renderer, subpass, &gui);
 
         let font_compositor = FontCompositor::new(
@@ -645,13 +642,13 @@ impl ConsoleRenderer {
 }
 
 impl EngineRenderHandler for ConsoleRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &Framebuffer) {
+    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
         if !self.gui.visible.load(Ordering::Relaxed) {
             // Nothing to draw
             return;
         }
 
-        self.background.build_commands(builder, frame);
+        self.background.build_commands(builder);
 
         let mut log_layout = self.gui.text_log.lock();
         let prompt_layout = self.gui.text_prompt.lock();
@@ -682,7 +679,7 @@ impl EngineRenderHandler for ConsoleRenderer {
             },
         }
 
-        let mut pass = self.font_compositor.begin_pass(builder, frame);
+        let mut pass = self.font_compositor.begin_pass(builder);
         pass.layout(&log_layout);
         pass.layout(&prompt_layout);
         pass.end_pass();
