@@ -44,7 +44,6 @@ struct SwapchainFrameState {
     current_idx: usize,
 }
 
-// TODO: Merge attachment data into this
 #[derive(Debug)]
 struct SwapchainFrameManager {
     state: RwLock<SwapchainFrameState>,
