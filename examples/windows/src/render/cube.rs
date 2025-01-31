@@ -5,7 +5,7 @@ use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::uniform::Uniform;
-use gtether::render::{Renderer, RendererEventData, RendererEventType};
+use gtether::render::{Renderer, RendererEventData, RendererEventType, VulkanoError};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -19,7 +19,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
-
+use vulkano::Validated;
 use crate::render::{MN, VP};
 
 mod deferred_vert {
@@ -200,19 +200,23 @@ impl CubeRenderer {
 }
 
 impl EngineRenderHandler for CubeRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_pipeline_graphics(graphics.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().unwrap(),
-            ).unwrap()
-            .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
-            .draw(self.vertex_buffer.len() as u32, 1, 0, 0).unwrap();
+                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+            )?
+            .bind_vertex_buffers(0, self.vertex_buffer.clone())?
+            .draw(self.vertex_buffer.len() as u32, 1, 0, 0)?;
+        Ok(())
     }
 }
 

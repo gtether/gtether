@@ -444,9 +444,11 @@ impl EngineDescriptorSet {
     /// use std::sync::Arc;
     /// use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
     /// use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint};
+    /// use vulkano::Validated;
     ///
     /// use gtether::render::descriptor_set::EngineDescriptorSet;
     /// use gtether::render::render_pass::EngineRenderHandler;
+    /// use gtether::render::VulkanoError;
     ///
     /// struct MyRenderHandler {
     ///     graphics: Arc<GraphicsPipeline>,
@@ -454,15 +456,19 @@ impl EngineDescriptorSet {
     /// }
     ///
     /// impl EngineRenderHandler for MyRenderHandler {
-    ///     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    ///     fn build_commands(
+    ///         &self,
+    ///         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ///     ) -> Result<(), Validated<VulkanoError>> {
     ///         builder
     ///             .bind_descriptor_sets(
     ///                 PipelineBindPoint::Graphics,
     ///                 self.graphics.layout().clone(),
     ///                 0,
-    ///                 self.descriptor_set.descriptor_set().unwrap(),
-    ///             ).unwrap()
+    ///                 self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+    ///             )?
     ///             /* other bind and draw calls */;
+    ///         Ok(())
     ///     }
     /// }
     /// ```
@@ -489,9 +495,11 @@ impl EngineDescriptorSet {
     /// use std::sync::Arc;
     /// use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
     /// use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint};
+    /// use vulkano::Validated;
     ///
     /// use gtether::render::descriptor_set::EngineDescriptorSet;
     /// use gtether::render::render_pass::EngineRenderHandler;
+    /// use gtether::render::VulkanoError;
     ///
     /// struct MyRenderHandler {
     ///     graphics: Arc<GraphicsPipeline>,
@@ -499,9 +507,12 @@ impl EngineDescriptorSet {
     /// }
     ///
     /// impl EngineRenderHandler for MyRenderHandler {
-    ///     fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    ///     fn build_commands(
+    ///         &self,
+    ///         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ///     ) -> Result<(), Validated<VulkanoError>> {
     ///         let descriptor_sets = self.descriptor_set
-    ///             .descriptor_set_with_offsets().unwrap();
+    ///             .descriptor_set_with_offsets().map_err(VulkanoError::from_validated)?;
     ///         for descriptor_set in descriptor_sets {
     ///             builder
     ///                 .bind_descriptor_sets(
@@ -509,9 +520,10 @@ impl EngineDescriptorSet {
     ///                     self.graphics.layout().clone(),
     ///                     0,
     ///                     descriptor_set,
-    ///                 ).unwrap()
+    ///                 )?
     ///                 /* other bind and draw calls */;
     ///         }
+    ///         Ok(())
     ///     }
     /// }
     /// ```
@@ -532,7 +544,6 @@ impl EngineDescriptorSet {
 /// ```
 /// use std::sync::Arc;
 /// use vulkano::descriptor_set::layout::DescriptorSetLayout;
-/// use vulkano::{Validated, VulkanError};
 ///
 /// use gtether::render::descriptor_set::{EngineDescriptorSet, VKDescriptorSource};
 /// use gtether::render::Renderer;
@@ -543,7 +554,7 @@ impl EngineDescriptorSet {
 /// fn create_descriptor_set(
 ///     renderer: Arc<Renderer>,
 ///     layout: Arc<DescriptorSetLayout>,
-/// ) -> Result<EngineDescriptorSet, Validated<VulkanError>> {
+/// ) -> EngineDescriptorSet {
 ///     let descriptor_source_a: Arc<dyn VKDescriptorSource> = get_descriptor_source_a();
 ///     let descriptor_source_b: Arc<dyn VKDescriptorSource> = get_descriptor_source_b();
 ///

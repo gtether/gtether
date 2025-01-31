@@ -16,6 +16,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use vulkano::Validated;
 use winit::event::ElementState;
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -32,7 +33,7 @@ use crate::render::font::Font;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::uniform::Uniform;
-use crate::render::{FlatVertex, RenderTarget, Renderer, RendererEventData, RendererEventType};
+use crate::render::{FlatVertex, RenderTarget, Renderer, RendererEventData, RendererEventType, VulkanoError};
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
 use crate::render::descriptor_set::EngineDescriptorSet;
@@ -544,24 +545,28 @@ impl ConsoleBackgroundSolidRenderer {
         }
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_pipeline_graphics(graphics.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().unwrap(),
-            ).unwrap()
-            .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
+                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+            )?
+            .bind_vertex_buffers(0, self.buffer.clone())?
             .draw(
                 self.buffer.len() as u32,
                 1,
                 0,
                 0,
-            ).unwrap();
+            )?;
+        Ok(())
     }
 }
 
@@ -578,7 +583,10 @@ impl ConsoleBackgroundRenderer {
         }
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         match self {
             ConsoleBackgroundRenderer::Solid(renderer)
                 => renderer.build_commands(builder),
@@ -642,13 +650,16 @@ impl ConsoleRenderer {
 }
 
 impl EngineRenderHandler for ConsoleRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         if !self.gui.visible.load(Ordering::Relaxed) {
             // Nothing to draw
-            return;
+            return Ok(());
         }
 
-        self.background.build_commands(builder);
+        self.background.build_commands(builder)?;
 
         let mut log_layout = self.gui.text_log.lock();
         let prompt_layout = self.gui.text_prompt.lock();
@@ -682,7 +693,9 @@ impl EngineRenderHandler for ConsoleRenderer {
         let mut pass = self.font_compositor.begin_pass(builder);
         pass.layout(&log_layout);
         pass.layout(&prompt_layout);
-        pass.end_pass();
+        pass.end_pass()?;
+
+        Ok(())
     }
 }
 

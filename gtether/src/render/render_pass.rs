@@ -25,7 +25,11 @@ pub trait EngineRenderPass: Send + Sync + 'static {
     fn attachment_name_map(&self) -> HashMap<String, u32>;
 
     /// Build the render commands used to render a particular frame.
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &EngineFramebuffer);
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        frame: &EngineFramebuffer,
+    ) -> Result<(), Validated<VulkanoError>>;
 }
 
 /// An individual render handler, used for rendering specific details of subpasses.
@@ -37,7 +41,10 @@ pub trait EngineRenderPass: Send + Sync + 'static {
 pub trait EngineRenderHandler: Send + Sync + 'static {
     /// Build the specific render commands used to render the part of the frame this handler is
     /// responsible for.
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>);
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>>;
 }
 
 struct EngineRenderSubpass {
@@ -45,10 +52,14 @@ struct EngineRenderSubpass {
 }
 
 impl EngineRenderSubpass {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         for handler in &self.handlers {
-            handler.build_commands(builder);
+            handler.build_commands(builder)?;
         }
+        Ok(())
     }
 }
 
@@ -66,7 +77,11 @@ impl EngineRenderPass for StandardEngineRenderPass {
     #[inline]
     fn attachment_name_map(&self) -> HashMap<String, u32> { self.attachment_name_map.clone() }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &EngineFramebuffer) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        frame: &EngineFramebuffer,
+    ) -> Result<(), Validated<VulkanoError>> {
 
         builder.begin_render_pass(
             RenderPassBeginInfo {
@@ -77,7 +92,7 @@ impl EngineRenderPass for StandardEngineRenderPass {
                 contents: SubpassContents::Inline,
                 ..Default::default()
             },
-        ).unwrap();
+        )?;
 
         let mut first = true;
         for subpass in self.subpasses.iter() {
@@ -88,13 +103,14 @@ impl EngineRenderPass for StandardEngineRenderPass {
                         contents: SubpassContents::Inline,
                         ..Default::default()
                     },
-                ).unwrap();
+                )?;
             }
-            subpass.build_commands(builder);
+            subpass.build_commands(builder)?;
             first = false;
         }
 
-        builder.end_render_pass(SubpassEndInfo::default()).unwrap();
+        builder.end_render_pass(SubpassEndInfo::default())?;
+        Ok(())
     }
 }
 
@@ -411,12 +427,13 @@ impl EngineRenderSubpassBuilder {
 /// # use vulkano::{Validated, VulkanError};
 /// # use gtether::render::{EngineDevice, RenderTarget};
 /// # use gtether::render::render_pass::{EngineRenderPass};
-/// use gtether::render::{Renderer, RendererConfig};
+/// use gtether::render::{Renderer, RendererConfig, VulkanoError};
 /// use gtether::render::render_pass::NoOpEngineRenderPass;
 ///
-/// # fn wrapper(target: Arc<dyn RenderTarget>, device: Arc<EngineDevice>, render_pass: Arc<dyn EngineRenderPass>) -> Result<(), Validated<VulkanError>> {
+/// # fn wrapper(target: Arc<dyn RenderTarget>, device: Arc<EngineDevice>, render_pass: Arc<dyn EngineRenderPass>) -> Result<(), Validated<VulkanoError>> {
 /// // Note that Renderer::new() already does exactly this
-/// let noop_render_pass = NoOpEngineRenderPass::new(&target, &device)?;
+/// let noop_render_pass = NoOpEngineRenderPass::new(&target, &device)
+///     .map_err(VulkanoError::from_validated)?;
 /// let renderer = Renderer::with_render_pass(target, device, noop_render_pass)?;
 ///
 /// // ... Do some work to create an actual render pass ...
@@ -468,7 +485,11 @@ impl EngineRenderPass for NoOpEngineRenderPass {
         HashMap::new()
     }
 
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>, frame: &EngineFramebuffer) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        frame: &EngineFramebuffer,
+    ) -> Result<(), Validated<VulkanoError>> {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -479,7 +500,8 @@ impl EngineRenderPass for NoOpEngineRenderPass {
                     contents: SubpassContents::Inline,
                     ..Default::default()
                 },
-            ).unwrap()
-            .end_render_pass(SubpassEndInfo::default()).unwrap();
+            )?
+            .end_render_pass(SubpassEndInfo::default())?;
+        Ok(())
     }
 }

@@ -8,32 +8,45 @@
 //!
 //! # Examples
 //! ```
-//! # use std::sync::Arc;
-//! # use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+//! use std::sync::Mutex;
+//! use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+//! use vulkano::Validated;
 //! use gtether::render::font::compositor::FontCompositor;
-//! # use gtether::render::font::compositor::FontRenderer;
-//! # use gtether::render::font::layout::TextLayout;
-//! # use gtether::render::RenderTarget;
-//! #
-//! # let font_renderer: Box<dyn FontRenderer> = return;
-//! # let builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> = return;
-//! # let layout_a: TextLayout = return;
-//! # let layout_b: TextLayout = return;
+//! use gtether::render::font::layout::TextLayout;
+//! use gtether::render::render_pass::EngineRenderHandler;
+//! use gtether::render::VulkanoError;
 //!
-//! let font_compositor = FontCompositor::new(font_renderer);
+//! struct MyTextRenderer {
+//!     layout_a: Mutex<TextLayout>,
+//!     layout_b: Mutex<TextLayout>,
+//!     compositor: FontCompositor,
+//! }
 //!
-//! let mut font_pass = font_compositor.begin_pass(builder);
+//! impl EngineRenderHandler for MyTextRenderer {
+//!     fn build_commands(
+//!         &self,
+//!         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+//!     ) -> Result<(), Validated<VulkanoError>> {
+//!         let layout_a = self.layout_a.lock().unwrap();
+//!         let layout_b = self.layout_b.lock().unwrap();
 //!
-//! font_pass
-//!     .layout(&layout_a)
-//!     .layout(&layout_b);
+//!         let mut font_pass = self.compositor.begin_pass(builder);
 //!
-//! font_pass.end_pass();
+//!         font_pass
+//!             .layout(&layout_a)
+//!             .layout(&layout_b);
+//!
+//!         font_pass.end_pass()?;
+//!
+//!         Ok(())
+//!     }
+//! }
 //! ```
 
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-
+use vulkano::Validated;
 use crate::render::font::layout::{PositionedChar, TextLayout};
+use crate::render::VulkanoError;
 
 /// Render helper for a concrete font representation.
 ///
@@ -45,7 +58,7 @@ pub trait FontRenderer: Send + Sync + 'static {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-    );
+    ) -> Result<(), Validated<VulkanoError>>;
 }
 
 /// Top-level render helper for rendering fonts.
@@ -98,11 +111,11 @@ impl<'a> FontCompositorPass<'a> {
     }
 
     /// End this pass, and commit all rendering commands.
-    pub fn end_pass(self) {
+    pub fn end_pass(self) -> Result<(), Validated<VulkanoError>> {
         let layout_chars = self.layouts.into_iter()
             .map(|layout| layout.iter_build())
             .flatten()
             .collect::<Vec<_>>();
-        self.compositor.renderer.build_commands(self.builder, layout_chars);
+        self.compositor.renderer.build_commands(self.builder, layout_chars)
     }
 }

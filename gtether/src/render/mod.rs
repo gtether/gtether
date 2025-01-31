@@ -623,7 +623,7 @@ impl Renderer {
             CommandBufferUsage::OneTimeSubmit,
         ).map_err(Validated::unwrap)
             .expect("Failed to allocate command builder");
-        state.render_pass.build_commands(&mut command_builder, &frame);
+        state.render_pass.build_commands(&mut command_builder, &frame).unwrap();
         let command = command_builder.build().map_err(Validated::unwrap)
             .expect("Failed to build command");
 

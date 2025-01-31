@@ -22,12 +22,12 @@
 //! use gtether::render::font::compositor::FontCompositor;
 //! use gtether::render::font::glyph::GlyphFontLoader;
 //! use gtether::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
-//! # use gtether::render::{RenderTarget, RendererHandle};
+//! # use gtether::render::{RenderTarget, Renderer};
 //! # use gtether::resource::manager::ResourceManager;
 //! use gtether::resource::manager::LoadPriority;
 //! #
 //! # let resource_manager: Arc<ResourceManager> = return;
-//! # let renderer: &RendererHandle = return;
+//! # let renderer: &Arc<Renderer> = return;
 //! # let subpass: &Subpass = return;
 //! # let render_target: Arc<dyn RenderTarget> = return;
 //! # let font_data: Vec<u8> = return;
@@ -56,18 +56,31 @@
 //!
 //! Render a [TextLayout][tl] (generally done as part of a parent render handler)
 //! ```
-//! # use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-//! # use gtether::render::font::compositor::FontCompositor;
-//! # use gtether::render::font::layout::TextLayout;
-//! # use gtether::render::swapchain::Framebuffer;
-//! # let text_layout: TextLayout = return;
-//! # let font_compositor: FontCompositor = return;
-//! # let command_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> = return;
-//! # let frame: &Framebuffer = return;
-//! #
-//! let mut pass = font_compositor.begin_pass(command_builder, frame);
-//! pass.layout(&text_layout);
-//! pass.end_pass();
+//! use std::sync::Mutex;
+//! use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+//! use vulkano::Validated;
+//! use gtether::render::font::compositor::FontCompositor;
+//! use gtether::render::font::layout::TextLayout;
+//! use gtether::render::render_pass::EngineRenderHandler;
+//! use gtether::render::VulkanoError;
+//!
+//! struct MyTextRenderer {
+//!     layout: Mutex<TextLayout>,
+//!     compositor: FontCompositor,
+//! }
+//!
+//! impl EngineRenderHandler for MyTextRenderer {
+//!     fn build_commands(
+//!         &self,
+//!         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+//!     ) -> Result<(), Validated<VulkanoError>> {
+//!         let layout = self.layout.lock().unwrap();
+//!         let mut font_pass = self.compositor.begin_pass(builder);
+//!         font_pass.layout(&layout);
+//!         font_pass.end_pass()?;
+//!         Ok(())
+//!     }
+//! }
 //! ```
 //!
 //! [gf]: glyph::GlyphFont

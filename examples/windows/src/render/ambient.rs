@@ -5,7 +5,7 @@ use gtether::render::frame::FrameManagerExt;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::uniform::Uniform;
-use gtether::render::{FlatVertex, Renderer};
+use gtether::render::{FlatVertex, Renderer, VulkanoError};
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState};
@@ -17,6 +17,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use vulkano::Validated;
 
 mod ambient_vert {
     vulkano_shaders::shader! {
@@ -141,19 +142,23 @@ impl AmbientRenderer {
 }
 
 impl EngineRenderHandler for AmbientRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_pipeline_graphics(graphics.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().unwrap(),
-            ).unwrap()
-            .bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap()
-            .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
+                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+            )?
+            .bind_vertex_buffers(0, self.screen_buffer.clone())?
+            .draw(self.screen_buffer.len() as u32, 1, 0, 0)?;
+        Ok(())
     }
 }
 

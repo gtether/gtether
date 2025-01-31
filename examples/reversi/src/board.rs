@@ -4,7 +4,7 @@ use gtether::render::model::{Model, ModelVertexNormal};
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::uniform::Uniform;
-use gtether::render::{EngineDevice, RenderTarget, Renderer, RendererEventData, RendererEventType};
+use gtether::render::{EngineDevice, RenderTarget, Renderer, RendererEventData, RendererEventType, VulkanoError};
 use gtether::resource::Resource;
 use itertools::Itertools;
 use parry3d::na::Point3;
@@ -27,6 +27,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use vulkano::Validated;
 use gtether::event::{Event, EventHandler};
 use gtether::gui::input::{ElementState, InputDelegate, InputDelegateEvent, MouseButton};
 use gtether::render::font::compositor::FontCompositor;
@@ -743,21 +744,24 @@ impl BoardRenderer {
 }
 
 impl EngineRenderHandler for BoardRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         let graphics = self.graphics.vk_graphics();
         let selected_graphics = self.selected_graphics.vk_graphics();
         let model_tile = self.model_tile.read();
         let model_piece = self.model_piece.read();
 
         builder
-            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_pipeline_graphics(graphics.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().unwrap(),
-            ).unwrap();
-        model_tile.draw_instanced(builder, self.instances.clone()).unwrap();
+                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+            )?;
+        model_tile.draw_instanced(builder, self.instances.clone())?;
 
         let (piece_instances, selected_instance) = {
             let board_state = self.board.state();
@@ -807,9 +811,9 @@ impl EngineRenderHandler for BoardRenderer {
                     ..Default::default()
                 },
                 piece_instances,
-            ).unwrap();
+            ).map_err(VulkanoError::from_validated)?;
 
-            model_piece.draw_instanced(builder, piece_instance_buffer).unwrap();
+            model_piece.draw_instanced(builder, piece_instance_buffer)?;
         }
 
         if selected_instance.is_some() {
@@ -825,11 +829,13 @@ impl EngineRenderHandler for BoardRenderer {
                     ..Default::default()
                 },
                 selected_instance,
-            ).unwrap();
+            ).map_err(VulkanoError::from_validated)?;
 
-            builder.bind_pipeline_graphics(selected_graphics.clone()).unwrap();
-            model_piece.draw_instanced(builder, selected_instance_buffer).unwrap();
+            builder.bind_pipeline_graphics(selected_graphics.clone())?;
+            model_piece.draw_instanced(builder, selected_instance_buffer)?;
         }
+
+        Ok(())
     }
 }
 
@@ -931,7 +937,10 @@ impl BoardTextRenderer {
 }
 
 impl EngineRenderHandler for BoardTextRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         let mut pass = self.font_compositor.begin_pass(builder);
 
         let mut layout = self.layout.layout.lock();
@@ -954,6 +963,8 @@ impl EngineRenderHandler for BoardTextRenderer {
             _ => {}
         }
 
-        pass.end_pass();
+        pass.end_pass()?;
+
+        Ok(())
     }
 }

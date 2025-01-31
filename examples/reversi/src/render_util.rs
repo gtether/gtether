@@ -3,7 +3,7 @@ use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::uniform::{Uniform, UniformSet, UniformValue};
-use gtether::render::{FlatVertex, RenderTarget, Renderer};
+use gtether::render::{FlatVertex, RenderTarget, Renderer, VulkanoError};
 use std::sync::Arc;
 use parry3d::na::{Isometry3, Perspective3, Point3};
 use vulkano::buffer::{BufferContents, Subbuffer};
@@ -18,6 +18,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::Subpass;
+use vulkano::Validated;
 use gtether::render::frame::FrameManagerExt;
 
 #[derive(BufferContents)]
@@ -307,25 +308,28 @@ impl DeferredLightingRenderer {
 }
 
 impl EngineRenderHandler for DeferredLightingRenderer {
-    fn build_commands(&self, builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>) {
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), Validated<VulkanoError>> {
         let ambient_graphics = self.ambient_graphics.vk_graphics();
         let directional_graphics = self.directional_graphics.vk_graphics();
 
-        builder.bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap();
+        builder.bind_vertex_buffers(0, self.screen_buffer.clone())?;
 
         builder
-            .bind_pipeline_graphics(ambient_graphics.clone()).unwrap()
+            .bind_pipeline_graphics(ambient_graphics.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 self.pipeline_layout.clone(),
                 0,
-                self.descriptor_set.descriptor_set().unwrap(),
-            ).unwrap()
-            .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
+                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+            )?
+            .draw(self.screen_buffer.len() as u32, 1, 0, 0)?;
 
-        builder.bind_pipeline_graphics(directional_graphics.clone()).unwrap();
+        builder.bind_pipeline_graphics(directional_graphics.clone())?;
         let descriptor_sets = self.descriptor_set
-            .descriptor_set_with_offsets().unwrap();
+            .descriptor_set_with_offsets().map_err(VulkanoError::from_validated)?;
         for descriptor_set in descriptor_sets {
             builder
                 .bind_descriptor_sets(
@@ -333,9 +337,11 @@ impl EngineRenderHandler for DeferredLightingRenderer {
                     self.pipeline_layout.clone(),
                     0,
                     descriptor_set,
-                ).unwrap()
-                .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
+                )?
+                .draw(self.screen_buffer.len() as u32, 1, 0, 0)?;
         }
+
+        Ok(())
     }
 }
 

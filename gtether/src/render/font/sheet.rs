@@ -34,7 +34,7 @@ use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
 use crate::render::image::ImageSampler;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
-use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererEventType};
+use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererEventType, VulkanoError};
 use crate::render::descriptor_set::EngineDescriptorSet;
 use crate::resource::manager::ResourceLoadResult;
 use crate::resource::{Resource, ResourceLoadError, ResourceMut, SubResourceLoader};
@@ -427,7 +427,7 @@ impl FontRenderer for FontSheetRenderer {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-    ) {
+    ) -> Result<(), Validated<VulkanoError>> {
         let graphics = self.graphics.vk_graphics();
 
         let font_sheet = self.font_sheet.read();
@@ -463,7 +463,7 @@ impl FontRenderer for FontSheetRenderer {
 
         if glyphs.is_empty() {
             // Nothing to render, we're done here
-            return;
+            return Ok(());
         }
 
         // TODO: Reuse the buffer somehow?
@@ -479,27 +479,28 @@ impl FontRenderer for FontSheetRenderer {
                 ..Default::default()
             },
             glyphs,
-        ).unwrap();
+        ).map_err(VulkanoError::from_validated)?;
         let instance_buffer_len = instance_buffer.len() as u32;
 
         builder
-            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_pipeline_graphics(graphics.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().unwrap(),
-            ).unwrap()
+                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
+            )?
             .bind_vertex_buffers(0, (
                 self.glyph_buffer.clone(),
                 instance_buffer,
-            )).unwrap()
+            ))?
             .draw(
                 self.glyph_buffer.len() as u32,
                 instance_buffer_len,
                 0,
                 0,
-            ).unwrap();
+            )?;
+        Ok(())
     }
 }
 
