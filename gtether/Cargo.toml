@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytemuck = { workspace = true }
 chrono = { workspace = true }
+crossbeam = { workspace = true }
 educe = { workspace = true }
 image = { workspace = true, optional = true }
 itertools = { workspace = true }
@@ -43,4 +44,5 @@ ump = { workspace = true }
 winit = { workspace = true, optional = true }
 
 [dev-dependencies]
+aquamarine = { workspace = true }
 assert_matches = "1.5"

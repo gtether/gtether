@@ -1,11 +1,11 @@
 extern crate nalgebra_glm as glm;
 
-use std::cell::{OnceCell, RefCell};
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-
+use async_trait::async_trait;
 use glm::identity;
+use parking_lot::Mutex;
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -17,15 +17,15 @@ use gtether::console::command::{Command, CommandError, CommandRegistry, CommandT
 use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::console::{Console, ConsoleStdinReader};
-use gtether::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
-use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
+use gtether::client::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
+use gtether::client::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::{Uniform, UniformSet};
 use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
-use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
-
+use gtether::{Application, Engine, EngineBuilder};
+use gtether::client::gui::ClientGui;
 use crate::render::ambient::{AmbientLight, AmbientRendererBootstrap};
 use crate::render::cube::CubeRendererBootstrap;
 use crate::render::directional::{DirectionalRendererBootstrap, PointLight};
@@ -207,11 +207,11 @@ impl Camera {
 
 struct WindowsApp {
     console: Arc<Console>,
-    window: OnceCell<WindowHandle>,
-    mn: OnceCell<Arc<Uniform<MN>>>,
-    vp: OnceCell<Arc<Uniform<VP>>>,
-    camera: RefCell<Camera>,
-    input: OnceCell<InputDelegate>,
+    window: OnceLock<WindowHandle>,
+    mn: OnceLock<Arc<Uniform<MN>>>,
+    vp: OnceLock<Arc<Uniform<VP>>>,
+    camera: Mutex<Camera>,
+    input: OnceLock<InputDelegate>,
 }
 
 impl WindowsApp {
@@ -224,17 +224,18 @@ impl WindowsApp {
 
         Self {
             console,
-            window: OnceCell::new(),
-            mn: OnceCell::new(),
-            vp: OnceCell::new(),
-            camera: RefCell::new(Camera::default()),
-            input: OnceCell::new(),
+            window: OnceLock::new(),
+            mn: OnceLock::new(),
+            vp: OnceLock::new(),
+            camera: Mutex::new(Camera::default()),
+            input: OnceLock::new(),
         }
     }
 }
 
-impl Application for WindowsApp {
-    fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {
+#[async_trait(?Send)]
+impl Application<ClientGui> for WindowsApp {
+    async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {
         let mut cmd_registry = self.console.registry();
 
         let mut model = identity();
@@ -243,11 +244,11 @@ impl Application for WindowsApp {
         model = glm::rotate_normalized_axis(&model, 1.0, &glm::vec3(1.0, 0.0, 0.0));
         model = glm::rotate_normalized_axis(&model, 1.0, &glm::vec3(0.0, 0.0, 1.0));
 
-        let window = registry.window.create_window(CreateWindowInfo {
+        let window = engine.side().create_window(CreateWindowInfo {
             attributes: WindowAttributes::default()
                 .with_title("Windowing Test"),
             ..Default::default()
-        });
+        }).wait_async().await.unwrap();
         //window.set_cursor_visible(false);
 
         let renderer = window.renderer();
@@ -268,7 +269,7 @@ impl Application for WindowsApp {
             "console_font",
             GlyphFontLoader::new(window.renderer().clone()),
             LoadPriority::Immediate,
-        ).wait().unwrap();
+        ).await.unwrap();
         let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)
             .font(console_font)
@@ -318,7 +319,7 @@ impl Application for WindowsApp {
         *mn.write() = MN::new(model);
         let vp = cube_renderer.vp().clone();
         *vp.write() = VP {
-            view: self.camera.borrow().view(),
+            view: self.camera.lock().view(),
             projection: identity(),
         };
 
@@ -356,7 +357,7 @@ impl Application for WindowsApp {
         self.vp.set(vp).unwrap();
     }
 
-    fn tick(&self, engine: &Engine<Self>, delta: Duration) {
+    fn tick(&self, engine: &Arc<Engine<Self, ClientGui>>, delta: Duration) {
         let window = self.window.get().unwrap();
 
         let mn = self.mn.get().unwrap();
@@ -374,7 +375,7 @@ impl Application for WindowsApp {
         let distance = delta.as_secs_f32() * speed;
 
         let mut changed = false;
-        let mut camera = self.camera.borrow_mut();
+        let mut camera = self.camera.lock();
         let mut orient = camera.orient();
         let right = camera.right();
 
@@ -449,11 +450,10 @@ fn main() {
         .build();
 
     EngineBuilder::new()
-        .metadata(EngineMetadata {
-            application_name: Some(String::from("gTether Example - windows")),
-            ..Default::default()
-        })
         .app(app)
+        .side(ClientGui::builder()
+            .application_name("gTether Example - windows")
+            .build())
         .resources(resources)
         .build()
         .start();

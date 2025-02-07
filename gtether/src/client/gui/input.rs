@@ -2,7 +2,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tracing::{event, Level};
@@ -186,7 +186,7 @@ impl Drop for InputDelegateLock {
 /// suitable if the count of input changes between ticks is required.
 pub struct InputDelegate {
     id: usize,
-    receiver: mpsc::Receiver<InputDelegateEvent>,
+    receiver: crossbeam::channel::Receiver<InputDelegateEvent>,
     manager: Arc<DelegateManager>,
 }
 
@@ -264,8 +264,8 @@ impl<'a> Iterator for InputDelegateIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.receiver.try_recv() {
             Ok(event) => Some(event),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => panic!("Server hung up"),
+            Err(crossbeam::channel::TryRecvError::Empty) => None,
+            Err(crossbeam::channel::TryRecvError::Disconnected) => panic!("Server hung up"),
         }
     }
 }
@@ -297,7 +297,7 @@ impl Ord for DelegateLockEntry {
 struct DelegateManager {
     state: Arc<StateManager>,
     next_id: AtomicUsize,
-    senders: RwLock<HashMap<usize, mpsc::Sender<InputDelegateEvent>>>,
+    senders: RwLock<HashMap<usize, crossbeam::channel::Sender<InputDelegateEvent>>>,
     locks: RwLock<BinaryHeap<DelegateLockEntry>>,
 }
 
@@ -322,7 +322,7 @@ impl DelegateManager {
     }
 
     fn create_delegate(manager: &Arc<DelegateManager>) -> InputDelegate {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam::channel::unbounded();
         let id = manager.next_id.fetch_add(1, Ordering::Relaxed);
 
         manager.senders.write().insert(id, sender);
@@ -414,7 +414,7 @@ impl DelegateManager {
     }
 }
 
-pub(in crate::gui) enum InputEvent {
+pub(crate) enum InputEvent {
     Key(KeyEvent),
     Modifiers(ModifiersState),
     MouseInput{ button: MouseButton, state: ElementState },
@@ -423,7 +423,7 @@ pub(in crate::gui) enum InputEvent {
 }
 
 impl InputEvent {
-    pub(in crate::gui) fn from_window_event(event: WindowEvent) -> Option<Self> {
+    pub(crate) fn from_window_event(event: WindowEvent) -> Option<Self> {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 Some(Self::Key(event.into()))
@@ -441,7 +441,7 @@ impl InputEvent {
         }
     }
 
-    pub(in crate::gui) fn from_device_event(event: DeviceEvent) -> Option<Self> {
+    pub(crate) fn from_device_event(event: DeviceEvent) -> Option<Self> {
         match event {
             DeviceEvent::MouseMotion { delta } => {
                 Some(Self::MouseMotion(glm::vec2(delta.0, delta.1)))
@@ -472,7 +472,7 @@ impl Default for InputState {
 }
 
 impl InputState {
-    pub(in crate::gui) fn handle_event(&self, event: InputEvent) {
+    pub(crate) fn handle_event(&self, event: InputEvent) {
         match event {
             InputEvent::Key(event) => {
                 let key_code = match event.physical_key {

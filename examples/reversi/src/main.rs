@@ -6,8 +6,8 @@ use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::console::Console;
 use gtether::event::Event;
-use gtether::gui::input::InputDelegate;
-use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
+use gtether::client::gui::input::InputDelegate;
+use gtether::client::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::model::obj::ModelObjLoader;
 use gtether::render::model::ModelVertexNormal;
@@ -16,10 +16,10 @@ use gtether::render::uniform::Uniform;
 use gtether::render::{RendererEventData, RendererEventType};
 use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
-use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
-use std::cell::OnceCell;
-use std::sync::Arc;
+use gtether::{Application, Engine, EngineBuilder};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use async_trait::async_trait;
 use parry3d::na::Point3;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
@@ -29,6 +29,8 @@ use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
+use gtether::client::gui::ClientGui;
+
 use crate::board::Board;
 use crate::bot::minimax::MinimaxAlgorithm;
 use crate::player::Player;
@@ -54,9 +56,9 @@ impl Command for ResetCommand {
 
 struct ReversiApp {
     console: Arc<Console>,
-    window: OnceCell<WindowHandle>,
-    board: OnceCell<Arc<Board>>,
-    input: OnceCell<InputDelegate>,
+    window: OnceLock<WindowHandle>,
+    board: OnceLock<Arc<Board>>,
+    input: OnceLock<InputDelegate>,
 }
 
 impl ReversiApp {
@@ -67,22 +69,23 @@ impl ReversiApp {
 
         Self {
             console,
-            window: OnceCell::new(),
-            board: OnceCell::new(),
-            input: OnceCell::new(),
+            window: OnceLock::new(),
+            board: OnceLock::new(),
+            input: OnceLock::new(),
         }
     }
 }
 
-impl Application for ReversiApp {
-    fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {
+#[async_trait(?Send)]
+impl Application<ClientGui> for ReversiApp {
+    async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {
         let mut cmd_registry = self.console.registry();
 
-        let window = registry.window.create_window(CreateWindowInfo {
+        let window = engine.side().create_window(CreateWindowInfo {
             attributes: WindowAttributes::default()
                 .with_title("Reversi"),
             ..Default::default()
-        });
+        }).wait_async().await.unwrap();
 
         let console_font = engine.resources().get_or_load(
             "console_font",
@@ -155,7 +158,7 @@ impl Application for ReversiApp {
             ]
         );
 
-        let console_font = console_font.wait().unwrap();
+        let console_font = console_font.await.unwrap();
         let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)
             .font(console_font.clone())
@@ -189,8 +192,8 @@ impl Application for ReversiApp {
                 .color_attachment("normals")
                 .depth_stencil_attachment("depth")
                 .handler(board.bootstrap_renderer(
-                    model_tile.wait().unwrap(),
-                    model_piece.wait().unwrap(),
+                    model_tile.await.unwrap(),
+                    model_piece.await.unwrap(),
                 ))
             .end_subpass()
             .begin_subpass()
@@ -209,7 +212,7 @@ impl Application for ReversiApp {
         self.board.set(board).unwrap();
     }
 
-    fn tick(&self, _engine: &Engine<Self>, _delta: Duration) {
+    fn tick(&self, _engine: &Arc<Engine<Self, ClientGui>>, _delta: Duration) {
         /* noop */
     }
 }
@@ -237,11 +240,10 @@ fn main() {
         .build();
 
     EngineBuilder::new()
-        .metadata(EngineMetadata {
-            application_name: Some("gTether Example - reversi".to_owned()),
-            ..Default::default()
-        })
         .app(app)
+        .side(ClientGui::builder()
+            .application_name("gTether Example - reversi")
+            .build())
         .resources(resources)
         .build()
         .start();

@@ -23,7 +23,6 @@ use vulkano::image::AllocateImageError;
 use crate::event::{EventBus, EventBusRegistry, EventType};
 use crate::render::render_pass::{EngineRenderPass, NoOpEngineRenderPass};
 use crate::render::swapchain::EngineSwapchain;
-use crate::EngineMetadata;
 use crate::render::frame::FrameManager;
 
 pub mod attachment;
@@ -136,12 +135,12 @@ pub struct Instance {
 }
 
 impl Instance {
-    pub(crate) fn new(engine_metadata: &EngineMetadata, extensions: InstanceExtensions) -> Self {
+    pub(crate) fn new(application_name: Option<String>, extensions: InstanceExtensions) -> Self {
         let library = VulkanLibrary::new()
             .expect("Failed to load Vulkan library/DLL");
 
         let inner = VKInstance::new(library, InstanceCreateInfo {
-            application_name: engine_metadata.application_name.clone(),
+            application_name,
             engine_name: Some("gTether".to_owned()),
             // TODO: Engine version
             // engine_version: ,

@@ -29,7 +29,7 @@ use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineSha
 use vulkano::render_pass::Subpass;
 use vulkano::Validated;
 use gtether::event::{Event, EventHandler};
-use gtether::gui::input::{ElementState, InputDelegate, InputDelegateEvent, MouseButton};
+use gtether::client::gui::input::{ElementState, InputDelegate, InputDelegateEvent, MouseButton};
 use gtether::render::font::compositor::FontCompositor;
 use gtether::render::font::Font;
 use gtether::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};

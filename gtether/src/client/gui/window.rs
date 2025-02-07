@@ -10,10 +10,10 @@ use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{CursorGrabMode, Window as WinitWindow, WindowId};
 
-use crate::gui::input::{InputEvent, InputState};
+use crate::client::gui::input::{InputEvent, InputState};
 use crate::render::Renderer;
 use crate::render::{EngineDevice, Instance, RenderTarget};
-use crate::{EngineMetadata, NonExhaustive};
+use crate::NonExhaustive;
 
 pub use winit::window::WindowAttributes;
 
@@ -165,15 +165,14 @@ impl Window {
         attributes: WindowAttributes,
         event_loop: &ActiveEventLoop,
         instance: &Arc<Instance>,
-        engine_metadata: &EngineMetadata,
+        application_name: Option<String>,
     ) -> (WindowHandle, thread::JoinHandle<()>) {
         let (endpoint_modify, sender_modify) = ump::channel();
         let (endpoint_event, sender_event) = ump::channel();
 
         let mut attributes = attributes;
         if &attributes.title == "winit window" {
-            attributes.title = engine_metadata.application_name.clone()
-                .unwrap_or("gTether Window".into());
+            attributes.title = application_name.unwrap_or("gTether Window".into());
         }
         let title = attributes.title.clone();
 
@@ -315,31 +314,37 @@ struct WindowEntry {
     exit_on_close: bool,
 }
 
-pub(in crate::gui) struct WindowManager {
-    engine_metadata: EngineMetadata,
+pub(crate) struct WindowManager {
+    application_name: Option<String>,
     render_instance: Arc<Instance>,
     windows: HashMap<WindowId, WindowEntry>,
+    msg_create_server: ump::Server<CreateWindowInfo, WindowHandle, ()>,
 }
 
 impl WindowManager {
-    pub(in crate::gui) fn new(engine_metadata: EngineMetadata, render_instance: Arc<Instance>) -> Self {
-        Self {
-            engine_metadata,
+    pub(crate) fn new(
+        application_name: Option<String>,
+        render_instance: Arc<Instance>,
+    ) -> (Self, ump::Client<CreateWindowInfo, WindowHandle, ()>) {
+        let (msg_create_server, msg_create_client) = ump::channel();
+        (Self {
+            application_name,
             render_instance,
             windows: HashMap::new(),
-        }
+            msg_create_server,
+        }, msg_create_client)
     }
 
-    pub(in crate::gui) fn create_window(
+    pub(crate) fn create_window(
         &mut self,
-        create_info: CreateWindowInfo,
         event_loop: &ActiveEventLoop,
+        create_info: CreateWindowInfo,
     ) -> WindowHandle {
         let (handle, join_handle) = Window::new(
             create_info.attributes,
             event_loop,
             &self.render_instance,
-            &self.engine_metadata,
+            self.application_name.clone(),
         );
         self.windows.insert(handle.id(), WindowEntry {
             window_handle: handle.clone(),
@@ -349,7 +354,23 @@ impl WindowManager {
         handle
     }
 
-    pub(in crate::gui) fn tick(&mut self, event_loop: &ActiveEventLoop) {
+    pub(crate) async fn run_async_msg_loop(&mut self, event_loop: &ActiveEventLoop) {
+        loop {
+            let (create_info, rctx) = self.msg_create_server.async_wait().await.unwrap();
+            let handle = self.create_window(event_loop, create_info);
+            rctx.reply(handle).unwrap();
+        }
+    }
+
+    pub(crate) fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        // Check for any create requests
+        // TODO: Handle errors
+        while let Some((create_info, rctx))
+                = self.msg_create_server.try_pop().unwrap() {
+            let handle = self.create_window(event_loop, create_info);
+            rctx.reply(handle).unwrap();
+        }
+
         // Check for any exited windows
         self.windows.retain(|_, entry| {
             let finished = entry.join_handle.is_finished();
@@ -364,7 +385,7 @@ impl WindowManager {
         });
     }
 
-    pub(in crate::gui) fn window_event(&mut self, window_id: WindowId, event: WindowEvent, event_loop: &ActiveEventLoop) {
+    pub(crate) fn window_event(&mut self, window_id: WindowId, event: WindowEvent, event_loop: &ActiveEventLoop) {
         if matches!(event, WindowEvent::CloseRequested) {
             if let Some(entry) = self.windows.remove(&window_id) {
                 // Don't care if this errors, because we'll be removing the window anyway
@@ -386,7 +407,7 @@ impl WindowManager {
         }
     }
 
-    pub(in crate::gui) fn device_event(&mut self, event: DeviceEvent) {
+    pub(crate) fn device_event(&mut self, event: DeviceEvent) {
         let mut invalid_window_ids = vec![];
         for (window_id, entry) in &self.windows {
             entry.window_handle.handle_event(WindowEventRequest::Device(event.clone())).unwrap_or_else(|err| {
