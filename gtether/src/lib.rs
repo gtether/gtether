@@ -17,6 +17,7 @@ pub mod event;
 #[cfg(feature = "graphics")]
 pub mod render;
 pub mod resource;
+pub mod util;
 
 /// User provided application.
 ///
