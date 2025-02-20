@@ -20,6 +20,7 @@ pub mod net;
 #[cfg(feature = "graphics")]
 pub mod render;
 pub mod resource;
+pub mod server;
 pub mod util;
 
 /// User provided application.
@@ -299,7 +300,7 @@ where
     /// Attempt to transition this [engine's](Engine) [stage](EngineStage).
     ///
     /// Will validate the given `stage` using [EngineStage::validate_transition()].
-    pub fn set_stage(&mut self, stage: EngineStage) -> Result<(), InvalidEngineStageTransition> {
+    pub fn set_stage(&self, stage: EngineStage) -> Result<(), InvalidEngineStageTransition> {
         let mut state = self.engine.state.write();
         state.stage.validate_transition(stage)?;
         state.stage = stage;
