@@ -2,9 +2,11 @@
 extern crate assert_matches;
 extern crate nalgebra_glm as glm;
 
+use std::any::Any;
 use std::error::Error;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -366,6 +368,86 @@ where
     }
 }
 
+/// Error that can occur when joining or stopping an [EngineJoinHandle].
+pub enum EngineJoinHandleError {
+    /// The [Engine] thread panicked.
+    Panicked(Box<dyn Any + Send + 'static>),
+
+    /// Could not stop the [Engine] because the stage [transition](EngineStage#transitioning) would
+    /// be [invalid](InvalidEngineStageTransition).
+    InvalidStageTransition(InvalidEngineStageTransition),
+}
+
+impl Debug for EngineJoinHandleError {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Panicked(_) =>
+                f.debug_tuple("EngineJoinHandleError::Panicked")
+                    .finish_non_exhaustive(),
+            Self::InvalidStageTransition(err) =>
+                f.debug_tuple("EngineJoinHandleError::InvalidStageTransition")
+                    .field(err)
+                    .finish(),
+        }
+    }
+}
+
+impl Display for EngineJoinHandleError {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Panicked(_) => write!(f, "Engine thread panicked!"),
+            Self::InvalidStageTransition(err) => Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for EngineJoinHandleError {}
+
+/// Handle for a threaded [Engine].
+///
+/// This handle can be used to manage an [Engine] instance that is running in a separate thread. It
+/// provides methods to stop the running [Engine], as well as join a stopped [Engine] thread.
+pub struct EngineJoinHandle<A, S>
+where
+    S: Side,
+    A: Application<S>,
+{
+    join_handle: JoinHandle<()>,
+    engine: Arc<Engine<A, S>>,
+}
+
+impl<A, S> EngineJoinHandle<A, S>
+where
+    S: Side,
+    A: Application<S>,
+{
+    /// Join the [Engine] thread.
+    ///
+    /// Does not stop the [Engine] beforehand, so this will block until the [Engine] has been
+    /// stopped externally, if it hasn't been already.
+    pub fn join(self) -> Result<(), EngineJoinHandleError> {
+        self.join_handle.join()
+            .map_err(|err| EngineJoinHandleError::Panicked(err))
+    }
+
+    /// Stop the [Engine] thread.
+    ///
+    /// Signals the [Engine] to stop, and joins the [Engine] thread afterward.
+    pub fn stop(self) -> Result<(), EngineJoinHandleError> {
+        self.engine.stop()
+            .map_err(|err| EngineJoinHandleError::InvalidStageTransition(err))?;
+        self.join()
+    }
+
+    /// Get a reference to the [Engine].
+    #[inline]
+    pub fn engine(&self) -> Arc<Engine<A, S>> {
+        self.engine.clone()
+    }
+}
+
 /// Build a new gTether Engine.
 ///
 /// # Examples
@@ -453,6 +535,33 @@ where
             state: Arc::new(RwLock::new(EngineStateInner::default())),
             resources,
         })
+    }
+}
+
+impl<A, S> EngineBuilder<A, S>
+where
+    S: Side + 'static,
+    A: Application<S> + 'static,
+{
+    /// Start the [Engine] in a separate thread.
+    ///
+    /// Spawn a separate thread, and start the [Engine] in it. This will yield an [EngineJoinHandle]
+    /// to manage the new [Engine] thread.
+    pub fn spawn(self) -> EngineJoinHandle<A, S> {
+        let engine = self.build();
+        let engine_thread = engine.clone();
+
+        let join_handle = std::thread::Builder::new()
+            // TODO: Get engine thread name
+            // .name()
+            .spawn(move || {
+                engine_thread.start();
+            }).unwrap();
+
+        EngineJoinHandle {
+            join_handle,
+            engine,
+        }
     }
 }
 
