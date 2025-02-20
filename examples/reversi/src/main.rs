@@ -2,12 +2,17 @@
 
 extern crate nalgebra_glm as glm;
 
+use async_trait::async_trait;
+use educe::Educe;
+use gtether::client::gui::input::InputDelegate;
+use gtether::client::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
+use gtether::client::gui::ClientGui;
+use gtether::client::Client;
+use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
 use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::console::Console;
 use gtether::event::Event;
-use gtether::client::gui::input::InputDelegate;
-use gtether::client::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::model::obj::ModelObjLoader;
 use gtether::render::model::ModelVertexNormal;
@@ -16,11 +21,14 @@ use gtether::render::uniform::Uniform;
 use gtether::render::{RendererEventData, RendererEventType};
 use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
-use gtether::{Application, Engine, EngineBuilder};
+use gtether::server::Server;
+use gtether::{Application, Engine, EngineBuilder, EngineJoinHandle};
+use parking_lot::{Mutex, MutexGuard};
+use parry3d::na::Point3;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use async_trait::async_trait;
-use parry3d::na::Point3;
+use tracing::{debug, info};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -28,9 +36,6 @@ use tracing_subscriber::EnvFilter;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
-use gtether::client::Client;
-use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
-use gtether::client::gui::ClientGui;
 
 use crate::board::Board;
 use crate::bot::minimax::MinimaxAlgorithm;
@@ -41,6 +46,8 @@ mod board;
 mod bot;
 mod render_util;
 mod player;
+
+const REVERSI_PORT: u16 = 19502;
 
 #[derive(Debug)]
 struct ResetCommand {
@@ -55,11 +62,45 @@ impl Command for ResetCommand {
     }
 }
 
+#[derive(Educe)]
+#[educe(Debug)]
+struct ConnectCommand {
+    #[educe(Debug(ignore))]
+    client: Arc<Engine<ReversiApp, ClientGui>>,
+    #[educe(Debug(ignore))]
+    server: Arc<ServerContainer>,
+}
+
+impl Command for ConnectCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::OneOf(vec![
+            ParamCountCheck::Equal(0),
+            ParamCountCheck::Equal(1),
+        ]).check(parameters.len() as u32)?;
+
+        if parameters.len() == 1 {
+            let socket_addr = parameters[0].parse()
+                .map_err(|_| CommandError::InvalidParameter(parameters[0].clone()))?;
+            self.server.shutdown();
+            self.client.side().net().connect_sync(socket_addr)
+        } else {
+            self.server.start();
+            self.client.side().net().connect_sync(SocketAddr::new(
+                Ipv4Addr::LOCALHOST.into(),
+                REVERSI_PORT,
+            ))
+        }.map_err(|err| CommandError::CommandFailure(Box::new(err)))?;
+
+        Ok(())
+    }
+}
+
 struct ReversiApp {
     console: Arc<Console>,
     window: OnceLock<WindowHandle>,
     board: OnceLock<Arc<Board>>,
     input: OnceLock<InputDelegate>,
+    server: Arc<ServerContainer>,
 }
 
 impl ReversiApp {
@@ -73,6 +114,7 @@ impl ReversiApp {
             window: OnceLock::new(),
             board: OnceLock::new(),
             input: OnceLock::new(),
+            server: Arc::new(ServerContainer::new()),
         }
     }
 }
@@ -208,6 +250,11 @@ impl Application<ClientGui> for ReversiApp {
             .build().unwrap();
         window.renderer().set_render_pass(render_pass);
 
+        cmd_registry.register_command("connect", Box::new(ConnectCommand {
+            client: engine.clone(),
+            server: self.server.clone()
+        })).unwrap();
+
         self.input.set(window.input_state().create_delegate()).unwrap();
         self.window.set(window).unwrap();
         self.board.set(board).unwrap();
@@ -215,6 +262,95 @@ impl Application<ClientGui> for ReversiApp {
 
     fn tick(&self, _engine: &Arc<Engine<Self, ClientGui>>, _delta: Duration) {
         /* noop */
+    }
+}
+
+struct ReversiAppServer {
+
+}
+
+impl ReversiAppServer {
+    fn new() -> Self {
+        Self {
+
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl Application<Server> for ReversiAppServer {
+    async fn init(&self, _engine: &Arc<Engine<Self, Server>>) {
+
+    }
+
+    fn tick(&self, _engine: &Arc<Engine<Self, Server>>, _delta: Duration) {
+
+    }
+}
+
+type EngineServer = Engine<ReversiAppServer, Server>;
+type EngineServerJoinHandle = EngineJoinHandle<ReversiAppServer, Server>;
+
+struct ServerContainer {
+    inner: Mutex<Option<EngineServerJoinHandle>>,
+}
+
+impl ServerContainer {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn shutdown_impl(inner: &mut MutexGuard<Option<EngineServerJoinHandle>>) {
+        if let Some(server) = inner.take() {
+            info!("Stopping server...");
+            server.stop().unwrap();
+            info!("Server stopped.");
+        } else {
+            debug!("Server is already stopped");
+        }
+    }
+
+    fn shutdown(&self) {
+        Self::shutdown_impl(&mut self.inner.lock());
+    }
+
+    fn start_impl(inner: &mut MutexGuard<Option<EngineServerJoinHandle>>) {
+        info!("Starting server...");
+        let side_result = Server::builder()
+            .port(REVERSI_PORT)
+            .build();
+        let side = match side_result {
+            Ok(side) => side,
+            Err(error) => {
+                debug!(?error);
+                panic!("{error}");
+            },
+        };
+        let join_handle = EngineBuilder::new()
+            .app(ReversiAppServer::new())
+            .side(side)
+            .spawn();
+        **inner = Some(join_handle);
+        info!("Server started.");
+    }
+
+    fn start(&self) -> Arc<EngineServer> {
+        let mut inner = self.inner.lock();
+        if inner.is_none() {
+            Self::start_impl(&mut inner);
+        } else {
+            debug!("Server is already running");
+        }
+        inner.as_ref().unwrap().engine()
+    }
+
+    fn restart(&self) -> Arc<EngineServer> {
+        let mut inner = self.inner.lock();
+        Self::shutdown_impl(&mut inner);
+        Self::start_impl(&mut inner);
+        inner.as_ref().unwrap().engine()
     }
 }
 
