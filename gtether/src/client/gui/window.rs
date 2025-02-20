@@ -165,14 +165,14 @@ impl Window {
         attributes: WindowAttributes,
         event_loop: &ActiveEventLoop,
         instance: &Arc<Instance>,
-        application_name: Option<String>,
+        application_name: String,
     ) -> (WindowHandle, thread::JoinHandle<()>) {
         let (endpoint_modify, sender_modify) = ump::channel();
         let (endpoint_event, sender_event) = ump::channel();
 
         let mut attributes = attributes;
         if &attributes.title == "winit window" {
-            attributes.title = application_name.unwrap_or("gTether Window".into());
+            attributes.title = application_name;
         }
         let title = attributes.title.clone();
 
@@ -315,7 +315,7 @@ struct WindowEntry {
 }
 
 pub(crate) struct WindowManager {
-    application_name: Option<String>,
+    application_name: String,
     render_instance: Arc<Instance>,
     windows: HashMap<WindowId, WindowEntry>,
     msg_create_server: ump::Server<CreateWindowInfo, WindowHandle, ()>,
@@ -323,12 +323,12 @@ pub(crate) struct WindowManager {
 
 impl WindowManager {
     pub(crate) fn new(
-        application_name: Option<String>,
+        application_name: impl Into<String>,
         render_instance: Arc<Instance>,
     ) -> (Self, ump::Client<CreateWindowInfo, WindowHandle, ()>) {
         let (msg_create_server, msg_create_client) = ump::channel();
         (Self {
-            application_name,
+            application_name: application_name.into(),
             render_instance,
             windows: HashMap::new(),
             msg_create_server,

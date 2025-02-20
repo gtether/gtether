@@ -12,6 +12,8 @@
 //! # use std::sync::Arc;
 //! # use std::time::Duration;
 //! use async_trait::async_trait;
+//! # use gtether::client::ClientBuildError;
+//! use gtether::client::Client;
 //! use gtether::client::gui::ClientGui;
 //! use gtether::{Application, Engine};
 //!
@@ -26,17 +28,20 @@
 //!
 //! let app = StartingGuiApp {};
 //!
-//! let side = ClientGui::builder()
+//! let side = Client::builder()
 //!     .application_name("StartingApplication")
 //!     // 60 ticks per second
 //!     .tick_rate(60)
-//!     .build();
+//!     .enable_gui()
+//!     .build()?;
 //!
 //! Engine::builder()
 //!     .app(app)
 //!     .side(side)
 //!     .build()
 //!     .start();
+//! #
+//! # Ok::<(), ClientBuildError>(())
 //! ```
 
 use std::sync::Arc;
@@ -54,7 +59,9 @@ use winit::window::WindowId;
 use window::WindowManager;
 
 use crate::{Application, EngineStage, EngineState, Side};
+use crate::client::{Client, ClientBuildError, ClientBuilder};
 use crate::client::gui::window::{CreateWindowInfo, WindowHandle};
+use crate::net::client::ClientNetworking;
 use crate::render::Instance;
 
 pub mod window;
@@ -122,7 +129,9 @@ impl<A: Application<ClientGui>> ApplicationHandler for WindowOrchestrator<A> {
 }
 
 enum ClientGuiState {
-    Created(ClientGuiBuilder),
+    Created {
+        render_extensions: InstanceExtensions,
+    },
     Started {
         render_instance: Arc<Instance>,
         msg_create_client: ump::Client<CreateWindowInfo, WindowHandle, ()>,
@@ -143,25 +152,24 @@ enum ClientGuiState {
 ///  * x86_64 linux
 ///    * aarch64 is likely to work fine, but isn't tested
 pub struct ClientGui {
+    inner: Client,
     state: RwLock<ClientGuiState>,
 }
 
 impl ClientGui {
-    /// Create a builder for ClientGui.
-    ///
-    /// This is the recommended way to create a new ClientGui.
-    #[inline]
-    pub fn builder() -> ClientGuiBuilder {
-        ClientGuiBuilder::new()
-    }
-
-    fn new(builder: ClientGuiBuilder) -> Self {
+    fn new(
+        inner: Client,
+        render_extensions: InstanceExtensions,
+    ) -> Self {
         Self {
-            state: RwLock::new(ClientGuiState::Created(builder)),
+            inner,
+            state: RwLock::new(ClientGuiState::Created {
+                render_extensions,
+            }),
         }
     }
 
-    /// The [render instance](Instance) for this ClientGui.
+    /// The [render instance](Instance) for this [ClientGui].
     #[inline]
     pub fn render_instance(&self) -> Arc<Instance> {
         match &*self.state.read() {
@@ -194,6 +202,18 @@ impl ClientGui {
             _ => panic!("ClientGuiSide not started yet"),
         }
     }
+
+    /// The application name of the [ClientGui].
+    #[inline]
+    pub fn application_name(&self) -> &str {
+        &self.inner.application_name
+    }
+
+    /// Reference to the client's [ClientNetworking] instance.
+    #[inline]
+    pub fn net(&self) -> &ClientNetworking {
+        &self.inner.net
+    }
 }
 
 impl Side for ClientGui {
@@ -201,8 +221,42 @@ impl Side for ClientGui {
         let (event_loop, mut handler) = {
             let mut state = self.state.write();
             let (new_state, event_loop, handler) = match &*state {
-                ClientGuiState::Created(builder) => {
-                    builder.start(engine_state)
+                ClientGuiState::Created {
+                    render_extensions,
+                } => {
+                    let event_loop = EventLoop::builder()
+                        .build().unwrap();
+                    event_loop.set_control_flow(ControlFlow::Poll);
+
+                    let render_extensions = render_extensions.clone()
+                        | Surface::required_extensions(&event_loop);
+                    let render_instance = Arc::new(Instance::new(
+                        Some(self.application_name().to_owned()),
+                        render_extensions,
+                    ));
+
+                    let min_tick_duration = Duration::from_secs_f32(
+                        1.0 / self.inner.tick_rate as f32
+                    );
+
+                    let (manager, msg_create_client) = WindowManager::new(
+                        self.application_name(),
+                        render_instance.clone(),
+                    );
+
+                    let handler = WindowOrchestrator {
+                        engine_state,
+                        manager,
+                        min_tick_duration,
+                        last_tick: Instant::now(),
+                    };
+
+                    let new_state = ClientGuiState::Started {
+                        render_instance,
+                        msg_create_client,
+                    };
+
+                    (new_state, event_loop, handler)
                 },
                 _ => panic!("ClientGuiSide can only be started once"),
             };
@@ -217,12 +271,17 @@ impl Side for ClientGui {
 
 /// Builder pattern for [ClientGui].
 ///
+/// This builder pattern is not directly creatable, but instead should be obtained by starting with
+/// a normal [ClientBuilder] and calling [ClientBuilder::enable_gui()].
+///
 /// # Examples
 /// ```no_run
 /// # use std::sync::Arc;
 /// # use std::time::Duration;
 /// # use async_trait::async_trait;
-/// use gtether::client::gui::ClientGui;
+/// # use gtether::client::ClientBuildError;
+/// use gtether::client::Client;
+/// # use gtether::client::gui::ClientGui;
 /// use gtether::Engine;
 /// # use gtether::Application;
 /// #
@@ -237,59 +296,30 @@ impl Side for ClientGui {
 /// #
 /// # let app = MyApp {};
 ///
-/// let side = ClientGui::builder()
-///     .application_name("MyApplication")
-///     // 60 ticks per second
-///     .tick_rate(60)
-///     .build();
+/// let side = Client::builder()
+///     .application_name("StartingApplication")
+///     .enable_gui()
+///     .build()?;
 ///
 /// let engine = Engine::builder()
 ///     .app(app)
 ///     .side(side)
 ///     .build();
+/// #
+/// # Ok::<(), ClientBuildError>(())
 /// ```
-#[derive(Clone)]
 pub struct ClientGuiBuilder {
-    application_name: Option<String>,
-    tick_rate: usize,
+    client_builder: ClientBuilder,
     render_extensions: InstanceExtensions,
 }
 
 impl ClientGuiBuilder {
-    /// Create a new ClientGuiBuilder.
-    ///
-    /// It is recommended to use [ClientGui::builder()] instead.
     #[inline]
-    pub fn new() -> Self {
+    pub(super) fn new(client_builder: ClientBuilder) -> Self {
         Self {
-            application_name: None,
-            tick_rate: 60,
+            client_builder,
             render_extensions: InstanceExtensions::default(),
         }
-    }
-
-    /// Set the application name.
-    ///
-    /// This name is used e.g. in Vulkan drivers to identify your application.
-    ///
-    /// Default is `None`.
-    #[inline]
-    pub fn application_name(&mut self, name: impl Into<String>) -> &mut Self {
-        self.application_name = Some(name.into());
-        self
-    }
-
-    /// Set the tick rate.
-    ///
-    /// [ClientGui] will attempt to drive the [Application] at this tick rate. If ticks take too
-    /// long, some ticks may be skipped resulting in a lower tick rate, but the tick rate will never
-    /// be higher than this number.
-    ///
-    /// Default is `60`.
-    #[inline]
-    pub fn tick_rate(&mut self, tick_rate: usize) -> &mut Self {
-        self.tick_rate = tick_rate;
-        self
     }
 
     /// Define any additional Vulkan render extensions that are required.
@@ -307,43 +337,11 @@ impl ClientGuiBuilder {
 
     /// Build a new [ClientGui].
     #[inline]
-    pub fn build(&self) -> ClientGui {
-        ClientGui::new(self.clone())
-    }
-
-    fn start<A: Application<ClientGui>>(&self, engine_state: EngineState<A, ClientGui>)
-        -> (ClientGuiState, EventLoop<()>, WindowOrchestrator<A>)
-    {
-        let event_loop = EventLoop::builder()
-            .build().unwrap();
-        event_loop.set_control_flow(ControlFlow::Poll);
-
-        let render_extensions = self.render_extensions.clone()
-            | Surface::required_extensions(&event_loop);
-        let render_instance = Arc::new(Instance::new(
-            self.application_name.clone(),
-            render_extensions,
-        ));
-
-        let min_tick_duration = Duration::from_secs_f32(1.0 / self.tick_rate as f32);
-
-        let (manager, msg_create_client) = WindowManager::new(
-            self.application_name.clone(),
-            render_instance.clone(),
-        );
-
-        let handler = WindowOrchestrator {
-            engine_state,
-            manager,
-            min_tick_duration,
-            last_tick: Instant::now(),
-        };
-
-        let new_state = ClientGuiState::Started {
-            render_instance,
-            msg_create_client,
-        };
-
-        (new_state, event_loop, handler)
+    pub fn build(self) -> Result<ClientGui, ClientBuildError> {
+        let client = self.client_builder.build()?;
+        Ok(ClientGui::new(
+            client,
+            self.render_extensions,
+        ))
     }
 }

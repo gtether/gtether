@@ -25,6 +25,7 @@ use gtether::render::uniform::{Uniform, UniformSet};
 use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
 use gtether::{Application, Engine, EngineBuilder};
+use gtether::client::Client;
 use gtether::client::gui::ClientGui;
 use crate::render::ambient::{AmbientLight, AmbientRendererBootstrap};
 use crate::render::cube::CubeRendererBootstrap;
@@ -429,7 +430,7 @@ impl Application<ClientGui> for WindowsApp {
         }
 
         if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap_or(false) {
-            engine.request_exit();
+            engine.stop().unwrap();
         }
     }
 }
@@ -451,9 +452,10 @@ fn main() {
 
     EngineBuilder::new()
         .app(app)
-        .side(ClientGui::builder()
+        .side(Client::builder()
             .application_name("gTether Example - windows")
-            .build())
+            .enable_gui()
+            .build().unwrap())
         .resources(resources)
         .build()
         .start();

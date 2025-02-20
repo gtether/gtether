@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
+use gtether::client::Client;
 use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
 use gtether::client::gui::ClientGui;
 
@@ -241,9 +242,10 @@ fn main() {
 
     EngineBuilder::new()
         .app(app)
-        .side(ClientGui::builder()
+        .side(Client::builder()
             .application_name("gTether Example - reversi")
-            .build())
+            .enable_gui()
+            .build().unwrap())
         .resources(resources)
         .build()
         .start();

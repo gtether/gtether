@@ -375,6 +375,7 @@ where
 /// # use std::time::Duration;
 /// use async_trait::async_trait;
 /// use gtether::{Application, Engine};
+/// # use gtether::client::ClientBuildError;
 /// use gtether::client::Client;
 ///
 /// struct MyApp {}
@@ -389,8 +390,10 @@ where
 /// let app = MyApp {};
 /// let engine = Engine::builder()
 ///     .app(app)
-///     .side(Client::new(60))
+///     .side(Client::builder().build()?)
 ///     .build();
+///
+/// Ok::<(), ClientBuildError>(())
 /// ```
 pub struct EngineBuilder<A, S>
 where
