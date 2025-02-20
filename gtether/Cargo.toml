@@ -25,9 +25,11 @@ bytemuck = { workspace = true }
 chrono = { workspace = true }
 crossbeam = { workspace = true }
 educe = { workspace = true }
+gns = { workspace = true }
 image = { workspace = true, optional = true }
 itertools = { workspace = true }
 nalgebra-glm = { workspace = true }
+ouroboros = { workspace = true }
 parking_lot = { workspace = true }
 ringbuf = { workspace = true }
 sha2 = { workspace = true }

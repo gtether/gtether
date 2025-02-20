@@ -14,6 +14,7 @@ use crate::resource::manager::ResourceManager;
 pub mod client;
 pub mod console;
 pub mod event;
+pub mod net;
 #[cfg(feature = "graphics")]
 pub mod render;
 pub mod resource;
