@@ -1,11 +1,14 @@
 //! Server-side networking APIs.
 
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::net::SocketAddr;
-use std::sync::Arc;
 use async_trait::async_trait;
 use smol::future;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use crate::net::message::MessageDispatch;
+use crate::net::{NetworkingBuildError, NetworkingBuilder};
 
 /// Raw server listening on a given socket.
 ///
@@ -32,6 +35,7 @@ pub trait RawServerFactory: Send + Sync + 'static {
     /// If the socket is free and can be bound, yields a new [RawServer].
     async fn listen(
         &self,
+        msg_dispatch: Arc<MessageDispatch>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawServer>, ServerNetworkingError>;
 }
@@ -39,8 +43,12 @@ pub trait RawServerFactory: Send + Sync + 'static {
 #[async_trait]
 impl RawServerFactory for Box<dyn RawServerFactory> {
     #[inline]
-    async fn listen(&self, socket_addr: SocketAddr) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
-        (**self).listen(socket_addr).await
+    async fn listen(
+        &self,
+        msg_dispatch: Arc<MessageDispatch>,
+        socket_addr: SocketAddr,
+    ) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
+        (**self).listen(msg_dispatch, socket_addr).await
     }
 }
 
@@ -103,12 +111,23 @@ pub struct ServerNetworking {
 }
 
 impl ServerNetworking {
-    /// Create a new [ServerNetworking] instance.
-    pub fn new(
+    /// Create a builder for [ServerNetworking].
+    ///
+    /// This is the recommended way to create a new [ServerNetworking] stack.
+    #[inline]
+    pub fn builder() -> NetworkingBuilder<ServerBuilder> {
+        NetworkingBuilder::new()
+    }
+
+    fn new(
         raw_factory: impl RawServerFactory,
+        msg_dispatch: Arc<MessageDispatch>,
         socket_addr: SocketAddr,
     ) -> Result<Self, ServerNetworkingError> {
-        let inner = future::block_on(raw_factory.listen(socket_addr))?;
+        let inner = future::block_on(raw_factory.listen(
+            msg_dispatch,
+            socket_addr,
+        ))?;
 
         Ok(Self {
             inner,
@@ -119,5 +138,92 @@ impl ServerNetworking {
 impl Drop for ServerNetworking {
     fn drop(&mut self) {
         future::block_on(self.inner.close())
+    }
+}
+
+impl From<ServerNetworkingError> for NetworkingBuildError {
+    #[inline]
+    fn from(value: ServerNetworkingError) -> Self {
+        Self::InitError { source: Some(Box::new(value)) }
+    }
+}
+
+/// Builder sub-pattern for [ServerNetworking] stack.
+///
+/// This builder cannot be used directly, and is only used as a generic type in [NetworkingBuilder].
+/// To get a builder using this, see [ServerNetworking::builder()].
+#[derive(Default)]
+pub struct ServerBuilder {
+    raw_factory: Option<Box<dyn RawServerFactory>>,
+    ip_addr: Option<IpAddr>,
+    port: Option<u16>,
+}
+
+impl NetworkingBuilder<ServerBuilder> {
+    /// Set the [RawServerFactory] implementation for creating the [RawServer].
+    ///
+    /// This option is required.
+    #[inline]
+    pub fn raw_factory(mut self, raw_factory: impl RawServerFactory) -> Self {
+        self.extra.raw_factory = Some(Box::new(raw_factory));
+        self
+    }
+
+    /// Set the IP address that this server listens on.
+    ///
+    /// Default is [Ipv4Addr::LOCALHOST].
+    #[inline]
+    pub fn ip_addr(mut self, ip_addr: impl Into<IpAddr>) -> Self {
+        self.extra.ip_addr = Some(ip_addr.into());
+        self
+    }
+
+    /// Set the port that this server listens on.
+    ///
+    /// This option is required.
+    #[inline]
+    pub fn port(mut self, port: u16) -> Self {
+        self.extra.port = Some(port);
+        self
+    }
+
+    /// Set the socket address that this server listens on.
+    ///
+    /// This is effectively the same as:
+    /// ```no_run
+    /// # use std::net::{Ipv4Addr, SocketAddr};
+    /// # use gtether::net::server::ServerNetworking;
+    /// # let socket = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9001);
+    /// ServerNetworking::builder()
+    ///     .ip_addr(socket.ip())
+    ///     .port(socket.port())
+    /// # ;
+    /// ```
+    #[inline]
+    pub fn socket_addr(mut self, socket_addr: impl Into<SocketAddr>) -> Self {
+        let socket_addr = socket_addr.into();
+        self.extra.ip_addr = Some(socket_addr.ip());
+        self.extra.port = Some(socket_addr.port());
+        self
+    }
+
+    /// Build this [ServerNetworking] stack.
+    ///
+    /// # Errors
+    ///
+    /// Errors when there is a required option that is missing, or if the networking stack fails to
+    /// initialize.
+    pub fn build(mut self) -> Result<ServerNetworking, NetworkingBuildError> {
+        let msg_dispatch = self.msg_dispatch()?;
+        let raw_factory = self.extra.raw_factory
+            .ok_or(NetworkingBuildError::missing_option("raw_factory"))?;
+
+        let ip_addr = self.extra.ip_addr
+            .unwrap_or(Ipv4Addr::LOCALHOST.into());
+        let port = self.extra.port
+            .ok_or(NetworkingBuildError::missing_option("port"))?;
+        let socket_addr = SocketAddr::new(ip_addr, port);
+
+        Ok(ServerNetworking::new(raw_factory, msg_dispatch, socket_addr)?)
     }
 }

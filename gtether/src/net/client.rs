@@ -1,11 +1,14 @@
 //! Client-side networking APIs.
 
+use async_trait::async_trait;
+use smol::future;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use async_trait::async_trait;
-use smol::future;
+
+use crate::net::message::MessageDispatch;
+use crate::net::{NetworkingBuildError, NetworkingBuilder};
 
 /// Raw client representing a single connection.
 ///
@@ -33,6 +36,7 @@ pub trait RawClientFactory: Send + Sync + 'static {
     /// If the connection is successful, yields a new [RawClient].
     async fn connect(
         &self,
+        msg_dispatch: Arc<MessageDispatch>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawClient>, ClientNetworkingError>;
 }
@@ -40,8 +44,37 @@ pub trait RawClientFactory: Send + Sync + 'static {
 #[async_trait]
 impl RawClientFactory for Box<dyn RawClientFactory> {
     #[inline]
-    async fn connect(&self, socket_addr: SocketAddr) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
-        (**self).connect(socket_addr).await
+    async fn connect(
+        &self,
+        msg_dispatch: Arc<MessageDispatch>,
+        socket_addr: SocketAddr,
+    ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
+        (**self).connect(msg_dispatch, socket_addr).await
+    }
+}
+
+/// Simplistic [RawClientFactory] that always errors with [ClientNetworkingError::Closed].
+///
+/// This can be used for a [ClientNetworking] stack that isn't actively used; i.e. for a
+/// singleplayer game.
+#[derive(Debug, Default)]
+pub struct ClosedClientFactory {}
+
+impl ClosedClientFactory {
+    /// Create a new [ClosedClientFactory].
+    #[inline]
+    pub fn new() -> Self { Self::default() }
+}
+
+#[async_trait]
+impl RawClientFactory for ClosedClientFactory {
+    #[inline]
+    async fn connect(
+        &self,
+        _msg_dispatch: Arc<MessageDispatch>,
+        _socket_addr: SocketAddr
+    ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
+        Err(ClientNetworkingError::Closed)
     }
 }
 
@@ -95,22 +128,32 @@ impl From<ump::Error<ClientNetworkingError>> for ClientNetworkingError {
     }
 }
 
-/// Manager for client networking logic.
+/// Manager for client networking stack.
 ///
 /// An instance of ClientNetworking manages an internal [RawClientFactory] and any
 /// [RawClients](RawClient) it can create. Only one [RawClient] can be managed at a time.
 pub struct ClientNetworking {
     raw_factory: Box<dyn RawClientFactory>,
+    msg_dispatch: Arc<MessageDispatch>,
     inner: smol::lock::RwLock<Option<Arc<dyn RawClient>>>,
 }
 
 impl ClientNetworking {
-    /// Create a new [ClientNetworking] instance.
+    /// Create a builder for [ClientNetworking].
     ///
-    /// New instances start as unconnected.
-    pub fn new(raw_factory: impl RawClientFactory) -> Self {
+    /// This is the recommended way to create a new [ClientNetworking] stack.
+    #[inline]
+    pub fn builder() -> NetworkingBuilder<ClientBuilder> {
+        NetworkingBuilder::new()
+    }
+
+    fn new(
+        raw_factory: Box<dyn RawClientFactory>,
+        msg_dispatch: Arc<MessageDispatch>,
+    ) -> Self {
         Self {
-            raw_factory: Box::new(raw_factory),
+            raw_factory,
+            msg_dispatch,
             inner: smol::lock::RwLock::new(None),
         }
     }
@@ -123,7 +166,7 @@ impl ClientNetworking {
         if let Some(client) = inner.take() {
             client.close().await;
         }
-        *inner = Some(self.raw_factory.connect(socket_addr).await?);
+        *inner = Some(self.raw_factory.connect(self.msg_dispatch.clone(), socket_addr).await?);
         Ok(())
     }
 
@@ -139,5 +182,39 @@ impl Drop for ClientNetworking {
         if let Some(client) = self.inner.write_blocking().take() {
             future::block_on(client.close())
         }
+    }
+}
+
+/// Builder sub-pattern for [ClientNetworking] stack.
+///
+/// This builder cannot be used directly, and is only used as a generic type in [NetworkingBuilder].
+/// To get a builder using this, see [ClientNetworking::builder()].
+#[derive(Default)]
+pub struct ClientBuilder {
+    raw_factory: Option<Box<dyn RawClientFactory>>,
+}
+
+impl NetworkingBuilder<ClientBuilder> {
+    /// Set the [RawClientFactory] implementation for creating [RawClients](RawClient).
+    ///
+    /// This option is required.
+    #[inline]
+    pub fn raw_factory(mut self, raw_factory: impl RawClientFactory) -> Self {
+        self.extra.raw_factory = Some(Box::new(raw_factory));
+        self
+    }
+
+    /// Build this [ClientNetworking] stack.
+    ///
+    /// # Errors
+    ///
+    /// Errors when there is a required option that is missing, or if the networking stack fails to
+    /// initialize.
+    pub fn build(mut self) -> Result<ClientNetworking, NetworkingBuildError> {
+        let msg_dispatch = self.msg_dispatch()?;
+        let raw_factory = self.extra.raw_factory
+            .ok_or(NetworkingBuildError::missing_option("raw_factory"))?;
+
+        Ok(ClientNetworking::new(raw_factory, msg_dispatch))
     }
 }

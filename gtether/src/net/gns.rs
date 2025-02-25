@@ -39,6 +39,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::net::client::{ClientNetworkingError, RawClient, RawClientFactory};
+use crate::net::message::MessageDispatch;
 use crate::net::server::{RawServer, RawServerFactory, ServerNetworkingError};
 use crate::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
 
@@ -48,6 +49,7 @@ enum ClientMessage {
 }
 
 struct GnsClient<'gu> {
+    msg_dispatch: Arc<MessageDispatch>,
     socket: Option<GnsSocket<'gu, 'gu, IsClient>>,
     msg_recv: ump::Server<ClientMessage, (), ClientNetworkingError>,
 }
@@ -56,6 +58,7 @@ impl<'gu> GnsClient<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
+        msg_dispatch: Arc<MessageDispatch>,
         socket_addr: SocketAddr,
     ) -> Result<(Self, Arc<dyn RawClient>), ClientNetworkingError> {
         let socket = GnsSocket::new(gns_global, gns_utils)
@@ -66,6 +69,7 @@ impl<'gu> GnsClient<'gu> {
         let (msg_recv, msg_send) = ump::channel();
 
         let client = Self {
+            msg_dispatch,
             socket: Some(socket),
             msg_recv,
         };
@@ -128,6 +132,15 @@ impl<'gu> GnsClient<'gu> {
             }
         });
 
+        socket.poll_messages::<100>(|message| {
+            match self.msg_dispatch.dispatch(message.payload()) {
+                Ok(_) => {},
+                Err(error) => {
+                    warn!(?error, "Failed to dispatch message");
+                }
+            }
+        });
+
         !quit
     }
 }
@@ -156,6 +169,7 @@ enum ServerMessage {
 }
 
 struct GnsServer<'gu> {
+    msg_dispatch: Arc<MessageDispatch>,
     socket: Option<GnsSocket<'gu, 'gu, IsServer>>,
     // TODO: What value should this store?
     clients: HashMap<GnsConnection, ()>,
@@ -166,6 +180,7 @@ impl<'gu> GnsServer<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
+        msg_dispatch: Arc<MessageDispatch>,
         socket_addr: SocketAddr,
     ) -> Result<(Self, Arc<dyn RawServer>), ServerNetworkingError> {
         let socket = GnsSocket::new(gns_global, gns_utils)
@@ -176,6 +191,7 @@ impl<'gu> GnsServer<'gu> {
         let (msg_recv, msg_send) = ump::channel();
 
         let server = Self {
+            msg_dispatch,
             socket: Some(socket),
             clients: HashMap::new(),
             msg_recv,
@@ -263,6 +279,15 @@ impl<'gu> GnsServer<'gu> {
             }
         });
 
+        socket.poll_messages::<100>(|message| {
+            match self.msg_dispatch.dispatch(message.payload()) {
+                Ok(_) => {},
+                Err(error) => {
+                    warn!(?error, "Failed to dispatch message");
+                }
+            }
+        });
+
         true
     }
 }
@@ -290,6 +315,18 @@ static SUBSYSTEM: LazyLock<Arc<GnsSubsystem>> = LazyLock::new(|| {
     Arc::new(GnsSubsystem::new())
 });
 
+#[derive(Debug)]
+struct CreateClientReq {
+    socket_addr: SocketAddr,
+    msg_dispatch: Arc<MessageDispatch>,
+}
+
+#[derive(Debug)]
+struct CreateServerReq {
+    socket_addr: SocketAddr,
+    msg_dispatch: Arc<MessageDispatch>,
+}
+
 #[self_referencing]
 struct SubsystemData {
     gns_global: GnsGlobal,
@@ -300,8 +337,8 @@ struct SubsystemData {
     #[borrows(gns_global, gns_utils)]
     #[not_covariant]
     servers: Vec<GnsServer<'this>>,
-    msg_create_client_recv: ump::Server<SocketAddr, Arc<dyn RawClient>, ClientNetworkingError>,
-    msg_create_server_recv: ump::Server<SocketAddr, Arc<dyn RawServer>, ServerNetworkingError>,
+    msg_create_client_recv: ump::Server<CreateClientReq, Arc<dyn RawClient>, ClientNetworkingError>,
+    msg_create_server_recv: ump::Server<CreateServerReq, Arc<dyn RawServer>, ServerNetworkingError>,
 }
 
 /// Handle for the GNS subsystem.
@@ -313,19 +350,20 @@ struct SubsystemData {
 pub struct GnsSubsystem {
     #[allow(unused)]
     tick_loop: TickLoopHandle,
-    msg_create_client_send: ump::Client<SocketAddr, Arc<dyn RawClient>, ClientNetworkingError>,
-    msg_create_server_send: ump::Client<SocketAddr, Arc<dyn RawServer>, ServerNetworkingError>,
+    msg_create_client_send: ump::Client<CreateClientReq, Arc<dyn RawClient>, ClientNetworkingError>,
+    msg_create_server_send: ump::Client<CreateServerReq, Arc<dyn RawServer>, ServerNetworkingError>,
 }
 
 impl GnsSubsystem {
     fn tick(data: &mut SubsystemData, _delta: Duration) -> bool {
         data.with_mut(|data| {
-            while let Some((socket_addr, reply_ctx))
+            while let Some((req, reply_ctx))
                     = data.msg_create_client_recv.try_pop().unwrap_or(None) {
                 match GnsClient::new(
                     data.gns_global,
                     data.gns_utils,
-                    socket_addr,
+                    req.msg_dispatch,
+                    req.socket_addr,
                 ) {
                     Ok((client, client_handle)) => {
                         data.clients.push(client);
@@ -335,12 +373,13 @@ impl GnsSubsystem {
                 }
             }
 
-            while let Some((socket_addr, reply_ctx))
+            while let Some((req, reply_ctx))
                     = data.msg_create_server_recv.try_pop().unwrap_or(None) {
                 match GnsServer::new(
                     data.gns_global,
                     data.gns_utils,
-                    socket_addr,
+                    req.msg_dispatch,
+                    req.socket_addr,
                 ) {
                     Ok((server, server_handle)) => {
                         data.servers.push(server);
@@ -398,8 +437,16 @@ impl GnsSubsystem {
 
 #[async_trait]
 impl RawClientFactory for Arc<GnsSubsystem> {
-    async fn connect(&self, socket_addr: SocketAddr) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
-        self.msg_create_client_send.areq(socket_addr).await
+    async fn connect(
+        &self,
+        msg_dispatch: Arc<MessageDispatch>,
+        socket_addr: SocketAddr,
+    ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
+        let req = CreateClientReq {
+            socket_addr,
+            msg_dispatch,
+        };
+        self.msg_create_client_send.areq(req).await
             .map_err(|err| match err {
                 ump::Error::App(err) => err,
                 _ => ClientNetworkingError::internal_error("No response from subsystem"),
@@ -409,8 +456,16 @@ impl RawClientFactory for Arc<GnsSubsystem> {
 
 #[async_trait]
 impl RawServerFactory for Arc<GnsSubsystem> {
-    async fn listen(&self, socket_addr: SocketAddr) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
-        self.msg_create_server_send.areq(socket_addr).await
+    async fn listen(
+        &self,
+        msg_dispatch: Arc<MessageDispatch>,
+        socket_addr: SocketAddr,
+    ) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
+        let req = CreateServerReq {
+            socket_addr,
+            msg_dispatch,
+        };
+        self.msg_create_server_send.areq(req).await
             .map_err(|err| match err {
                 ump::Error::App(err) => err,
                 _ => ServerNetworkingError::internal_error("No response from subsystem"),

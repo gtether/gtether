@@ -36,6 +36,9 @@ use tracing_subscriber::EnvFilter;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
+use gtether::net::client::ClientNetworking;
+use gtether::net::gns::GnsSubsystem;
+use gtether::net::server::ServerNetworking;
 
 use crate::board::Board;
 use crate::bot::minimax::MinimaxAlgorithm;
@@ -318,16 +321,13 @@ impl ServerContainer {
 
     fn start_impl(inner: &mut MutexGuard<Option<EngineServerJoinHandle>>) {
         info!("Starting server...");
-        let side_result = Server::builder()
+        let networking = ServerNetworking::builder()
+            .raw_factory(GnsSubsystem::get())
             .port(REVERSI_PORT)
-            .build();
-        let side = match side_result {
-            Ok(side) => side,
-            Err(error) => {
-                debug!(?error);
-                panic!("{error}");
-            },
-        };
+            .build().unwrap();
+        let side = Server::builder()
+            .networking(networking)
+            .build().unwrap();
         let join_handle = EngineBuilder::new()
             .app(ReversiAppServer::new())
             .side(side)
@@ -376,10 +376,15 @@ fn main() {
             .build())
         .build();
 
+    let client_networking = ClientNetworking::builder()
+        .raw_factory(GnsSubsystem::get())
+        .build().unwrap();
+
     EngineBuilder::new()
         .app(app)
         .side(Client::builder()
             .application_name("gTether Example - reversi")
+            .networking(client_networking)
             .enable_gui()
             .build().unwrap())
         .resources(resources)

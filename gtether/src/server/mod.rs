@@ -4,23 +4,24 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use smol::future;
 
 use crate::{Application, EngineStage, EngineState, Side};
-use crate::net::gns::GnsSubsystem;
-use crate::net::server::{RawServerFactory, ServerNetworkingError, ServerNetworking};
+use crate::net::NetworkingBuildError;
+use crate::net::server::ServerNetworking;
 use crate::util::tick_loop::TickLoopBuilder;
 
 /// Server [Side] implementation.
 ///
 /// # Examples
-/// ```
+/// ```no_run
 /// # use std::sync::Arc;
 /// # use std::time::Duration;
 /// # use async_trait::async_trait;
 /// use gtether::Engine;
 /// # use gtether::Application;
+/// use gtether::net::gns::GnsSubsystem;
+/// use gtether::net::server::ServerNetworking;
 /// use gtether::server::Server;
 /// # use gtether::server::ServerBuildError;
 ///
@@ -35,10 +36,15 @@ use crate::util::tick_loop::TickLoopBuilder;
 /// #
 /// # let app = MyApp {};
 ///
+/// let networking = ServerNetworking::builder()
+///     .raw_factory(GnsSubsystem::get())
+///     .port(9001)
+///     .build()?;
+///
 /// let side = Server::builder()
 ///     // 60 ticks per second
 ///     .tick_rate(60)
-///     .port(9001)
+///     .networking(networking)
 ///     .build()?;
 ///
 /// let engine = Engine::builder()
@@ -103,7 +109,7 @@ pub enum ServerBuildError {
     MissingOption { name: String },
 
     /// There was an error while initializing the [ServerNetworking] instance.
-    NetworkingError(ServerNetworkingError),
+    Networking(NetworkingBuildError),
 }
 
 impl Display for ServerBuildError {
@@ -111,7 +117,7 @@ impl Display for ServerBuildError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingOption { name } => write!(f, "Missing required option: '{name}'"),
-            Self::NetworkingError(err) => Display::fmt(err, f),
+            Self::Networking(err) => Display::fmt(err, f),
         }
     }
 }
@@ -124,10 +130,10 @@ impl ServerBuildError {
     }
 }
 
-impl From<ServerNetworkingError> for ServerBuildError {
+impl From<NetworkingBuildError> for ServerBuildError {
     #[inline]
-    fn from(value: ServerNetworkingError) -> Self {
-        Self::NetworkingError(value)
+    fn from(value: NetworkingBuildError) -> Self {
+        Self::Networking(value)
     }
 }
 
@@ -136,48 +142,42 @@ impl From<ServerNetworkingError> for ServerBuildError {
 /// # Examples
 ///
 /// Minimal example
-/// ```
+/// ```no_run
+/// use gtether::net::gns::GnsSubsystem;
+/// use gtether::net::server::ServerNetworking;
 /// use gtether::server::Server;
 /// # use gtether::server::ServerBuildError;
 ///
 /// let side = Server::builder()
-///     .port(9001)
+///     .networking(ServerNetworking::builder()
+///         .raw_factory(GnsSubsystem::get())
+///         .port(9001)
+///         .build()?)
 ///     .build()?;
 /// #
 /// # Ok::<(), ServerBuildError>(())
 /// ```
 ///
 /// Custom tick rate
-/// ```
+/// ```no_run
+/// use gtether::net::gns::GnsSubsystem;
+/// use gtether::net::server::ServerNetworking;
 /// use gtether::server::Server;
 /// # use gtether::server::ServerBuildError;
 ///
 /// let side = Server::builder()
 ///     .tick_rate(120)
-///     .port(9001)
-///     .build()?;
-/// #
-/// # Ok::<(), ServerBuildError>(())
-/// ```
-///
-/// Use a different network interface
-/// ```
-/// use std::net::Ipv4Addr;
-/// use gtether::server::Server;
-/// # use gtether::server::ServerBuildError;
-///
-/// let side = Server::builder()
-///     .ip_addr(Ipv4Addr::new(192, 168, 0, 42))
-///     .port(9001)
+///     .networking(ServerNetworking::builder()
+///         .raw_factory(GnsSubsystem::get())
+///         .port(9001)
+///         .build()?)
 ///     .build()?;
 /// #
 /// # Ok::<(), ServerBuildError>(())
 /// ```
 pub struct ServerBuilder {
     tick_rate: Option<usize>,
-    ip_addr: Option<IpAddr>,
-    port: Option<u16>,
-    raw_server_factory: Option<Box<dyn RawServerFactory>>,
+    networking: Option<ServerNetworking>,
 }
 
 impl ServerBuilder {
@@ -188,9 +188,7 @@ impl ServerBuilder {
     pub fn new() -> Self {
         Self {
             tick_rate: None,
-            ip_addr: None,
-            port: None,
-            raw_server_factory: None,
+            networking: None,
         }
     }
 
@@ -207,51 +205,12 @@ impl ServerBuilder {
         self
     }
 
-    /// Set the IP address that this server listens on.
+    /// Set the networking stack for server-side networking.
     ///
-    /// Default is [Ipv4Addr::LOCALHOST].
+    /// This is a required option.
     #[inline]
-    pub fn ip_addr(mut self, ip_addr: impl Into<IpAddr>) -> Self {
-        self.ip_addr = Some(ip_addr.into());
-        self
-    }
-
-    /// Set the port that this server listens on.
-    ///
-    /// This option is required.
-    #[inline]
-    pub fn port(mut self, port: u16) -> Self {
-        self.port = Some(port);
-        self
-    }
-
-    /// Set the socket address that this server listens on.
-    ///
-    /// This is effectively the same as:
-    /// ```no_run
-    /// # use std::net::{Ipv4Addr, SocketAddr};
-    /// # use gtether::server::Server;
-    /// # let socket = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9001);
-    /// Server::builder()
-    ///     .ip_addr(socket.ip())
-    ///     .port(socket.port())
-    /// ```
-    #[inline]
-    pub fn socket_addr(mut self, socket_addr: impl Into<SocketAddr>) -> Self {
-        let socket_addr = socket_addr.into();
-        self.ip_addr = Some(socket_addr.ip());
-        self.port = Some(socket_addr.port());
-        self
-    }
-
-    /// Set the [RawServerFactory] for networking.
-    ///
-    /// This determines the implementation used for server-side networking.
-    ///
-    /// Default uses [GNS](crate::net::gns).
-    #[inline]
-    pub fn raw_server_factory(mut self, raw_server_factory: impl RawServerFactory) -> Self {
-        self.raw_server_factory = Some(Box::new(raw_server_factory));
+    pub fn networking(mut self, networking: ServerNetworking) -> Self {
+        self.networking = Some(networking);
         self
     }
 
@@ -259,18 +218,8 @@ impl ServerBuilder {
     pub fn build(self) -> Result<Server, ServerBuildError> {
         let tick_rate = self.tick_rate
             .unwrap_or(60);
-
-        let ip_addr = self.ip_addr
-            .unwrap_or(Ipv4Addr::LOCALHOST.into());
-        let port = self.port.clone()
-            .ok_or(ServerBuildError::missing_option("port"))?;
-        let socket_addr = SocketAddr::new(ip_addr, port);
-        let raw_server_factory = self.raw_server_factory
-            .unwrap_or_else(|| Box::new(GnsSubsystem::get()));
-        let net = ServerNetworking::new(
-            raw_server_factory,
-            socket_addr,
-        )?;
+        let net = self.networking
+            .ok_or(ServerBuildError::missing_option("networking"))?;
 
         Ok(Server {
             tick_rate,

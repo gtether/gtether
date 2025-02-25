@@ -14,10 +14,10 @@ use smol::future;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::net::client::{ClientNetworking, ClientNetworkingError, RawClientFactory};
-use crate::net::gns::GnsSubsystem;
+use crate::net::client::{ClientNetworking, ClosedClientFactory};
 use crate::util::tick_loop::TickLoopBuilder;
 use crate::{Application, EngineStage, EngineState, Side};
+use crate::net::NetworkingBuildError;
 
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -119,24 +119,31 @@ impl Side for Client {
 #[derive(Debug)]
 pub enum ClientBuildError {
     /// There was an error while initializing the [ClientNetworking] instance.
-    NetworkingError(ClientNetworkingError),
+    Networking(NetworkingBuildError),
 }
 
 impl Display for ClientBuildError {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NetworkingError(err) => Display::fmt(err, f),
+            Self::Networking(err) => Display::fmt(err, f),
         }
     }
 }
 
-impl Error for ClientBuildError {}
-
-impl From<ClientNetworkingError> for ClientBuildError {
+impl Error for ClientBuildError {
     #[inline]
-    fn from(value: ClientNetworkingError) -> Self {
-        Self::NetworkingError(value)
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Networking(err) => Some(err),
+        }
+    }
+}
+
+impl From<NetworkingBuildError> for ClientBuildError {
+    #[inline]
+    fn from(value: NetworkingBuildError) -> Self {
+        Self::Networking(value)
     }
 }
 
@@ -178,7 +185,7 @@ impl From<ClientNetworkingError> for ClientBuildError {
 pub struct ClientBuilder {
     application_name: Option<String>,
     tick_rate: Option<usize>,
-    raw_client_factory: Option<Box<dyn RawClientFactory>>,
+    networking: Option<ClientNetworking>,
 }
 
 impl ClientBuilder {
@@ -190,7 +197,7 @@ impl ClientBuilder {
         Self {
             application_name: None,
             tick_rate: None,
-            raw_client_factory: None,
+            networking: None,
         }
     }
 
@@ -216,14 +223,12 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the [RawClientFactory] for networking.
+    /// Set the networking stack for client-side networking.
     ///
-    /// This determines the implementation used for client-side networking.
-    ///
-    /// Default uses [GNS](crate::net::gns).
+    /// Default is [ClosedClientFactory], which effectively represents no networking.
     #[inline]
-    pub fn raw_client_factory(mut self, raw_client_factory: impl RawClientFactory) -> Self {
-        self.raw_client_factory = Some(Box::new(raw_client_factory));
+    pub fn networking(mut self, networking: ClientNetworking) -> Self {
+        self.networking = Some(networking);
         self
     }
 
@@ -233,10 +238,13 @@ impl ClientBuilder {
             .unwrap_or("client".to_owned());
         let tick_rate = self.tick_rate
             .unwrap_or(60);
-
-        let raw_client_factory = self.raw_client_factory
-            .unwrap_or_else(|| Box::new(GnsSubsystem::get()));
-        let net = ClientNetworking::new(raw_client_factory);
+        let net = self.networking
+            .map(Ok)
+            .unwrap_or_else(|| {
+                ClientNetworking::builder()
+                    .raw_factory(ClosedClientFactory::new())
+                    .build()
+            })?;
 
         Ok(Client {
             application_name,
