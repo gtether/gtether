@@ -4,6 +4,7 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use smol::future;
 
 use crate::{Application, EngineStage, EngineState, Side};
@@ -56,7 +57,7 @@ use crate::util::tick_loop::TickLoopBuilder;
 /// ```
 pub struct Server {
     tick_rate: usize,
-    net: ServerNetworking,
+    net: Arc<ServerNetworking>,
 }
 
 impl Server {
@@ -70,7 +71,7 @@ impl Server {
 
     /// Reference to the server's [ServerNetworking] instance.
     #[inline]
-    pub fn net(&self) -> &ServerNetworking {
+    pub fn net(&self) -> &Arc<ServerNetworking> {
         &self.net
     }
 }
@@ -177,7 +178,7 @@ impl From<NetworkingBuildError> for ServerBuildError {
 /// ```
 pub struct ServerBuilder {
     tick_rate: Option<usize>,
-    networking: Option<ServerNetworking>,
+    networking: Option<Arc<ServerNetworking>>,
 }
 
 impl ServerBuilder {
@@ -209,7 +210,7 @@ impl ServerBuilder {
     ///
     /// This is a required option.
     #[inline]
-    pub fn networking(mut self, networking: ServerNetworking) -> Self {
+    pub fn networking(mut self, networking: Arc<ServerNetworking>) -> Self {
         self.networking = Some(networking);
         self
     }

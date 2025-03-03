@@ -1,20 +1,60 @@
 //! Server-side networking APIs.
 
 use async_trait::async_trait;
+use flagset::FlagSet;
 use smol::future;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::net::message::MessageDispatch;
+use crate::net::message::{Message, MessageDispatchError, MessageFlags, MessageRecv, MessageRepliable, MessageReplyFuture, MessageSend};
 use crate::net::{NetworkingBuildError, NetworkingBuilder};
+use crate::net::message::dispatch::{MessageDispatch, MessageDispatchServer};
+use crate::net::message::server::ServerMessageHandler;
+
+/// An opaque ID type representing a single client-server connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Connection(u32);
+
+impl Display for Connection {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "connection-{}", self.0)
+    }
+}
+
+/// Server-side raw API.
+///
+/// This API is implemented by the networking stack, and a reference is given to
+/// [RawServerFactories](RawServerFactory) in order to provide an interface for raw implementations
+/// to access the networking stack's logic.
+pub trait RawServerApi: Send + Sync + 'static {
+    /// Generate and initialize a new [Connection].
+    fn init_connection(&self) -> Connection;
+
+    /// Dispatch raw message data to the networking stack for processing.
+    fn dispatch_message(
+        &self,
+        connection: Connection,
+        msg: &[u8],
+    ) -> Result<(), MessageDispatchError>;
+}
 
 /// Raw server listening on a given socket.
 ///
 /// A RawServer can contain and manage many client connections for a single socket.
 #[async_trait]
 pub trait RawServer: Send + Sync + 'static {
+    fn send(
+        &self,
+        connection: Connection,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), ServerNetworkingError>;
+
     /// Close the server and all connections it has.
     ///
     /// After being closed, this server can no longer be used. This method should be idempotent, and
@@ -35,7 +75,7 @@ pub trait RawServerFactory: Send + Sync + 'static {
     /// If the socket is free and can be bound, yields a new [RawServer].
     async fn listen(
         &self,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawServerApi>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawServer>, ServerNetworkingError>;
 }
@@ -45,10 +85,10 @@ impl RawServerFactory for Box<dyn RawServerFactory> {
     #[inline]
     async fn listen(
         &self,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawServerApi>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
-        (**self).listen(msg_dispatch, socket_addr).await
+        (**self).listen(api, socket_addr).await
     }
 }
 
@@ -64,6 +104,12 @@ pub enum ServerNetworkingError {
     /// The socket could not be bound for listening.
     InvalidListen(SocketAddr),
 
+    /// The specified connection was invalid or not found.
+    InvalidConnection(Connection),
+
+    /// A message failed to send because it could not be serialized.
+    MalformedMessage(Box<dyn Error + Send + Sync>),
+
     /// An operation was attempted on a server manager that has already been closed.
     Closed,
 }
@@ -74,12 +120,23 @@ impl Display for ServerNetworkingError {
             Self::InternalError(msg) => write!(f, "Internal Error: {msg}"),
             Self::InvalidListen(socket_addr) =>
                 write!(f, "Cannot listen on: {socket_addr}"),
+            Self::InvalidConnection(connection) =>
+                write!(f, "Invalid connection: {connection}"),
+            Self::MalformedMessage(err) =>
+                write!(f, "Malformed message; {err}"),
             Self::Closed => write!(f, "Server has been closed"),
         }
     }
 }
 
-impl Error for ServerNetworkingError {}
+impl Error for ServerNetworkingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MalformedMessage(err) => Some(err.deref()),
+            _ => None,
+        }
+    }
+}
 
 impl ServerNetworkingError {
     /// Helper for creating an [InternalError](Self::InternalError) from a string.
@@ -102,12 +159,43 @@ impl From<ump::Error<ServerNetworkingError>> for ServerNetworkingError {
     }
 }
 
+struct Api {
+    next_connect_id: AtomicU32,
+    msg_dispatch: MessageDispatch<MessageDispatchServer>,
+}
+
+impl Api {
+    fn new() -> Self {
+        Self {
+            next_connect_id: AtomicU32::new(0),
+            msg_dispatch: MessageDispatch::new(),
+        }
+    }
+}
+
+impl RawServerApi for Api {
+    #[inline]
+    fn init_connection(&self) -> Connection {
+        Connection(self.next_connect_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn dispatch_message(
+        &self,
+        connection: Connection,
+        msg: &[u8],
+    ) -> Result<(), MessageDispatchError> {
+        self.msg_dispatch.dispatch(connection, msg)
+    }
+}
+
 /// Manager for server networking logic.
 ///
 /// An instance of ServerNetworking manages an internal [RawServer]. This internal server may
 /// handle many client connections.
 pub struct ServerNetworking {
+    api: Arc<Api>,
     inner: Arc<dyn RawServer>,
+    next_msg_num: AtomicU64,
 }
 
 impl ServerNetworking {
@@ -121,17 +209,85 @@ impl ServerNetworking {
 
     fn new(
         raw_factory: impl RawServerFactory,
-        msg_dispatch: Arc<MessageDispatch>,
         socket_addr: SocketAddr,
     ) -> Result<Self, ServerNetworkingError> {
+        let api = Arc::new(Api::new());
+
         let inner = future::block_on(raw_factory.listen(
-            msg_dispatch,
+            api.clone(),
             socket_addr,
         ))?;
 
         Ok(Self {
+            api,
             inner,
+            next_msg_num: AtomicU64::new(1),
         })
+    }
+
+    /// Insert a message handler into this [ServerNetworking] stack.
+    ///
+    /// The handler is associated with the message type's [key](message::MessageBody::KEY), and
+    /// inserting multiple handlers with the same key will override the old one.
+    pub fn insert_msg_handler<M, E>(
+        &self,
+        handler: impl ServerMessageHandler<M, E>
+    )
+    where
+        M: MessageRecv,
+        E: Error + Send + Sync + 'static,
+    {
+        self.api.msg_dispatch.insert_handler(handler)
+    }
+
+    /// Send a [Message] from this server to a connected client.
+    ///
+    /// Does not block, and will yield as soon as the message is passed off to the networking stack.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the provided [Message] could not be serialized, or if the provided [Connection] is
+    /// invalid.
+    pub fn send<M>(
+        &self,
+        connection: Connection,
+        msg: impl Into<Message<M>>,
+    ) -> Result<(), ServerNetworkingError>
+    where
+        M: MessageSend,
+    {
+        let mut msg = msg.into();
+        msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+        let bytes = msg.encode()
+            .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
+        self.inner.send(connection, bytes, M::flags())
+    }
+
+    /// Send a [Message] from this server to a connected client, and wait for a response.
+    ///
+    /// Does not block. Will yield a [MessageReplyFuture] that can be used to wait for a response
+    /// either synchronously or asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the provided [Message] could not be serialized, or if the provided [Connection] is
+    /// invalid.
+    pub fn send_recv<M>(
+        &self,
+        connection: Connection,
+        msg: impl Into<Message<M>>,
+    ) -> Result<MessageReplyFuture<M::Reply>, ServerNetworkingError>
+    where
+        M: MessageSend + MessageRepliable,
+        M::Reply: MessageRecv + Send + 'static,
+    {
+        let mut msg = msg.into();
+        msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+        let bytes = msg.encode()
+            .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
+        let fut = self.api.msg_dispatch.register_reply(&msg);
+        self.inner.send(connection, bytes, M::flags())?;
+        Ok(fut)
     }
 }
 
@@ -144,7 +300,7 @@ impl Drop for ServerNetworking {
 impl From<ServerNetworkingError> for NetworkingBuildError {
     #[inline]
     fn from(value: ServerNetworkingError) -> Self {
-        Self::InitError { source: Some(Box::new(value)) }
+        Self::InitError(Box::new(value))
     }
 }
 
@@ -213,8 +369,7 @@ impl NetworkingBuilder<ServerBuilder> {
     ///
     /// Errors when there is a required option that is missing, or if the networking stack fails to
     /// initialize.
-    pub fn build(mut self) -> Result<ServerNetworking, NetworkingBuildError> {
-        let msg_dispatch = self.msg_dispatch()?;
+    pub fn build(self) -> Result<Arc<ServerNetworking>, NetworkingBuildError> {
         let raw_factory = self.extra.raw_factory
             .ok_or(NetworkingBuildError::missing_option("raw_factory"))?;
 
@@ -224,6 +379,6 @@ impl NetworkingBuilder<ServerBuilder> {
             .ok_or(NetworkingBuildError::missing_option("port"))?;
         let socket_addr = SocketAddr::new(ip_addr, port);
 
-        Ok(ServerNetworking::new(raw_factory, msg_dispatch, socket_addr)?)
+        Ok(Arc::new(ServerNetworking::new(raw_factory, socket_addr)?))
     }
 }

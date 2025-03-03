@@ -2,6 +2,7 @@
 
 extern crate nalgebra_glm as glm;
 
+use std::collections::HashMap;
 use async_trait::async_trait;
 use educe::Educe;
 use gtether::client::gui::input::InputDelegate;
@@ -23,11 +24,13 @@ use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
 use gtether::server::Server;
 use gtether::{Application, Engine, EngineBuilder, EngineJoinHandle};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use parry3d::na::Point3;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use bitcode::{Decode, Encode};
+use flagset::FlagSet;
 use tracing::{debug, info};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
@@ -38,7 +41,8 @@ use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 use gtether::net::client::ClientNetworking;
 use gtether::net::gns::GnsSubsystem;
-use gtether::net::server::ServerNetworking;
+use gtether::net::message::{Message, MessageBody, MessageFlags, MessageRepliable};
+use gtether::net::server::{Connection, ServerNetworking, ServerNetworkingError};
 
 use crate::board::Board;
 use crate::bot::minimax::MinimaxAlgorithm;
@@ -51,6 +55,37 @@ mod render_util;
 mod player;
 
 const REVERSI_PORT: u16 = 19502;
+
+#[derive(Encode, Decode, Debug)]
+struct HandshakeMessage {
+    requested_name: String,
+}
+
+impl MessageBody for HandshakeMessage {
+    const KEY: &'static str = "handshake";
+    #[inline]
+    fn flags() -> FlagSet<MessageFlags> {
+        MessageFlags::Reliable.into()
+    }
+}
+
+impl MessageRepliable for HandshakeMessage {
+    type Reply = HandshakeMessageReply;
+}
+
+#[derive(Encode, Decode, Debug)]
+struct HandshakeMessageReply {
+    name: String,
+}
+
+impl MessageBody for HandshakeMessageReply {
+    const KEY: &'static str = "handshake-reply";
+
+    #[inline]
+    fn flags() -> FlagSet<MessageFlags> {
+        MessageFlags::Reliable.into()
+    }
+}
 
 #[derive(Debug)]
 struct ResetCommand {
@@ -93,6 +128,14 @@ impl Command for ConnectCommand {
                 REVERSI_PORT,
             ))
         }.map_err(|err| CommandError::CommandFailure(Box::new(err)))?;
+
+        let reply = self.client.side().net().send_recv(HandshakeMessage {
+            requested_name: "Player".to_owned(),
+        })
+            .map_err(|err| CommandError::CommandFailure(Box::new(err)))?
+            .wait();
+
+        info!(name = %reply.body().name, "Player name confirmed");
 
         Ok(())
     }
@@ -269,13 +312,13 @@ impl Application<ClientGui> for ReversiApp {
 }
 
 struct ReversiAppServer {
-
+    players: Arc<RwLock<HashMap<String, Connection>>>,
 }
 
 impl ReversiAppServer {
     fn new() -> Self {
         Self {
-
+            players: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -321,15 +364,36 @@ impl ServerContainer {
 
     fn start_impl(inner: &mut MutexGuard<Option<EngineServerJoinHandle>>) {
         info!("Starting server...");
+        let app = ReversiAppServer::new();
+        let players = app.players.clone();
         let networking = ServerNetworking::builder()
             .raw_factory(GnsSubsystem::get())
             .port(REVERSI_PORT)
             .build().unwrap();
+
+        let handler_net = networking.clone();
+        networking.insert_msg_handler(move |connection, msg: Message<HandshakeMessage>| {
+            let mut players = players.write();
+            for idx in 1.. {
+                let requested_name = msg.body().requested_name.clone() + &idx.to_string();
+                if !players.contains_key(&requested_name) {
+                    info!(name = %requested_name, "Player connected");
+                    players.insert(requested_name.clone(), connection);
+                    let reply = msg.reply(HandshakeMessageReply {
+                        name: requested_name,
+                    });
+                    handler_net.send(connection, reply)?;
+                    break;
+                }
+            }
+            Ok::<_, ServerNetworkingError>(())
+        });
+
         let side = Server::builder()
             .networking(networking)
             .build().unwrap();
         let join_handle = EngineBuilder::new()
-            .app(ReversiAppServer::new())
+            .app(app)
             .side(side)
             .spawn();
         **inner = Some(join_handle);

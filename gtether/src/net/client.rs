@@ -1,14 +1,29 @@
 //! Client-side networking APIs.
 
 use async_trait::async_trait;
+use flagset::FlagSet;
 use smol::future;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::net::message::MessageDispatch;
+use crate::net::message::{Message, MessageDispatchError, MessageFlags, MessageRecv, MessageRepliable, MessageReplyFuture, MessageSend};
 use crate::net::{NetworkingBuildError, NetworkingBuilder};
+use crate::net::message::client::ClientMessageHandler;
+use crate::net::message::dispatch::{MessageDispatch, MessageDispatchClient};
+
+/// Client-side raw API.
+///
+/// This API is implemented by the networking stack, and a reference is given to
+/// [RawClientFactories](RawClientFactory) in order to provide an interface for raw implementations
+/// to access the networking stack's logic.
+pub trait RawClientApi: Send + Sync + 'static {
+    /// Dispatch raw message data to the networking stack for processing.
+    fn dispatch_message(&self, msg: &[u8]) -> Result<(), MessageDispatchError>;
+}
 
 /// Raw client representing a single connection.
 ///
@@ -16,6 +31,12 @@ use crate::net::{NetworkingBuildError, NetworkingBuilder};
 /// closes the connection and opens a new one, a new instance of RawClient should be created.
 #[async_trait]
 pub trait RawClient: Send + Sync + 'static {
+    fn send(
+        &self,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), ClientNetworkingError>;
+
     /// Close the connection.
     ///
     /// After being closed, this connection can no longer be used. This method should be idempotent,
@@ -36,7 +57,7 @@ pub trait RawClientFactory: Send + Sync + 'static {
     /// If the connection is successful, yields a new [RawClient].
     async fn connect(
         &self,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawClientApi>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawClient>, ClientNetworkingError>;
 }
@@ -46,10 +67,10 @@ impl RawClientFactory for Box<dyn RawClientFactory> {
     #[inline]
     async fn connect(
         &self,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawClientApi>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
-        (**self).connect(msg_dispatch, socket_addr).await
+        (**self).connect(api, socket_addr).await
     }
 }
 
@@ -71,7 +92,7 @@ impl RawClientFactory for ClosedClientFactory {
     #[inline]
     async fn connect(
         &self,
-        _msg_dispatch: Arc<MessageDispatch>,
+        _api: Arc<dyn RawClientApi>,
         _socket_addr: SocketAddr
     ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
         Err(ClientNetworkingError::Closed)
@@ -90,6 +111,9 @@ pub enum ClientNetworkingError {
     /// The attempted connection was invalid.
     InvalidConnection(SocketAddr),
 
+    /// A message failed to send because it could not be serialized.
+    MalformedMessage(Box<dyn Error + Send + Sync>),
+
     /// An operation was attempted on a client connection that has already been closed.
     Closed,
 }
@@ -100,12 +124,21 @@ impl Display for ClientNetworkingError {
             Self::InternalError(msg) => write!(f, "Internal Error: {msg}"),
             Self::InvalidConnection(socket_addr) =>
                 write!(f, "Invalid connection: {socket_addr}"),
+            Self::MalformedMessage(err) =>
+                write!(f, "Malformed message; {err}"),
             Self::Closed => write!(f, "Client has been closed"),
         }
     }
 }
 
-impl Error for ClientNetworkingError {}
+impl Error for ClientNetworkingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MalformedMessage(err) => Some(err.deref()),
+            _ => None,
+        }
+    }
+}
 
 impl ClientNetworkingError {
     /// Helper for creating an [InternalError](Self::InternalError) from a string.
@@ -128,14 +161,33 @@ impl From<ump::Error<ClientNetworkingError>> for ClientNetworkingError {
     }
 }
 
+struct Api {
+    msg_dispatch: MessageDispatch<MessageDispatchClient>,
+}
+
+impl Api {
+    fn new() -> Self {
+        Self {
+            msg_dispatch: MessageDispatch::new(),
+        }
+    }
+}
+
+impl RawClientApi for Api {
+    fn dispatch_message(&self, msg: &[u8]) -> Result<(), MessageDispatchError> {
+        self.msg_dispatch.dispatch(msg)
+    }
+}
+
 /// Manager for client networking stack.
 ///
 /// An instance of ClientNetworking manages an internal [RawClientFactory] and any
 /// [RawClients](RawClient) it can create. Only one [RawClient] can be managed at a time.
 pub struct ClientNetworking {
     raw_factory: Box<dyn RawClientFactory>,
-    msg_dispatch: Arc<MessageDispatch>,
+    api: Arc<Api>,
     inner: smol::lock::RwLock<Option<Arc<dyn RawClient>>>,
+    next_msg_num: AtomicU64,
 }
 
 impl ClientNetworking {
@@ -149,12 +201,14 @@ impl ClientNetworking {
 
     fn new(
         raw_factory: Box<dyn RawClientFactory>,
-        msg_dispatch: Arc<MessageDispatch>,
     ) -> Self {
+        let api = Arc::new(Api::new());
+
         Self {
             raw_factory,
-            msg_dispatch,
+            api,
             inner: smol::lock::RwLock::new(None),
+            next_msg_num: AtomicU64::new(1),
         }
     }
 
@@ -166,7 +220,8 @@ impl ClientNetworking {
         if let Some(client) = inner.take() {
             client.close().await;
         }
-        *inner = Some(self.raw_factory.connect(self.msg_dispatch.clone(), socket_addr).await?);
+        *inner = Some(self.raw_factory.connect(self.api.clone(), socket_addr).await?);
+        self.next_msg_num.store(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -174,6 +229,79 @@ impl ClientNetworking {
     #[inline]
     pub fn connect_sync(&self, socket_addr: SocketAddr) -> Result<(), ClientNetworkingError> {
         future::block_on(self.connect(socket_addr))
+    }
+
+    /// Insert a message handler into this [ClientNetworking] stack.
+    ///
+    /// The handler is associated with the message type's [key](message::MessageBody::KEY), and
+    /// inserting multiple handlers with the same key will override the old one.
+    pub fn insert_msg_handler<M, E>(
+        &self,
+        handler: impl ClientMessageHandler<M, E>
+    )
+    where
+        M: MessageRecv,
+        E: Error + Send + Sync + 'static,
+    {
+        self.api.msg_dispatch.insert_handler(handler);
+    }
+
+    /// Send a [Message] from this client to a connected server.
+    ///
+    /// Does not block, and will yield as soon as the message is passed off to the networking stack.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the provided [Message] could not be serialized, or if the client connection is
+    /// already closed.
+    pub fn send<M>(
+        &self,
+        msg: impl Into<Message<M>>,
+    ) -> Result<(), ClientNetworkingError>
+    where
+        M: MessageSend,
+    {
+        let inner = self.inner.read_blocking();
+        if let Some(client) = &*inner {
+            let mut msg = msg.into();
+            msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+            let bytes = msg.encode()
+                .map_err(|err| ClientNetworkingError::MalformedMessage(Box::new(err)))?;
+            client.send(bytes, M::flags())
+        } else {
+            Err(ClientNetworkingError::Closed)
+        }
+    }
+
+    /// Send a [Message] from this client to a connected server, and wait for a response.
+    ///
+    /// Does not block. Will yield a [MessageReplyFuture] that can be used to wait for a response
+    /// either synchronously or asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the provided [Message] could not be serialized, or if the client connection is
+    /// already closed.
+    pub fn send_recv<M>(
+        &self,
+        msg: impl Into<Message<M>>,
+    ) -> Result<MessageReplyFuture<M::Reply>, ClientNetworkingError>
+    where
+        M: MessageSend + MessageRepliable,
+        M::Reply: MessageRecv + Send + 'static,
+    {
+        let inner = self.inner.read_blocking();
+        if let Some(client) = &*inner {
+            let mut msg = msg.into();
+            msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+            let bytes = msg.encode()
+                .map_err(|err| ClientNetworkingError::MalformedMessage(Box::new(err)))?;
+            let fut = self.api.msg_dispatch.register_reply(&msg);
+            client.send(bytes, M::flags())?;
+            Ok(fut)
+        } else {
+            Err(ClientNetworkingError::Closed)
+        }
     }
 }
 
@@ -210,11 +338,10 @@ impl NetworkingBuilder<ClientBuilder> {
     ///
     /// Errors when there is a required option that is missing, or if the networking stack fails to
     /// initialize.
-    pub fn build(mut self) -> Result<ClientNetworking, NetworkingBuildError> {
-        let msg_dispatch = self.msg_dispatch()?;
+    pub fn build(self) -> Result<Arc<ClientNetworking>, NetworkingBuildError> {
         let raw_factory = self.extra.raw_factory
             .ok_or(NetworkingBuildError::missing_option("raw_factory"))?;
 
-        Ok(ClientNetworking::new(raw_factory, msg_dispatch))
+        Ok(Arc::new(ClientNetworking::new(raw_factory)))
     }
 }

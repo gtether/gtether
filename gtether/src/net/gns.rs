@@ -28,28 +28,47 @@
 //! let server_factory: Box<dyn RawServerFactory> = Box::new(GnsSubsystem::get());
 //! ```
 
-use ahash::{HashMap, HashMapExt};
 use async_trait::async_trait;
-use gns::sys::ESteamNetworkingConnectionState as NetConnectState;
+use bimap::BiHashMap;
+use educe::Educe;
+use flagset::FlagSet;
+use gns::sys::{k_nSteamNetworkingSend_Reliable, ESteamNetworkingConnectionState as NetConnectState};
 use gns::{GnsConnection, GnsGlobal, GnsSocket, GnsUtils, IsClient, IsServer};
+use image::EncodableLayout;
+use itertools::Either;
 use ouroboros::self_referencing;
+use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::net::client::{ClientNetworkingError, RawClient, RawClientFactory};
-use crate::net::message::MessageDispatch;
-use crate::net::server::{RawServer, RawServerFactory, ServerNetworkingError};
+use crate::net::client::{ClientNetworkingError, RawClient, RawClientApi, RawClientFactory};
+use crate::net::message::MessageFlags;
+use crate::net::server::{Connection, RawServer, RawServerApi, RawServerFactory, ServerNetworkingError};
 use crate::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
+
+fn msg_send_flags_to_gns(flags: FlagSet<MessageFlags>) -> std::os::raw::c_int {
+    let mut gns_flags = 0;
+
+    if  flags.contains(MessageFlags::Reliable) {
+        gns_flags |= k_nSteamNetworkingSend_Reliable;
+    }
+
+    gns_flags
+}
 
 #[derive(Debug)]
 enum ClientMessage {
+    Send {
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    },
     Close,
 }
 
 struct GnsClient<'gu> {
-    msg_dispatch: Arc<MessageDispatch>,
+    api: Arc<dyn RawClientApi>,
     socket: Option<GnsSocket<'gu, 'gu, IsClient>>,
     msg_recv: ump::Server<ClientMessage, (), ClientNetworkingError>,
 }
@@ -58,7 +77,7 @@ impl<'gu> GnsClient<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawClientApi>,
         socket_addr: SocketAddr,
     ) -> Result<(Self, Arc<dyn RawClient>), ClientNetworkingError> {
         let socket = GnsSocket::new(gns_global, gns_utils)
@@ -69,7 +88,7 @@ impl<'gu> GnsClient<'gu> {
         let (msg_recv, msg_send) = ump::channel();
 
         let client = Self {
-            msg_dispatch,
+            api,
             socket: Some(socket),
             msg_recv,
         };
@@ -89,6 +108,8 @@ impl<'gu> GnsClient<'gu> {
     }
 
     fn tick(&mut self) -> bool {
+        let mut msgs_to_send = Vec::new();
+
         while let Some((msg, reply_ctx)) = match self.msg_recv.try_pop() {
             Ok(val) => val,
             Err(_) => {
@@ -98,11 +119,14 @@ impl<'gu> GnsClient<'gu> {
             }
         } {
             match msg {
+                ClientMessage::Send { msg, flags } => {
+                    msgs_to_send.push((msg, flags));
+                },
                 ClientMessage::Close => {
                     self.close();
                     reply_ctx.reply(()).unwrap();
                     return false;
-                }
+                },
             }
         }
 
@@ -133,13 +157,30 @@ impl<'gu> GnsClient<'gu> {
         });
 
         socket.poll_messages::<100>(|message| {
-            match self.msg_dispatch.dispatch(message.payload()) {
+            match self.api.dispatch_message(&mut message.payload()) {
                 Ok(_) => {},
                 Err(error) => {
                     warn!(?error, "Failed to dispatch message");
                 }
             }
         });
+
+        let msgs_to_send = msgs_to_send.into_iter()
+            .map(|(msg, flags)| socket.utils().allocate_message(
+                socket.connection(),
+                msg_send_flags_to_gns(flags),
+                msg.as_bytes(),
+            ))
+            .collect::<Vec<_>>();
+        if !msgs_to_send.is_empty() {
+            for msg in socket.send_messages(msgs_to_send) {
+                match msg {
+                    Either::Left(_) => {},
+                    Either::Right(error) =>
+                        warn!(?error, "Failed to send GNS message"),
+                }
+            }
+        }
 
         !quit
     }
@@ -151,6 +192,18 @@ struct GnsClientHandle {
 
 #[async_trait]
 impl RawClient for GnsClientHandle {
+    #[inline]
+    fn send(
+        &self,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), ClientNetworkingError> {
+        self.msg_send.req_async(ClientMessage::Send { msg, flags })
+            // We're firing and forgetting, so we don't care about the WaitReply<>
+            .map(|_| ())
+            .map_err(ClientNetworkingError::from)
+    }
+
     #[inline]
     async fn close(&self) {
         let result = self.msg_send.areq(ClientMessage::Close).await
@@ -165,14 +218,20 @@ impl RawClient for GnsClientHandle {
 
 #[derive(Debug)]
 enum ServerMessage {
+    Send {
+        connection: Connection,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    },
     Close,
 }
 
+type ClientsMap = BiHashMap<GnsConnection, Connection, ahash::RandomState, ahash::RandomState>;
+
 struct GnsServer<'gu> {
-    msg_dispatch: Arc<MessageDispatch>,
+    api: Arc<dyn RawServerApi>,
     socket: Option<GnsSocket<'gu, 'gu, IsServer>>,
-    // TODO: What value should this store?
-    clients: HashMap<GnsConnection, ()>,
+    clients: Arc<RwLock<ClientsMap>>,
     msg_recv: ump::Server<ServerMessage, (), ServerNetworkingError>,
 }
 
@@ -180,7 +239,7 @@ impl<'gu> GnsServer<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawServerApi>,
         socket_addr: SocketAddr,
     ) -> Result<(Self, Arc<dyn RawServer>), ServerNetworkingError> {
         let socket = GnsSocket::new(gns_global, gns_utils)
@@ -190,15 +249,21 @@ impl<'gu> GnsServer<'gu> {
 
         let (msg_recv, msg_send) = ump::channel();
 
+        let clients = Arc::new(RwLock::new(BiHashMap::with_hashers(
+            ahash::RandomState::default(),
+            ahash::RandomState::default(),
+        )));
+
         let server = Self {
-            msg_dispatch,
+            api,
             socket: Some(socket),
-            clients: HashMap::new(),
+            clients: clients.clone(),
             msg_recv,
         };
 
         let server_handle = Arc::new(GnsServerHandle {
             msg_send,
+            clients,
         });
 
         Ok((server, server_handle))
@@ -207,14 +272,18 @@ impl<'gu> GnsServer<'gu> {
     fn close(&mut self) {
         // Take and drop the socket
         if let Some(socket) = self.socket.take() {
-            for (connection, _) in self.clients.drain() {
-                socket.close_connection(connection, 0, "", false);
-            }
+            let mut clients = self.clients.write();
+            clients.retain(|connection, _| {
+                socket.close_connection(*connection, 0, "", false);
+                false
+            });
             socket.poll_callbacks();
         }
     }
 
     fn tick(&mut self) -> bool {
+        let mut msgs_to_send = Vec::new();
+
         while let Some((msg, reply_ctx)) = match self.msg_recv.try_pop() {
             Ok(val) => val,
             Err(_) => {
@@ -224,11 +293,14 @@ impl<'gu> GnsServer<'gu> {
             }
         } {
             match msg {
+                ServerMessage::Send { connection, msg, flags } => {
+                    msgs_to_send.push((connection, msg, flags))
+                },
                 ServerMessage::Close => {
                     self.close();
                     reply_ctx.reply(()).unwrap();
                     return false;
-                }
+                },
             }
         }
 
@@ -251,7 +323,9 @@ impl<'gu> GnsServer<'gu> {
                     match socket.accept(connection) {
                         Ok(_) => {
                             info!(?remote_addr, "Client connected");
-                            self.clients.insert(connection, ());
+                            let api_connection = self.api.init_connection();
+                            let mut clients = self.clients.write();
+                            clients.insert(connection, api_connection);
                         },
                         Err(_) => {
                             warn!(?remote_addr, "Failed to accept client");
@@ -267,7 +341,8 @@ impl<'gu> GnsServer<'gu> {
                     let connection = event.connection();
                     let remote_addr = event.info().remote_address();
                     info!(?remote_addr, "Client disconnected");
-                    self.clients.remove(&connection);
+                    let mut clients = self.clients.write();
+                    clients.remove_by_left(&connection);
                     socket.close_connection(connection, 0, "", false);
                 }
 
@@ -279,14 +354,45 @@ impl<'gu> GnsServer<'gu> {
             }
         });
 
+        let clients = self.clients.read();
+
         socket.poll_messages::<100>(|message| {
-            match self.msg_dispatch.dispatch(message.payload()) {
-                Ok(_) => {},
-                Err(error) => {
-                    warn!(?error, "Failed to dispatch message");
+            let connection = message.connection();
+            if let Some(api_connection) = clients.get_by_left(&connection) {
+                match self.api.dispatch_message(*api_connection, &mut message.payload()) {
+                    Ok(_) => {},
+                    Err(error) => {
+                        warn!(?api_connection, ?error, "Failed to dispatch message");
+                    }
                 }
+            } else {
+                warn!(?connection, "Received message for untracked GNS connection");
             }
         });
+
+        let msgs_to_send = msgs_to_send.into_iter()
+            .filter_map(|(connection, msg, flags)| {
+                if let Some(gns_connection) = clients.get_by_right(&connection) {
+                    Some(socket.utils().allocate_message(
+                        *gns_connection,
+                        msg_send_flags_to_gns(flags),
+                        msg.as_bytes(),
+                    ))
+                } else {
+                    debug!(?connection, "Dropping message for untracked connection");
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if !msgs_to_send.is_empty() {
+            for msg in socket.send_messages(msgs_to_send) {
+                match msg {
+                    Either::Left(_) => {},
+                    Either::Right(error) =>
+                        warn!(?error, "Failed to send GNS message"),
+                }
+            }
+        }
 
         true
     }
@@ -294,10 +400,27 @@ impl<'gu> GnsServer<'gu> {
 
 struct GnsServerHandle {
     msg_send: ump::Client<ServerMessage, (), ServerNetworkingError>,
+    clients: Arc<RwLock<ClientsMap>>,
 }
 
 #[async_trait]
 impl RawServer for GnsServerHandle {
+    fn send(
+        &self,
+        connection: Connection,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), ServerNetworkingError> {
+        let clients = self.clients.read();
+        if clients.contains_right(&connection) {
+            self.msg_send.req_async(ServerMessage::Send { connection, msg, flags })
+                .map(|_| ())
+                .map_err(ServerNetworkingError::from)
+        } else {
+            Err(ServerNetworkingError::InvalidConnection(connection))
+        }
+    }
+
     #[inline]
     async fn close(&self) {
         let result = self.msg_send.areq(ServerMessage::Close).await
@@ -315,16 +438,20 @@ static SUBSYSTEM: LazyLock<Arc<GnsSubsystem>> = LazyLock::new(|| {
     Arc::new(GnsSubsystem::new())
 });
 
-#[derive(Debug)]
+#[derive(Educe)]
+#[educe(Debug)]
 struct CreateClientReq {
     socket_addr: SocketAddr,
-    msg_dispatch: Arc<MessageDispatch>,
+    #[educe(Debug(ignore))]
+    api: Arc<dyn RawClientApi>,
 }
 
-#[derive(Debug)]
+#[derive(Educe)]
+#[educe(Debug)]
 struct CreateServerReq {
     socket_addr: SocketAddr,
-    msg_dispatch: Arc<MessageDispatch>,
+    #[educe(Debug(ignore))]
+    api: Arc<dyn RawServerApi>,
 }
 
 #[self_referencing]
@@ -362,7 +489,7 @@ impl GnsSubsystem {
                 match GnsClient::new(
                     data.gns_global,
                     data.gns_utils,
-                    req.msg_dispatch,
+                    req.api,
                     req.socket_addr,
                 ) {
                     Ok((client, client_handle)) => {
@@ -378,7 +505,7 @@ impl GnsSubsystem {
                 match GnsServer::new(
                     data.gns_global,
                     data.gns_utils,
-                    req.msg_dispatch,
+                    req.api,
                     req.socket_addr,
                 ) {
                     Ok((server, server_handle)) => {
@@ -439,12 +566,12 @@ impl GnsSubsystem {
 impl RawClientFactory for Arc<GnsSubsystem> {
     async fn connect(
         &self,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawClientApi>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
         let req = CreateClientReq {
             socket_addr,
-            msg_dispatch,
+            api,
         };
         self.msg_create_client_send.areq(req).await
             .map_err(|err| match err {
@@ -458,12 +585,12 @@ impl RawClientFactory for Arc<GnsSubsystem> {
 impl RawServerFactory for Arc<GnsSubsystem> {
     async fn listen(
         &self,
-        msg_dispatch: Arc<MessageDispatch>,
+        api: Arc<dyn RawServerApi>,
         socket_addr: SocketAddr,
     ) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
         let req = CreateServerReq {
             socket_addr,
-            msg_dispatch,
+            api,
         };
         self.msg_create_server_send.areq(req).await
             .map_err(|err| match err {

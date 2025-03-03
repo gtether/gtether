@@ -5,8 +5,10 @@ edition.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+bitcode = { workspace = true }
 bytemuck = { workspace = true }
 educe = { workspace = true }
+flagset = { workspace = true }
 gtether = { workspace = true, features = ["gui"] }
 itertools = { workspace = true }
 nalgebra-glm = { workspace = true }

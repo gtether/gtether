@@ -11,8 +11,7 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-use ahash::{HashMap, HashMapExt};
+use std::ops::Deref;
 
 pub mod client;
 pub mod gns;
@@ -25,14 +24,8 @@ pub enum NetworkingBuildError {
     /// A required option was not specified.
     MissingOption { name: String },
 
-    /// The `msg_type` specified for a [MessageHandler](message::MessageHandler) was invalid.
-    InvalidMsgType {
-        msg_type: String,
-        reason: String,
-    },
-
     /// There was some sort of error while initializing the stack.
-    InitError { source: Option<Box<dyn Error>> },
+    InitError(Box<dyn Error>),
 }
 
 impl Display for NetworkingBuildError {
@@ -41,9 +34,7 @@ impl Display for NetworkingBuildError {
         match self {
             Self::MissingOption { name } =>
                 write!(f, "Missing required option: '{name}'"),
-            Self::InvalidMsgType { msg_type, reason } =>
-                write!(f, "Invalid handler msg_type '{msg_type}': {reason}"),
-            Self::InitError { .. } => write!(f, "Error occurred while initializing"),
+            Self::InitError(err) => write!(f, "Error occurred while initializing; {err}"),
         }
     }
 }
@@ -52,7 +43,7 @@ impl Error for NetworkingBuildError {
     #[inline]
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InitError { source } => source.as_ref().map(|v| &**v),
+            Self::InitError(err) => Some(err.deref()),
             _ => None,
         }
     }
@@ -124,7 +115,6 @@ impl NetworkingBuildError {
 /// ```
 ///
 pub struct NetworkingBuilder<T: Default> {
-    msg_dispatch_handlers: HashMap<String, Box<dyn message::MessageHandler>>,
     extra: T,
 }
 
@@ -136,40 +126,8 @@ impl<T: Default> NetworkingBuilder<T> {
     #[inline]
     pub fn new() -> Self {
         Self {
-            msg_dispatch_handlers: HashMap::new(),
             extra: T::default(),
         }
-    }
-
-    /// Add a [message handler](message::MessageHandler) for a specified `msg_type`.
-    ///
-    /// Specifying this option multiple times with the same `msg_type` will override the previously
-    /// set handler with the same `msg_type`.
-    #[inline]
-    pub fn msg_dispatch_handler(
-        mut self,
-        msg_type: impl Into<String>,
-        handler: impl message::MessageHandler,
-    ) -> Self {
-        self.msg_dispatch_handlers.insert(msg_type.into(), Box::new(handler));
-        self
-    }
-
-    fn msg_dispatch(&mut self) -> Result<Arc<message::MessageDispatch>, NetworkingBuildError> {
-        let handlers = self.msg_dispatch_handlers.drain()
-            .map(|(msg_type, handler)| {
-                if msg_type.len() > message::MsgTypeLenType::MAX as usize {
-                    Err(NetworkingBuildError::InvalidMsgType {
-                        msg_type: msg_type.clone(),
-                        reason: format!("Too large ({} > {})", msg_type.len(), message::MsgTypeLenType::MAX),
-                    })
-                } else {
-                    Ok((msg_type, handler))
-                }
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        Ok(Arc::new(message::MessageDispatch::new(handlers)))
     }
 }
 

@@ -13,7 +13,7 @@
 use smol::future;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-
+use std::sync::Arc;
 use crate::net::client::{ClientNetworking, ClosedClientFactory};
 use crate::util::tick_loop::TickLoopBuilder;
 use crate::{Application, EngineStage, EngineState, Side};
@@ -63,7 +63,7 @@ pub mod gui;
 pub struct Client {
     application_name: String,
     tick_rate: usize,
-    net: ClientNetworking,
+    net: Arc<ClientNetworking>,
 }
 
 impl Client {
@@ -83,7 +83,7 @@ impl Client {
 
     /// Reference to the client's [ClientNetworking] instance.
     #[inline]
-    pub fn net(&self) -> &ClientNetworking {
+    pub fn net(&self) -> &Arc<ClientNetworking> {
         &self.net
     }
 }
@@ -185,7 +185,7 @@ impl From<NetworkingBuildError> for ClientBuildError {
 pub struct ClientBuilder {
     application_name: Option<String>,
     tick_rate: Option<usize>,
-    networking: Option<ClientNetworking>,
+    networking: Option<Arc<ClientNetworking>>,
 }
 
 impl ClientBuilder {
@@ -227,7 +227,7 @@ impl ClientBuilder {
     ///
     /// Default is [ClosedClientFactory], which effectively represents no networking.
     #[inline]
-    pub fn networking(mut self, networking: ClientNetworking) -> Self {
+    pub fn networking(mut self, networking: Arc<ClientNetworking>) -> Self {
         self.networking = Some(networking);
         self
     }
