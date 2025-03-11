@@ -353,9 +353,13 @@ impl ConsoleGui {
                                 true
                             } else if event.physical_key == PhysicalKey::Code(KeyCode::Enter) {
                                 if gui.visible.load(Ordering::Relaxed) {
-                                    let mut input = gui.text_prompt.lock();
-                                    let _ = gui.console.handle_command(input.to_string());
-                                    input.clear();
+                                    let cmd = {
+                                        let mut input = gui.text_prompt.lock();
+                                        let cmd = input.to_string();
+                                        input.clear();
+                                        cmd
+                                    };
+                                    let _ = gui.console.handle_command(cmd);
                                     true
                                 } else {
                                     false

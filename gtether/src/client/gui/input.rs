@@ -1,9 +1,10 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::fmt;
+use std::{fmt, thread};
+use std::any::Any;
 use std::fmt::Formatter;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-
+use std::thread::JoinHandle;
 use parking_lot::RwLock;
 use tracing::{event, Level};
 use winit::event::{DeviceEvent, KeyEvent as WinitKeyEvent, WindowEvent};
@@ -238,6 +239,36 @@ impl InputDelegate {
             handler(&self, event);
         }
     }
+
+    pub fn spawn(
+        self,
+        mut handler: impl FnMut(&InputDelegate, InputDelegateEvent) + Send + 'static,
+    ) -> InputDelegateJoinHandle {
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let thread_should_exit = should_exit.clone();
+
+        let thread_name = if let Some(parent_name) = thread::current().name() {
+            parent_name.to_owned() + "-input-delegate"
+        } else {
+            "input-delegate".to_owned()
+        };
+
+        let join_handle = thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                while !thread_should_exit.load(Ordering::Relaxed) {
+                    // TODO: Error handling?
+                    let event = self.receiver.recv().unwrap();
+                    handler(&self, event);
+                }
+            })
+            .unwrap();
+
+        InputDelegateJoinHandle {
+            join_handle,
+            should_exit,
+        }
+    }
 }
 
 impl InputStateLayer for InputDelegate {
@@ -267,6 +298,19 @@ impl<'a> Iterator for InputDelegateIter<'a> {
             Err(crossbeam::channel::TryRecvError::Empty) => None,
             Err(crossbeam::channel::TryRecvError::Disconnected) => panic!("Server hung up"),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct InputDelegateJoinHandle {
+    join_handle: JoinHandle<()>,
+    should_exit: Arc<AtomicBool>,
+}
+
+impl InputDelegateJoinHandle {
+    pub fn join(self) -> Result<(), Box<dyn Any + Send>> {
+        self.should_exit.store(true, Ordering::Relaxed);
+        self.join_handle.join()
     }
 }
 

@@ -211,7 +211,7 @@ impl ClientGui {
 
     /// Reference to the client's [ClientNetworking] instance.
     #[inline]
-    pub fn net(&self) -> &ClientNetworking {
+    pub fn net(&self) -> &Arc<ClientNetworking> {
         &self.inner.net
     }
 }

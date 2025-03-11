@@ -3,17 +3,17 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
-use crate::board::Board;
+use crate::board::controller::BoardController;
 
 pub mod minimax;
 
 pub trait BotAlgorithm: Debug + Send + Sync + 'static {
-    fn find_best_play(&self, board: &Arc<Board>) -> Option<glm::TVec2<usize>>;
+    fn find_best_play(&self, board: &Arc<BoardController>) -> Option<glm::TVec2<usize>>;
 }
 
 #[derive(Debug)]
 enum BotRunnerMsg {
-    Play(Arc<Board>),
+    Play(Arc<BoardController>),
     Stop,
 }
 
@@ -68,7 +68,7 @@ impl BotRunner {
         }
     }
 
-    pub fn play(&self, board: Arc<Board>) {
+    pub fn play(&self, board: Arc<BoardController>) {
         match self.client.req(BotRunnerMsg::Play(board)) {
             Ok(_) => {},
             Err(ump::Error::ServerDisappeared | ump::Error::NoReply) => {},
