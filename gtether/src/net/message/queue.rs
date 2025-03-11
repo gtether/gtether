@@ -232,7 +232,7 @@ where
     }
 }
 
-impl<M> ClientMessageHandler<M, MessageQueueFull> for Arc<MessageQueue<Message<M>>>
+impl<M> ClientMessageHandler<M, MessageQueueFull> for MessageQueue<Message<M>>
 where
     M: MessageBody + Send + Sync + 'static,
 {
@@ -243,7 +243,7 @@ where
     }
 }
 
-impl<M> ServerMessageHandler<M, MessageQueueFull> for Arc<MessageQueue<(Connection, Message<M>)>>
+impl<M> ServerMessageHandler<M, MessageQueueFull> for MessageQueue<(Connection, Message<M>)>
 where
     M: MessageBody + Send + Sync + 'static,
 {

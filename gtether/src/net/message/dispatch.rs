@@ -25,7 +25,7 @@ impl MessageDispatchSide for MessageDispatchClient {
     type HandleFn = Box<dyn (Fn(
         MessageHeader,
         &[u8],
-    ) -> Result<(), MessageDispatchError>) + Send + Sync + 'static>;
+    ) -> Result<bool, MessageDispatchError>) + Send + Sync + 'static>;
 
     fn reply_fn<M>(reply_ctx: Arc<MessageReplyContext<M>>) -> Self::HandleFn
     where
@@ -38,7 +38,7 @@ impl MessageDispatchSide for MessageDispatchClient {
                     source: Some(Box::new(err)),
                 })?;
             reply_ctx.accept(Message::with_header(msg_header, msg_body));
-            Ok(())
+            Ok(true)
         })
     }
 }
@@ -50,7 +50,7 @@ impl MessageDispatchSide for MessageDispatchServer {
         MessageHeader,
         Connection,
         &[u8],
-    ) -> Result<(), MessageDispatchError>) + Send + Sync + 'static>;
+    ) -> Result<bool, MessageDispatchError>) + Send + Sync + 'static>;
 
     fn reply_fn<M>(reply_ctx: Arc<MessageReplyContext<M>>) -> Self::HandleFn
     where
@@ -63,7 +63,7 @@ impl MessageDispatchSide for MessageDispatchServer {
                     source: Some(Box::new(err)),
                 })?;
             reply_ctx.accept(Message::with_header(msg_header, msg_body));
-            Ok(())
+            Ok(true)
         })
     }
 }
@@ -103,15 +103,19 @@ impl MessageDispatchEntry<MessageDispatchClient> {
     {
         Self {
             handle_fn: Box::new(move |msg_header, msg_body| {
-                let msg_body = M::decode(msg_body)
-                    .map_err(|err| MessageDecodeError {
-                        details: "Could not deserialize message body".to_owned(),
-                        source: Some(Box::new(err)),
-                    })?;
-                let msg = Message::with_header(msg_header, msg_body);
-                handler.handle(msg)
-                    .map_err(|err| MessageDispatchError::DispatchFailed(Box::new(err)))?;
-                Ok(())
+                if handler.is_valid() {
+                    let msg_body = M::decode(msg_body)
+                        .map_err(|err| MessageDecodeError {
+                            details: "Could not deserialize message body".to_owned(),
+                            source: Some(Box::new(err)),
+                        })?;
+                    let msg = Message::with_header(msg_header, msg_body);
+                    handler.handle(msg)
+                        .map_err(|err| MessageDispatchError::DispatchFailed(Box::new(err)))?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }),
         }
     }
@@ -120,7 +124,7 @@ impl MessageDispatchEntry<MessageDispatchClient> {
         &self,
         msg_header: MessageHeader,
         msg_body: &[u8],
-    ) -> Result<(), MessageDispatchError> {
+    ) -> Result<bool, MessageDispatchError> {
         (self.handle_fn)(msg_header, msg_body)
     }
 }
@@ -134,15 +138,19 @@ impl MessageDispatchEntry<MessageDispatchServer> {
     {
         Self {
             handle_fn: Box::new(move |msg_header, connection, msg_body| {
-                let msg_body = M::decode(msg_body)
-                    .map_err(|err| MessageDecodeError {
-                        details: "Could not deserialize message body".to_owned(),
-                        source: Some(Box::new(err)),
-                    })?;
-                let msg = Message::with_header(msg_header, msg_body);
-                handler.handle(connection, msg)
-                    .map_err(|err| MessageDispatchError::DispatchFailed(Box::new(err)))?;
-                Ok(())
+                if handler.is_valid() {
+                    let msg_body = M::decode(msg_body)
+                        .map_err(|err| MessageDecodeError {
+                            details: "Could not deserialize message body".to_owned(),
+                            source: Some(Box::new(err)),
+                        })?;
+                    let msg = Message::with_header(msg_header, msg_body);
+                    handler.handle(connection, msg)
+                        .map_err(|err| MessageDispatchError::DispatchFailed(Box::new(err)))?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             })
         }
     }
@@ -152,7 +160,7 @@ impl MessageDispatchEntry<MessageDispatchServer> {
         msg_header: MessageHeader,
         connection: Connection,
         msg_body: &[u8],
-    ) -> Result<(), MessageDispatchError> {
+    ) -> Result<bool, MessageDispatchError> {
         (self.handle_fn)(msg_header, connection, msg_body)
     }
 }
@@ -211,15 +219,19 @@ impl MessageDispatch<MessageDispatchClient> {
         debug!(side="client", ?msg_header, "Dispatching message");
 
         if let Some(reply_num) = msg_header.reply_num {
-            let reply_handlers = self.reply_handlers.lock();
-            if let Some(entry) = reply_handlers.get(&reply_num) {
-                return entry.handle(msg_header, msg_body);
+            let mut reply_handlers = self.reply_handlers.lock();
+            if let Some(entry) = reply_handlers.remove(&reply_num) {
+                return entry.handle(msg_header, msg_body).map(|_| ());
             }
         }
 
-        let handlers = self.handlers.lock();
+        let mut handlers = self.handlers.lock();
         if let Some(entry) = handlers.get(&msg_header.key) {
-            return entry.handle(msg_header, msg_body);
+            let key = msg_header.key.clone();
+            if !entry.handle(msg_header, msg_body)? {
+                handlers.remove(&key);
+            }
+            return Ok(())
         }
 
         Err(MessageDispatchError::NoHandler { key: msg_header.key })
@@ -250,15 +262,19 @@ impl MessageDispatch<MessageDispatchServer> {
         debug!(side="server", ?msg_header, "Dispatching message");
 
         if let Some(reply_num) = msg_header.reply_num {
-            let reply_handlers = self.reply_handlers.lock();
-            if let Some(entry) = reply_handlers.get(&reply_num) {
-                return entry.handle(msg_header, connection, msg_body);
+            let mut reply_handlers = self.reply_handlers.lock();
+            if let Some(entry) = reply_handlers.remove(&reply_num) {
+                return entry.handle(msg_header, connection, msg_body).map(|_| ());
             }
         }
 
-        let handlers = self.handlers.lock();
+        let mut handlers = self.handlers.lock();
         if let Some(entry) = handlers.get(&msg_header.key) {
-            return entry.handle(msg_header, connection, msg_body);
+            let key = msg_header.key.clone();
+            if !entry.handle(msg_header, connection, msg_body)? {
+                handlers.remove(&key);
+            }
+            return Ok(())
         }
 
         Err(MessageDispatchError::NoHandler { key: msg_header.key })
