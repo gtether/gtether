@@ -223,6 +223,10 @@ enum ServerMessage {
         msg: Vec<u8>,
         flags: FlagSet<MessageFlags>,
     },
+    Broadcast {
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    },
     Close,
 }
 
@@ -283,6 +287,7 @@ impl<'gu> GnsServer<'gu> {
 
     fn tick(&mut self) -> bool {
         let mut msgs_to_send = Vec::new();
+        let mut msgs_to_broadcast = Vec::new();
 
         while let Some((msg, reply_ctx)) = match self.msg_recv.try_pop() {
             Ok(val) => val,
@@ -294,7 +299,10 @@ impl<'gu> GnsServer<'gu> {
         } {
             match msg {
                 ServerMessage::Send { connection, msg, flags } => {
-                    msgs_to_send.push((connection, msg, flags))
+                    msgs_to_send.push((connection, msg, flags));
+                },
+                ServerMessage::Broadcast { msg, flags } => {
+                    msgs_to_broadcast.push((msg, flags));
                 },
                 ServerMessage::Close => {
                     self.close();
@@ -383,6 +391,17 @@ impl<'gu> GnsServer<'gu> {
                     None
                 }
             })
+            .chain(msgs_to_broadcast.into_iter()
+                .map(|(msg, flags)| {
+                    let flags = msg_send_flags_to_gns(flags);
+                    clients.left_values()
+                        .map(move |gns_connection| socket.utils().allocate_message(
+                            *gns_connection,
+                            flags,
+                            msg.as_bytes(),
+                        ))
+                })
+                .flatten())
             .collect::<Vec<_>>();
         if !msgs_to_send.is_empty() {
             for msg in socket.send_messages(msgs_to_send) {
@@ -419,6 +438,16 @@ impl RawServer for GnsServerHandle {
         } else {
             Err(ServerNetworkingError::InvalidConnection(connection))
         }
+    }
+
+    fn broadcast(
+        &self,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), ServerNetworkingError> {
+        self.msg_send.req_async(ServerMessage::Broadcast { msg, flags })
+            .map(|_| ())
+            .map_err(ServerNetworkingError::from)
     }
 
     #[inline]

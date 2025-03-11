@@ -55,6 +55,12 @@ pub trait RawServer: Send + Sync + 'static {
         flags: FlagSet<MessageFlags>,
     ) -> Result<(), ServerNetworkingError>;
 
+    fn broadcast(
+        &self,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), ServerNetworkingError>;
+
     /// Close the server and all connections it has.
     ///
     /// After being closed, this server can no longer be used. This method should be idempotent, and
@@ -261,6 +267,20 @@ impl ServerNetworking {
         let bytes = msg.encode()
             .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
         self.inner.send(connection, bytes, M::flags())
+    }
+
+    pub fn broadcast<M>(
+        &self,
+        msg: impl Into<Message<M>>,
+    ) -> Result<(), ServerNetworkingError>
+    where
+        M: MessageSend,
+    {
+        let mut msg = msg.into();
+        msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+        let bytes = msg.encode()
+            .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
+        self.inner.broadcast(bytes, M::flags())
     }
 
     /// Send a [Message] from this server to a connected client, and wait for a response.
