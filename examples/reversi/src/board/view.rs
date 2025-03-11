@@ -283,12 +283,14 @@ impl ClientMessageHandler<MessageUpdateBoard, Infallible> for BoardView {
 
         let board = msg.into_body().into_board_state();
         if board.version() > state.board.version() {
-            if board.size() != state.board.size() {
-                state.selected_pos = None;
-            } else if board.tile(state.selected_pos.unwrap()).unwrap().owner.is_some() {
-                state.selected_pos = None;
-            } else if !self.local_players.contains(&board.current_player_idx()) {
-                state.selected_pos = None;
+            if state.selected_pos.is_some() {
+                if board.size() != state.board.size() {
+                    state.selected_pos = None;
+                } else if board.tile(state.selected_pos.unwrap()).unwrap().owner.is_some() {
+                    state.selected_pos = None;
+                } else if !self.local_players.contains(&board.current_player_idx()) {
+                    state.selected_pos = None;
+                }
             }
 
             state.board = board;

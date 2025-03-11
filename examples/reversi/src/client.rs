@@ -18,12 +18,13 @@ use gtether::render::{RendererEventData, RendererEventType};
 use gtether::resource::manager::LoadPriority;
 use gtether::resource::Resource;
 use gtether::{Application, Engine};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use parry3d::na::Point3;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tracing::info;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
@@ -51,6 +52,7 @@ pub struct ReversiClient {
     window: OnceLock<WindowHandle>,
     board_view: Mutex<Option<Arc<BoardView>>>,
     render_data: OnceLock<RenderData>,
+    preferred_name: RwLock<String>,
     server: Arc<ReversiServerManager>,
 }
 
@@ -67,6 +69,7 @@ impl ReversiClient {
             window: OnceLock::new(),
             board_view: Mutex::new(None),
             render_data: OnceLock::new(),
+            preferred_name: RwLock::new("Player".to_owned()),
             server,
         }
     }
@@ -74,6 +77,13 @@ impl ReversiClient {
     #[inline]
     pub fn console(&self) -> &Arc<Console> {
         &self.console
+    }
+
+    #[inline]
+    pub fn set_preferred_name(&self, name: impl Into<String>) {
+        let name = name.into();
+        info!(?name, "Set preferred name");
+        *self.preferred_name.write() = name;
     }
 
     fn set_board_view(&self, board_view: Arc<BoardView>) {
@@ -139,7 +149,7 @@ impl ReversiClient {
 
         net.connect_sync(socket_addr)?;
 
-        let msg = PlayerConnect::new("Player", None);
+        let msg = PlayerConnect::new(&*self.preferred_name.read(), None);
         let reply = net.send_recv(msg)?.wait();
         let reply_body = reply.into_body();
 
@@ -257,6 +267,9 @@ impl Application<ClientGui> for ReversiClient {
         cmd_registry.register_command("connect", Box::new(ConnectCommand {
             client: engine.clone(),
         })).unwrap();
+        cmd_registry.register_command("name", Box::new(NameCommand {
+            client: engine.clone(),
+        })).unwrap();
 
         self.window.set(window).unwrap();
         self.render_data.set(render_data).unwrap();
@@ -317,5 +330,20 @@ impl Command for ConnectCommand {
             socket_addr,
             self.client.side().net(),
         ).map_err(|err| CommandError::CommandFailure(Box::new(err)))
+    }
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+struct NameCommand {
+    #[educe(Debug(ignore))]
+    client: Arc<Engine<ReversiClient, ClientGui>>,
+}
+
+impl Command for NameCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::Equal(1).check(parameters.len() as u32)?;
+        self.client.app().set_preferred_name(&parameters[0]);
+        Ok(())
     }
 }
