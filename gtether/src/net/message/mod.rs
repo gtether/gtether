@@ -325,6 +325,12 @@ impl<M: MessageBody> Message<M> {
         &self.body
     }
 
+    /// Unwrap into the [body](MessageBody).
+    #[inline]
+    pub fn into_body(self) -> M {
+        self.body
+    }
+
     pub(super) fn set_msg_num(&mut self, msg_num: NonZeroU64) {
         self.header.msg_num = Some(msg_num);
     }
