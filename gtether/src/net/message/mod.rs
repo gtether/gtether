@@ -57,6 +57,11 @@ pub(super) mod dispatch;
 pub mod queue;
 pub mod server;
 
+#[cfg(feature = "derive")]
+pub use gtether_derive::MessageBody;
+#[cfg(feature = "derive")]
+pub use gtether_derive::MessageRepliable;
+
 /// Error that can occur when encoding messages.
 #[derive(Debug)]
 pub struct MessageEncodeError {
@@ -201,6 +206,39 @@ impl MessageHeader {
 /// This type is user-defined.
 ///
 /// See [module-level documentation](super::message#message-composition) for more.
+///
+/// # Implementation
+///
+/// The easiest way to implement MessageBody is with the derive macro:
+/// ```
+/// use gtether::net::message::MessageBody;
+///
+/// #[derive(MessageBody)]
+/// struct MyMessage {}
+///
+/// #[derive(MessageBody)]
+/// #[message_flag(Reliable)]
+/// struct MyReliableMessage {}
+/// ```
+///
+/// You can however implement MessageBody manually if needed:
+/// ```
+/// use gtether::net::message::{MessageBody, MessageFlags};
+/// use gtether::util::FlagSet;
+///
+/// struct MyMessage {}
+/// impl MessageBody for MyMessage {
+///     const KEY: &'static str = "MyMessage";
+/// }
+///
+/// struct MyReliableMessage {}
+/// impl MessageBody for MyReliableMessage {
+///     const KEY: &'static str = "MyReliableMessage";
+///     fn flags() -> FlagSet<MessageFlags> {
+///         MessageFlags::Reliable.into()
+///     }
+/// }
+/// ```
 pub trait MessageBody {
     /// The key identifying this message type.
     ///
@@ -272,6 +310,34 @@ impl<M: MessageBody + DecodeOwned> MessageRecv for M {
 }
 
 /// Trait describing a [Message] that can be replied to.
+///
+/// # Implementation
+///
+/// The easiest way to implement MessageRepliable is with the [MessageBody] derive macro:
+/// ```
+/// use gtether::net::message::MessageBody;
+///
+/// #[derive(MessageBody)]
+/// #[message_reply(MyMessageReply)]
+/// struct MyMessage {}
+///
+/// #[derive(MessageBody)]
+/// struct MyMessageReply {}
+/// ```
+///
+/// You can however implement MessageBody manually if needed:
+/// ```
+/// use gtether::net::message::{MessageBody, MessageRepliable};
+///
+/// #[derive(MessageBody)]
+/// struct MyMessage {}
+/// impl MessageRepliable for MyMessage {
+///     type Reply = MyMessageReply;
+/// }
+///
+/// #[derive(MessageBody)]
+/// struct MyMessageReply {}
+/// ```
 pub trait MessageRepliable: MessageBody {
     /// The message type of the reply.
     type Reply: MessageBody;

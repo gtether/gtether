@@ -4,9 +4,8 @@ use std::sync::{Arc, Weak};
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use bitcode::{Decode, Encode};
 use educe::Educe;
-use flagset::FlagSet;
 use tracing::{info, warn};
-use gtether::net::message::{Message, MessageBody, MessageFlags};
+use gtether::net::message::{Message, MessageBody};
 use gtether::net::message::server::ServerMessageHandler;
 use gtether::net::server::{Connection, ServerNetworking};
 
@@ -14,7 +13,8 @@ use crate::board::{BoardState, GameState};
 use crate::board::view::MessageUpdateBoard;
 use crate::player::Player;
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, MessageBody, Debug)]
+#[message_flag(Reliable)]
 pub struct MessagePlay {
     player_idx: usize,
     pos: [usize; 2],
@@ -41,12 +41,6 @@ impl MessagePlay {
     pub fn pos(&self) -> glm::TVec2<usize> {
         self.pos.into()
     }
-}
-
-impl MessageBody for MessagePlay {
-    const KEY: &'static str = "play";
-    #[inline]
-    fn flags() -> FlagSet<MessageFlags> { MessageFlags::Reliable.into() }
 }
 
 #[derive(Debug)]

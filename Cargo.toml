@@ -2,7 +2,7 @@
 
 members = [
     "gtether",
-    "examples/*",
+    "examples/*", "gtether_derive",
 ]
 
 resolver = "2"
@@ -48,3 +48,6 @@ winit = { version = "0.30", features = ["x11", "rwh_05"] }
 
 [workspace.dependencies.gtether]
 path = "gtether"
+
+[workspace.dependencies.gtether_derive]
+path = "gtether_derive"

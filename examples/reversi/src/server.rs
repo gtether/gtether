@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use bitcode::{Decode, Encode};
 use educe::Educe;
-use flagset::FlagSet;
 use gtether::net::gns::GnsSubsystem;
 use gtether::net::message::server::ServerMessageHandler;
-use gtether::net::message::{Message, MessageBody, MessageFlags, MessageRepliable};
+use gtether::net::message::{Message, MessageBody};
 use gtether::net::server::{Connection, ServerNetworking, ServerNetworkingError};
 use gtether::server::Server;
 use gtether::{Application, Engine, EngineBuilder, EngineJoinHandle};
@@ -21,7 +20,9 @@ use crate::render_util::hsv_to_rgb;
 
 pub const REVERSI_PORT: u16 = 19502;
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, MessageBody, Debug)]
+#[message_flag(Reliable)]
+#[message_reply(PlayerConnectReply)]
 pub struct PlayerConnect {
     requested_name: String,
     color: Option<[f32; 3]>,
@@ -50,19 +51,8 @@ impl PlayerConnect {
     }
 }
 
-impl MessageBody for PlayerConnect {
-    const KEY: &'static str = "player-connect";
-    #[inline]
-    fn flags() -> FlagSet<MessageFlags> {
-        MessageFlags::Reliable.into()
-    }
-}
-
-impl MessageRepliable for PlayerConnect {
-    type Reply = PlayerConnectReply;
-}
-
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, MessageBody, Debug)]
+#[message_flag(Reliable)]
 pub struct PlayerConnectReply {
     name: String,
     player_idx: Option<usize>,
@@ -109,14 +99,6 @@ impl PlayerConnectReply {
     #[inline]
     pub fn into_board_state(self) -> BoardState {
         self.board_state
-    }
-}
-
-impl MessageBody for PlayerConnectReply {
-    const KEY: &'static str = "player-connect-reply";
-    #[inline]
-    fn flags() -> FlagSet<MessageFlags> {
-        MessageFlags::Reliable.into()
     }
 }
 

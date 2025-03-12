@@ -6,6 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+derive = [
+    "dep:gtether_derive",
+]
 graphics = [
     "dep:ab_glyph",
     "dep:image",
@@ -14,6 +17,7 @@ graphics = [
     "dep:vulkano-shaders",
 ]
 gui = ["graphics", "dep:winit"]
+default = ["derive"]
 
 [dependencies]
 ab_glyph = { workspace = true, optional = true }
@@ -29,6 +33,7 @@ crossbeam = { workspace = true }
 educe = { workspace = true }
 flagset = { workspace = true }
 gns = { workspace = true }
+gtether_derive = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 itertools = { workspace = true }
 nalgebra-glm = { workspace = true }

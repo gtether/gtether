@@ -1,10 +1,9 @@
 use bitcode::{Decode, Encode};
-use flagset::FlagSet;
 use gtether::client::gui::input::{ElementState, InputDelegate, InputDelegateEvent, InputDelegateJoinHandle, MouseButton};
 use gtether::event::{Event, EventHandler};
 use gtether::net::client::ClientNetworking;
 use gtether::net::message::client::ClientMessageHandler;
-use gtether::net::message::{Message, MessageBody, MessageFlags};
+use gtether::net::message::{Message, MessageBody};
 use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::font::compositor::FontCompositor;
 use gtether::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
@@ -65,7 +64,8 @@ impl TileView {
     }
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, MessageBody, Debug)]
+#[message_flag(Reliable)]
 pub struct MessageUpdateBoard {
     board: BoardState,
 }
@@ -84,12 +84,6 @@ impl MessageUpdateBoard {
     pub fn into_board_state(self) -> BoardState {
         self.board
     }
-}
-
-impl MessageBody for MessageUpdateBoard {
-    const KEY: &'static str = "update-board";
-    #[inline]
-    fn flags() -> FlagSet<MessageFlags> { MessageFlags::Reliable.into() }
 }
 
 #[derive(Debug)]
