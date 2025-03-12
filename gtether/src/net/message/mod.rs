@@ -59,8 +59,6 @@ pub mod server;
 
 #[cfg(feature = "derive")]
 pub use gtether_derive::MessageBody;
-#[cfg(feature = "derive")]
-pub use gtether_derive::MessageRepliable;
 
 /// Error that can occur when encoding messages.
 #[derive(Debug)]
