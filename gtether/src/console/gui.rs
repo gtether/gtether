@@ -33,7 +33,7 @@ use crate::render::font::Font;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::uniform::Uniform;
-use crate::render::{FlatVertex, RenderTarget, Renderer, RendererEventData, RendererEventType, VulkanoError};
+use crate::render::{FlatVertex, RenderTarget, Renderer, RendererStaleEvent, VulkanoError};
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
 use crate::render::descriptor_set::EngineDescriptorSet;
@@ -327,7 +327,7 @@ impl ConsoleGui {
             text_log: Mutex::new(text_log),
             text_prompt: Mutex::new(text_prompt),
         });
-        window_handle.renderer().event_bus().register(RendererEventType::Stale, orig_gui.clone());
+        window_handle.renderer().event_bus().register(orig_gui.clone());
 
         let gui = orig_gui.clone();
         thread::spawn(move || {
@@ -407,10 +407,8 @@ impl ConsoleGui {
     }
 }
 
-impl EventHandler<RendererEventType, RendererEventData> for ConsoleGui {
-    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
-        assert_eq!(event.event_type(), &RendererEventType::Stale,
-                   "ConsoleGui can only handle 'Stale' Renderer events");
+impl EventHandler<RendererStaleEvent> for ConsoleGui {
+    fn handle_event(&self, event: &mut Event<RendererStaleEvent>) {
         let target = event.target();
 
         let (mut new_text_log, mut new_text_prompt) = Self::create_text_layouts(
@@ -842,7 +840,6 @@ impl ConsoleGuiBuilder {
             font,
             font_sheet,
         );
-        window_handle.renderer().event_bus().register(RendererEventType::Stale, console_gui.clone());
 
         Ok(console_gui)
     }

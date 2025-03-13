@@ -14,7 +14,7 @@ use gtether::render::model::{Model, ModelVertexNormal};
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::uniform::Uniform;
-use gtether::render::{EngineDevice, RenderTarget, Renderer, RendererEventData, RendererEventType, VulkanoError};
+use gtether::render::{EngineDevice, RenderTarget, Renderer, RendererStaleEvent, VulkanoError};
 use gtether::resource::Resource;
 use parking_lot::{Mutex, RwLock};
 use parry3d::bounding_volume::Aabb;
@@ -595,14 +595,13 @@ impl BoardTextRendererLayout {
             font_sheet,
             layout: Mutex::new(layout),
         });
-        renderer.event_bus().register(RendererEventType::Stale, render_layout.clone());
+        renderer.event_bus().register(render_layout.clone());
         render_layout
     }
 }
 
-impl EventHandler<RendererEventType, RendererEventData> for BoardTextRendererLayout {
-    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
-        assert_eq!(event.event_type(), &RendererEventType::Stale);
+impl EventHandler<RendererStaleEvent> for BoardTextRendererLayout {
+    fn handle_event(&self, event: &mut Event<RendererStaleEvent>) {
         let new_layout = Self::create_layout(
             event.target(),
             self.font_sheet.read().sizer(),

@@ -14,7 +14,6 @@ use gtether::render::model::obj::ModelObjLoader;
 use gtether::render::model::{Model, ModelVertexNormal};
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::Uniform;
-use gtether::render::{RendererEventData, RendererEventType};
 use gtether::resource::manager::LoadPriority;
 use gtether::resource::Resource;
 use gtether::{Application, Engine};
@@ -28,7 +27,7 @@ use tracing::info;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
-
+use gtether::render::RendererStaleEvent;
 use crate::board::view::BoardView;
 use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight, MN, VP};
 use crate::server::{PlayerConnect, ReversiServerManager, REVERSI_PORT};
@@ -219,8 +218,7 @@ impl Application<ClientGui> for ReversiClient {
         {
             let camera = camera.clone();
             window.renderer().event_bus().register(
-                RendererEventType::Stale,
-                move |event: &mut Event<RendererEventType, RendererEventData>| {
+                move |event: &mut Event<RendererStaleEvent>| {
                     camera.write().update(event.target());
                 }
             );
