@@ -14,7 +14,6 @@
 use parking_lot::RwLock;
 use smol::prelude::*;
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
@@ -22,6 +21,7 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 /// Marker trait for [events][Event] that are cancellable.
 pub trait EventCancellable {}
@@ -335,7 +335,7 @@ impl SubscriberOnceFuture {
     /// # fn wrapper<T>(event_bus: EventBus) -> Result<(), SubscriberOnceError> where for<'a> T: 'a {
     /// let fut = event_bus.registry().register_once(|event: &mut Event<T>| {
     ///     // Some one-time action
-    /// });
+    /// }).unwrap(); // We're sure we're registering the right type here
     /// fut.wait()?;
     /// # Ok(())
     /// # }
@@ -401,6 +401,20 @@ impl SubscriberOncePipe {
     }
 }
 
+#[derive(Debug)]
+pub struct InvalidTypeIdError {
+    type_id: TypeId,
+}
+
+impl Display for InvalidTypeIdError {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TypeId '{:?}' is not valid for the EventBus", self.type_id)
+    }
+}
+
+impl Error for InvalidTypeIdError {}
+
 /// Registry for registering new [EventSubscribers][es] to.
 ///
 /// This is the public-facing part of [EventBus], where users can register additional
@@ -412,6 +426,7 @@ impl SubscriberOncePipe {
 /// [es]: EventSubscriber
 /// [evt]: Event
 pub struct EventBusRegistry {
+    valid_type_ids: HashSet<TypeId>,
     subscribers: RwLock<HashMap<TypeId, Vec<SubscriberEntry>>>,
     once_pipes: RwLock<HashMap<TypeId, SubscriberOncePipe>>,
 }
@@ -423,15 +438,21 @@ impl EventBusRegistry {
     pub fn register<T>(
         &self,
         subscriber: impl Into<EventSubscriber<T>>,
-    )
+    ) -> Result<(), InvalidTypeIdError>
     where
         for<'a> T: 'a,
     {
-        let subscriber = subscriber.into();
-        self.subscribers.write()
-            .entry(TypeId::of::<T>())
-            .or_default()
-            .push(subscriber.into());
+        let type_id = TypeId::of::<T>();
+        if self.valid_type_ids.contains(&type_id) {
+            let subscriber = subscriber.into();
+            self.subscribers.write()
+                .entry(type_id)
+                .or_default()
+                .push(subscriber.into());
+            Ok(())
+        } else {
+            Err(InvalidTypeIdError { type_id })
+        }
     }
 
     /// Register a one-off event handler.
@@ -446,23 +467,27 @@ impl EventBusRegistry {
     pub fn register_once<T>(
         &self,
         subscriber_once: impl FnOnce(&mut Event<T>) + Send + 'static,
-    ) -> SubscriberOnceFuture
+    ) -> Result<SubscriberOnceFuture, InvalidTypeIdError>
     where
         for<'a> T: 'a,
     {
-        let subscriber_once: SubscriberFnOnce<T> = Box::new(subscriber_once);
         let type_id = TypeId::of::<T>();
-        let mut once_pipes_map = self.once_pipes.upgradable_read();
-        let once_pipe = if once_pipes_map.contains_key(&type_id) {
-            &once_pipes_map[&type_id]
+        if self.valid_type_ids.contains(&type_id) {
+            let subscriber_once: SubscriberFnOnce<T> = Box::new(subscriber_once);
+            let mut once_pipes_map = self.once_pipes.upgradable_read();
+            let once_pipe = if once_pipes_map.contains_key(&type_id) {
+                &once_pipes_map[&type_id]
+            } else {
+                once_pipes_map.with_upgraded(|map| {
+                    map.entry(type_id.clone())
+                        .or_insert_with(SubscriberOncePipe::new::<T>);
+                });
+                &once_pipes_map[&type_id]
+            };
+            Ok(once_pipe.send(subscriber_once))
         } else {
-            once_pipes_map.with_upgraded(|map| {
-                map.entry(type_id.clone())
-                    .or_insert_with(SubscriberOncePipe::new::<T>);
-            });
-            &once_pipes_map[&type_id]
-        };
-        once_pipe.send(subscriber_once)
+            Err(InvalidTypeIdError { type_id })
+        }
     }
 }
 
@@ -500,18 +525,15 @@ pub struct EventBus {
     registry: EventBusRegistry,
 }
 
-impl Default for EventBus {
-    fn default() -> Self {
-        Self {
-            registry: EventBusRegistry {
-                subscribers: RwLock::new(HashMap::new()),
-                once_pipes: RwLock::new(HashMap::new()),
-            }
-        }
-    }
-}
-
 impl EventBus {
+    /// Create an [EventBusBuilder].
+    ///
+    /// This is the recommended way to create an [EventBus].
+    #[inline]
+    pub fn builder() -> EventBusBuilder {
+        EventBusBuilder::new()
+    }
+
     /// Reference to this EventBus's [EventBusRegistry].
     #[inline]
     pub fn registry(&self) -> &EventBusRegistry { &self.registry }
@@ -551,6 +573,51 @@ impl EventBus {
     }
 }
 
+/// Builder pattern for [EventBus].
+///
+/// Usually created via [EventBus::builder()].
+pub struct EventBusBuilder {
+    valid_type_ids: HashSet<TypeId>,
+}
+
+impl EventBusBuilder {
+    /// Create a new builder.
+    ///
+    /// It is recommended to use [EventBus::builder()] instead.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            valid_type_ids: HashSet::new(),
+        }
+    }
+
+    /// Add a [TypeId] that the [EventBus] will be expected to fire.
+    ///
+    /// If any [TypeIds](TypeId) are added, only events of that type are expected to be fired and
+    /// handled, otherwise an [InvalidTypeIdError] will be yielded. If no TypeIds are added, any
+    /// events may be fired and handled.
+    #[inline]
+    pub fn event_type<T>(&mut self) -> &mut Self
+    where
+        for<'a> T: 'a,
+    {
+        self.valid_type_ids.insert(TypeId::of::<T>());
+        self
+    }
+
+    /// Build a new [EventBus].
+    #[inline]
+    pub fn build(&self) -> EventBus {
+        EventBus {
+            registry: EventBusRegistry {
+                valid_type_ids: self.valid_type_ids.clone(),
+                subscribers: RwLock::new(HashMap::new()),
+                once_pipes: RwLock::new(HashMap::new()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,9 +647,16 @@ mod tests {
         }
     }
 
+    fn create_event_bus() -> EventBus {
+        EventBus::builder()
+            .event_type::<IncrementEvent>()
+            .event_type::<CancellableIncrementEvent>()
+            .build()
+    }
+
     #[test]
     fn test_fire_event_no_subscriber() {
-        let event_bus = EventBus::default();
+        let event_bus = create_event_bus();
 
         let result = event_bus.fire(IncrementEvent(0));
         assert_eq!(result.into_data().0, 0);
@@ -594,8 +668,8 @@ mod tests {
 
     #[test]
     fn test_fire_event_single_subscriber() {
-        let event_bus = EventBus::default();
-        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default()));
+        let event_bus = create_event_bus();
+        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
 
         let result = event_bus.fire(IncrementEvent(0));
         assert_eq!(result.into_data().0, 1);
@@ -607,9 +681,9 @@ mod tests {
 
     #[test]
     fn test_fire_event_multiple_subscribers() {
-        let event_bus = EventBus::default();
+        let event_bus = create_event_bus();
         for _ in 0..3 {
-            event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default()));
+            event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
         }
 
         let result = event_bus.fire(IncrementEvent(0));
@@ -622,16 +696,19 @@ mod tests {
 
     #[test]
     fn test_fire_event_multiple_types() {
-        let event_bus = EventBus::default();
-
         struct Inc1Event(u32);
-        event_bus.registry().register(|event: &mut Event<Inc1Event>| { event.data().0 += 1; });
-
         struct Inc2Event(u32);
-        event_bus.registry().register(|event: &mut Event<Inc2Event>| { event.data().0 += 2; });
-
         struct Inc4Event(u32);
-        event_bus.registry().register(|event: &mut Event<Inc4Event>| { event.data().0 += 4; });
+
+        let event_bus = EventBus::builder()
+            .event_type::<Inc1Event>()
+            .event_type::<Inc2Event>()
+            .event_type::<Inc4Event>()
+            .build();
+
+        event_bus.registry().register(|event: &mut Event<Inc1Event>| { event.data().0 += 1; }).unwrap();
+        event_bus.registry().register(|event: &mut Event<Inc2Event>| { event.data().0 += 2; }).unwrap();
+        event_bus.registry().register(|event: &mut Event<Inc4Event>| { event.data().0 += 4; }).unwrap();
 
         let result = event_bus.fire(Inc1Event(0));
         assert_eq!(result.into_data().0, 1);
@@ -645,10 +722,10 @@ mod tests {
 
     #[test]
     fn test_fire_event_once_subscriber() {
-        let event_bus = EventBus::default();
+        let event_bus = create_event_bus();
         let once_fut = event_bus.registry().register_once(|event: &mut Event<IncrementEvent>| {
             event.data().0 += 1;
-        });
+        }).unwrap();
 
         // First should work
         let result = event_bus.fire(IncrementEvent(0));
@@ -663,11 +740,11 @@ mod tests {
 
     #[test]
     fn test_fire_event_subscriber_and_once() {
-        let event_bus = EventBus::default();
-        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default()));
+        let event_bus = create_event_bus();
+        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
         let once_fut = event_bus.registry().register_once(|event: &mut Event<IncrementEvent>| {
             event.data().0 += 1;
-        });
+        }).unwrap();
 
         // First should do both
         let result = event_bus.fire(IncrementEvent(0));
@@ -682,17 +759,17 @@ mod tests {
 
     #[test]
     fn test_fire_event_cancelled() {
-        let event_bus = EventBus::default();
+        let event_bus = create_event_bus();
         event_bus.registry().register(|event: &mut Event<CancellableIncrementEvent>| {
             event.data().0 += 1;
-        });
+        }).unwrap();
         event_bus.registry().register(|event: &mut Event<CancellableIncrementEvent>| {
             event.data().0 += 1;
             event.cancel();
-        });
+        }).unwrap();
         event_bus.registry().register(|event: &mut Event<CancellableIncrementEvent>| {
             event.data().0 += 1;
-        });
+        }).unwrap();
 
         let result = event_bus.fire(CancellableIncrementEvent(0));
         assert!(result.is_cancelled());
@@ -706,12 +783,12 @@ mod tests {
 
     #[test]
     fn test_fire_event_weak() {
-        let event_bus = EventBus::default();
-        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default()));
+        let event_bus = create_event_bus();
+        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
         let handler2 = Arc::new(IncrementHandler::default());
-        event_bus.registry().register(handler2.clone());
+        event_bus.registry().register(handler2.clone()).unwrap();
         let handler3 = Arc::new(IncrementHandler::default());
-        event_bus.registry().register(Arc::downgrade(&handler3));
+        event_bus.registry().register(Arc::downgrade(&handler3)).unwrap();
 
         let result = event_bus.fire(IncrementEvent(0));
         assert_eq!(result.into_data().0, 3);

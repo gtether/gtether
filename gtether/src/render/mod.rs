@@ -509,7 +509,11 @@ impl Renderer {
             config.swapchain,
         )?;
 
-        let event_bus = Arc::new(EventBus::default());
+        let event_bus = Arc::new(EventBus::builder()
+            .event_type::<RendererStaleEvent>()
+            .event_type::<RendererPreEvent>()
+            .event_type::<RendererPostEvent>()
+            .build());
 
         Ok(Self {
             target,

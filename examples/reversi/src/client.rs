@@ -221,7 +221,7 @@ impl Application<ClientGui> for ReversiClient {
                 move |event: &mut Event<RendererStaleEvent>| {
                     camera.write().update(event.target());
                 }
-            );
+            ).unwrap();
         }
 
         let deferred_lighting = DeferredLightingRendererBootstrap::new(

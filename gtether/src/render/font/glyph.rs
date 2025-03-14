@@ -263,7 +263,7 @@ impl ResourceLoader<dyn Font> for GlyphFontLoader {
         let new_value = self.load(manager, id, data).await?;
         self.renderer.event_bus().register_once(move |_event: &mut Event<RendererPostEvent>| {
             resource.replace(new_value);
-        }).await
+        }).unwrap().await
             .map_err(ResourceLoadError::from_error)
     }
 }

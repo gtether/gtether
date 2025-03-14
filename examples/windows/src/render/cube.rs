@@ -182,7 +182,7 @@ impl CubeRenderer {
                     0.01, 100.0,
                 );
             }
-        );
+        ).unwrap();
 
         let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
