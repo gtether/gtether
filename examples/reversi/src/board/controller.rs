@@ -161,7 +161,7 @@ impl BoardController {
     ) {
         let mut state = self.state.write();
         state.players[player_idx] = PlayerState {
-            player,
+            player: player.clone(),
             valid_connections,
         };
         let players = state.players.iter()
@@ -169,6 +169,11 @@ impl BoardController {
             .collect();
         state.board.set_players(players);
         self.update_clients(&state);
+
+        if player_idx == state.board.current_player_idx() {
+            drop(state);
+            player.begin_turn(self.weak.upgrade().unwrap());
+        }
     }
 }
 

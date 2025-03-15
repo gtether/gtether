@@ -10,8 +10,9 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::event::{EventBus, EventBusRegistry};
 use crate::net::message::{Message, MessageDispatchError, MessageFlags, MessageRecv, MessageRepliable, MessageReplyFuture, MessageSend};
-use crate::net::{NetworkingBuildError, NetworkingBuilder};
+use crate::net::{DisconnectReason, NetworkingBuildError, NetworkingBuilder};
 use crate::net::message::dispatch::{MessageDispatch, MessageDispatchServer};
 use crate::net::message::server::ServerMessageHandler;
 
@@ -23,6 +24,56 @@ impl Display for Connection {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "connection-{}", self.0)
+    }
+}
+
+/// Event describing when a client connects to a [ServerNetworking].
+#[derive(Debug)]
+pub struct ServerNetworkingConnectEvent {
+    connection: Connection,
+}
+
+impl ServerNetworkingConnectEvent {
+    #[inline]
+    pub fn new(connection: Connection) -> Self {
+        Self {
+            connection,
+        }
+    }
+
+    /// The [Connection] of the client that has connected.
+    #[inline]
+    pub fn connection(&self) -> Connection {
+        self.connection
+    }
+}
+
+/// Event describing when a client disconnects from a [ServerNetworking].
+#[derive(Debug)]
+pub struct ServerNetworkingDisconnectEvent {
+    connection: Connection,
+    reason: DisconnectReason,
+}
+
+impl ServerNetworkingDisconnectEvent {
+    #[inline]
+    pub fn new(connection: Connection, reason: DisconnectReason) -> Self {
+        Self {
+            connection,
+            reason,
+        }
+    }
+
+    /// The [Connection] of the client that disconnected.
+    #[inline]
+    pub fn connection(&self) -> Connection {
+        self.connection
+    }
+
+    /// Reason for the disconnected occurring.
+    #[inline]
+    pub fn reason(&self) -> DisconnectReason {
+        self.reason
     }
 }
 
@@ -41,6 +92,9 @@ pub trait RawServerApi: Send + Sync + 'static {
         connection: Connection,
         msg: &[u8],
     ) -> Result<(), MessageDispatchError>;
+
+    /// Access to the [EventBus] to fire server-networking events.
+    fn event_bus(&self) -> &EventBus;
 }
 
 /// Raw server listening on a given socket.
@@ -168,13 +222,20 @@ impl From<ump::Error<ServerNetworkingError>> for ServerNetworkingError {
 struct Api {
     next_connect_id: AtomicU32,
     msg_dispatch: MessageDispatch<MessageDispatchServer>,
+    event_bus: EventBus,
 }
 
 impl Api {
     fn new() -> Self {
+        let event_bus = EventBus::builder()
+            .event_type::<ServerNetworkingConnectEvent>()
+            .event_type::<ServerNetworkingDisconnectEvent>()
+            .build();
+
         Self {
             next_connect_id: AtomicU32::new(0),
             msg_dispatch: MessageDispatch::new(),
+            event_bus,
         }
     }
 }
@@ -185,12 +246,18 @@ impl RawServerApi for Api {
         Connection(self.next_connect_id.fetch_add(1, Ordering::SeqCst))
     }
 
+    #[inline]
     fn dispatch_message(
         &self,
         connection: Connection,
         msg: &[u8],
     ) -> Result<(), MessageDispatchError> {
         self.msg_dispatch.dispatch(connection, msg)
+    }
+
+    #[inline]
+    fn event_bus(&self) -> &EventBus {
+        &self.event_bus
     }
 }
 
@@ -229,6 +296,16 @@ impl ServerNetworking {
             inner,
             next_msg_num: AtomicU64::new(1),
         })
+    }
+
+    /// [EventBusRegistry] for [ServerNetworking] events.
+    ///
+    /// These include e.g.:
+    ///  * [ServerNetworkingConnectEvent]
+    ///  * [ServerNetworkingDisconnectEvent]
+    #[inline]
+    pub fn event_bus(&self) -> &EventBusRegistry {
+        self.api.event_bus.registry()
     }
 
     /// Insert a message handler into this [ServerNetworking] stack.

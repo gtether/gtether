@@ -18,6 +18,27 @@ pub mod gns;
 pub mod message;
 pub mod server;
 
+/// Reason for a disconnect to occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisconnectReason {
+    /// The connection was terminated locally by the user.
+    ClosedLocally,
+    /// The connection was terminated by the connected peer.
+    ClosedByPeer,
+    /// The connection was unexpectedly dropped.
+    Unexpected,
+}
+
+impl Display for DisconnectReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClosedLocally => write!(f, "Connection closed gracefully"),
+            Self::ClosedByPeer => write!(f, "Connection closed by peer"),
+            Self::Unexpected => write!(f, "Unexpected disconnect occurred"),
+        }
+    }
+}
+
 /// Errors that can occur while building a networking stack.
 #[derive(Debug)]
 pub enum NetworkingBuildError {

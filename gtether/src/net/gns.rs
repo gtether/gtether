@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use bimap::BiHashMap;
 use educe::Educe;
 use flagset::FlagSet;
-use gns::sys::{k_nSteamNetworkingSend_Reliable, ESteamNetworkingConnectionState as NetConnectState};
+use gns::sys::{k_nSteamNetworkingSend_Reliable, ESteamNetworkingConnectionState as NetConnectState, ESteamNetworkingSocketsDebugOutputType};
 use gns::{GnsConnection, GnsGlobal, GnsSocket, GnsUtils, IsClient, IsServer};
 use image::EncodableLayout;
 use itertools::Either;
@@ -41,11 +41,12 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::net::client::{ClientNetworkingError, RawClient, RawClientApi, RawClientFactory};
+use crate::net::client::{ClientNetworkingConnectEvent, ClientNetworkingDisconnectEvent, ClientNetworkingError, RawClient, RawClientApi, RawClientFactory};
+use crate::net::DisconnectReason;
 use crate::net::message::MessageFlags;
-use crate::net::server::{Connection, RawServer, RawServerApi, RawServerFactory, ServerNetworkingError};
+use crate::net::server::{Connection, RawServer, RawServerApi, RawServerFactory, ServerNetworkingConnectEvent, ServerNetworkingDisconnectEvent, ServerNetworkingError};
 use crate::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
 
 fn msg_send_flags_to_gns(flags: FlagSet<MessageFlags>) -> std::os::raw::c_int {
@@ -104,6 +105,9 @@ impl<'gu> GnsClient<'gu> {
         // Take and drop the socket
         if let Some(socket) = self.socket.take() {
             socket.poll_callbacks();
+            self.api.event_bus().fire(ClientNetworkingDisconnectEvent::new(
+                DisconnectReason::ClosedLocally,
+            ));
         }
     }
 
@@ -140,12 +144,20 @@ impl<'gu> GnsClient<'gu> {
         let mut quit = false;
         socket.poll_event::<100>(|event| {
             match (event.old_state(), event.info().state()) {
-                (
-                    _,
-                    NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer
-                    | NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally,
-                ) => {
+                (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
                     // Got disconnected or lost the connection
+                    self.api.event_bus().fire(ClientNetworkingDisconnectEvent::new(
+                        DisconnectReason::ClosedByPeer,
+                    ));
+                    quit = true;
+                    return;
+                }
+
+                (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
+                    // Lost the connection
+                    self.api.event_bus().fire(ClientNetworkingDisconnectEvent::new(
+                        DisconnectReason::Unexpected,
+                    ));
                     quit = true;
                     return;
                 }
@@ -334,6 +346,9 @@ impl<'gu> GnsServer<'gu> {
                             let api_connection = self.api.init_connection();
                             let mut clients = self.clients.write();
                             clients.insert(connection, api_connection);
+                            self.api.event_bus().fire(ServerNetworkingConnectEvent::new(
+                                api_connection,
+                            ));
                         },
                         Err(_) => {
                             warn!(?remote_addr, "Failed to accept client");
@@ -341,17 +356,30 @@ impl<'gu> GnsServer<'gu> {
                     }
                 }
 
-                (
-                    _,
-                    NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer
-                    | NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally,
-                ) => {
+                (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
                     let connection = event.connection();
                     let remote_addr = event.info().remote_address();
                     info!(?remote_addr, "Client disconnected");
                     let mut clients = self.clients.write();
-                    clients.remove_by_left(&connection);
+                    let (_, api_connection) = clients.remove_by_left(&connection).unwrap();
                     socket.close_connection(connection, 0, "", false);
+                    self.api.event_bus().fire(ServerNetworkingDisconnectEvent::new(
+                        api_connection,
+                        DisconnectReason::ClosedByPeer,
+                    ));
+                }
+
+                (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
+                    let connection = event.connection();
+                    let remote_addr = event.info().remote_address();
+                    info!(?remote_addr, "Client disconnected unexpectedly");
+                    let mut clients = self.clients.write();
+                    let (_, api_connection) = clients.remove_by_left(&connection).unwrap();
+                    socket.close_connection(connection, 0, "", false);
+                    self.api.event_bus().fire(ServerNetworkingDisconnectEvent::new(
+                        api_connection,
+                        DisconnectReason::Unexpected,
+                    ));
                 }
 
                 // A client state is changing
@@ -560,6 +588,26 @@ impl GnsSubsystem {
             .init(move || {
                 let gns_global = GnsGlobal::get().unwrap();
                 let gns_utils = GnsUtils::new().unwrap();
+
+                gns_utils.enable_debug_output(
+                    ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Debug,
+                    |ty, msg| {
+                        match ty {
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Debug |
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Verbose =>
+                                debug!(msg),
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Msg =>
+                                info!(msg),
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Warning |
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Important =>
+                                warn!(msg),
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Error |
+                            ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Bug =>
+                                error!(msg),
+                            _ => {},
+                        };
+                    }
+                );
 
                 Ok::<_, ()>(SubsystemDataBuilder {
                     gns_global,

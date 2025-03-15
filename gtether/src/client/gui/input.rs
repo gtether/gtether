@@ -5,8 +5,10 @@ use std::fmt::Formatter;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
+use crossbeam::channel::RecvTimeoutError;
 use parking_lot::RwLock;
-use tracing::{event, Level};
+use tracing::{error, event, Level};
 use winit::event::{DeviceEvent, KeyEvent as WinitKeyEvent, WindowEvent};
 
 pub use winit::event::{ElementState, MouseButton};
@@ -257,9 +259,21 @@ impl InputDelegate {
             .name(thread_name)
             .spawn(move || {
                 while !thread_should_exit.load(Ordering::Relaxed) {
-                    // TODO: Error handling?
-                    let event = self.receiver.recv().unwrap();
-                    handler(&self, event);
+                    let timeout = Duration::from_secs_f32(0.1);
+                    match self.receiver.recv_timeout(timeout) {
+                        Ok(event) => {
+                            // TODO: Error handling?
+                            handler(&self, event);
+                        },
+                        Err(RecvTimeoutError::Timeout) => {},
+                        Err(RecvTimeoutError::Disconnected) => {
+                            error!(
+                                thread = ?thread::current().name(),
+                                "Input delegate channel disconnected; halting thread",
+                            );
+                            break;
+                        }
+                    };
                 }
             })
             .unwrap();

@@ -1,17 +1,21 @@
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use async_trait::async_trait;
 use bitcode::{Decode, Encode};
 use educe::Educe;
 use gtether::net::gns::GnsSubsystem;
 use gtether::net::message::server::ServerMessageHandler;
 use gtether::net::message::{Message, MessageBody};
-use gtether::net::server::{Connection, ServerNetworking, ServerNetworkingError};
-use gtether::server::Server;
+use gtether::net::server::{Connection, ServerNetworking, ServerNetworkingDisconnectEvent, ServerNetworkingError};
+use gtether::server::{Server, ServerBuildError};
 use gtether::{Application, Engine, EngineBuilder, EngineJoinHandle};
 use parking_lot::{Mutex, RwLock};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, info};
-
+use gtether::event::{Event, EventHandler};
+use gtether::net::NetworkingBuildError;
 use crate::board::controller::BoardController;
 use crate::board::BoardState;
 use crate::bot::minimax::MinimaxAlgorithm;
@@ -104,22 +108,19 @@ impl PlayerConnectReply {
 
 #[derive(Debug)]
 struct RemotePlayer {
-    #[allow(unused)]
-    connection: Connection,
+    player_idx: usize,
     player: Arc<Player>,
 }
 
 #[derive(Debug)]
 struct Spectator {
-    #[allow(unused)]
-    connection: Connection,
     name: String,
 }
 
 #[derive(Debug)]
 struct PlayerManagerState {
-    players: Vec<RemotePlayer>,
-    spectators: Vec<Spectator>,
+    players: HashMap<Connection, RemotePlayer>,
+    spectators: HashMap<Connection, Spectator>,
 }
 
 #[derive(Educe)]
@@ -137,8 +138,8 @@ impl PlayerManager {
         net: &Arc<ServerNetworking>,
     ) -> Arc<Self> {
         let state = RwLock::new(PlayerManagerState {
-            players: vec![],
-            spectators: vec![],
+            players: HashMap::new(),
+            spectators: HashMap::new(),
         });
 
         let player_manager = Arc::new(Self {
@@ -148,18 +149,19 @@ impl PlayerManager {
         });
 
         net.insert_msg_handler(Arc::downgrade(&player_manager));
+        net.event_bus().register(player_manager.clone()).unwrap();
 
         player_manager
     }
 
     fn check_name(state: &PlayerManagerState, name: &str) -> bool {
-        for player in &state.players {
+        for player in state.players.values() {
             if name == player.player.info().name {
                 return false;
             }
         }
 
-        for spectator in &state.spectators {
+        for spectator in state.spectators.values() {
             if name == &spectator.name {
                 return false;
             }
@@ -211,8 +213,8 @@ impl ServerMessageHandler<PlayerConnect, ServerNetworkingError> for PlayerManage
                 let color = msg_body.color()
                     .unwrap_or(Self::default_color_for_player(state.players.len()));
                 let new_player = Arc::new(Player::human(name.clone(), color));
-                state.players.push(RemotePlayer {
-                    connection,
+                state.players.insert(connection, RemotePlayer {
+                    player_idx,
                     player: new_player.clone(),
                 });
                 self.board_controller.replace_player(player_idx, new_player, [connection].into());
@@ -228,8 +230,7 @@ impl ServerMessageHandler<PlayerConnect, ServerNetworkingError> for PlayerManage
             }
         }
 
-        state.spectators.push(Spectator {
-            connection,
+        state.spectators.insert(connection, Spectator {
             name: name.clone(),
         });
 
@@ -240,6 +241,30 @@ impl ServerMessageHandler<PlayerConnect, ServerNetworkingError> for PlayerManage
         self.net.send(connection, reply)?;
 
         Ok(())
+    }
+}
+
+impl EventHandler<ServerNetworkingDisconnectEvent> for PlayerManager {
+    fn handle_event(&self, event: &mut Event<ServerNetworkingDisconnectEvent>) {
+        let mut state = self.state.write();
+
+        if let Some(remote_player) = state.players.remove(&event.connection()) {
+            let name = remote_player.player.info().name.clone();
+            info!(connection = ?event.connection(), ?name, "Player disconnected");
+            // TODO: configure bot replacement?
+            let bot_player = Arc::new(Player::bot(
+                format!("Bot{}", remote_player.player_idx),
+                Self::default_color_for_player(remote_player.player_idx),
+                MinimaxAlgorithm::new(5),
+            ));
+            self.board_controller.replace_player(
+                remote_player.player_idx,
+                bot_player,
+                HashSet::new(),
+            );
+        }
+
+        state.spectators.remove(&event.connection());
     }
 }
 
@@ -297,6 +322,46 @@ impl Application<Server> for ReversiServer {
     }
 }
 
+#[derive(Debug)]
+pub struct ServerStartError {
+    source: Option<Box<dyn Error>>,
+}
+
+impl Display for ServerStartError {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => write!(f, "Failed to start server; {source}"),
+            None => write!(f, "Failed to start server"),
+        }
+    }
+}
+
+impl Error for ServerStartError {
+    #[inline]
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().map(|b| b.as_ref())
+    }
+}
+
+impl From<NetworkingBuildError> for ServerStartError {
+    #[inline]
+    fn from(value: NetworkingBuildError) -> Self {
+        Self {
+            source: Some(Box::new(value)),
+        }
+    }
+}
+
+impl From<ServerBuildError> for ServerStartError {
+    #[inline]
+    fn from(value: ServerBuildError) -> Self {
+        Self {
+            source: Some(Box::new(value)),
+        }
+    }
+}
+
 pub struct ReversiServerManager {
     inner: Mutex<Option<EngineJoinHandle<ReversiServer, Server>>>,
 }
@@ -323,39 +388,42 @@ impl ReversiServerManager {
         Self::shutdown_impl(&mut self.inner.lock());
     }
 
-    fn start_impl(inner: &mut Option<EngineJoinHandle<ReversiServer, Server>>) {
+    fn start_impl(
+        inner: &mut Option<EngineJoinHandle<ReversiServer, Server>>,
+    ) -> Result<(), ServerStartError> {
         info!("Starting server...");
         let app = ReversiServer::new();
         let networking = ServerNetworking::builder()
             .raw_factory(GnsSubsystem::get())
             .port(REVERSI_PORT)
-            .build().unwrap();
+            .build()?;
         let side = Server::builder()
             .networking(networking)
-            .build().unwrap();
+            .build()?;
         let join_handle = EngineBuilder::new()
             .app(app)
             .side(side)
             .spawn();
         *inner = Some(join_handle);
         info!("Server started.");
+        Ok(())
     }
 
     #[allow(unused)]
-    pub fn start(&self) -> Arc<Engine<ReversiServer, Server>> {
+    pub fn start(&self) -> Result<Arc<Engine<ReversiServer, Server>>, ServerStartError> {
         let mut inner = self.inner.lock();
         if inner.is_none() {
-            Self::start_impl(&mut inner);
+            Self::start_impl(&mut inner)?;
         } else {
             debug!("Server is already running");
         }
-        inner.as_ref().unwrap().engine()
+        Ok(inner.as_ref().unwrap().engine())
     }
 
-    pub fn restart(&self) -> Arc<Engine<ReversiServer, Server>> {
+    pub fn restart(&self) -> Result<Arc<Engine<ReversiServer, Server>>, ServerStartError> {
         let mut inner = self.inner.lock();
         Self::shutdown_impl(&mut inner);
-        Self::start_impl(&mut inner);
-        inner.as_ref().unwrap().engine()
+        Self::start_impl(&mut inner)?;
+        Ok(inner.as_ref().unwrap().engine())
     }
 }

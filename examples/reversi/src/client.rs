@@ -138,6 +138,25 @@ impl ReversiClient {
         window.renderer().set_render_pass(render_pass);
     }
 
+    fn clear_board_view(&self) {
+        let window = self.window.get()
+            .expect("ReversiClient should be initialized");
+        let render_data = self.render_data.get()
+            .expect("ReversiClient should be initialized");
+
+        let render_pass = EngineRenderPassBuilder::new(window.renderer().clone())
+            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0]).unwrap()
+            .begin_subpass()
+            .color_attachment("final_color")
+            .handler(render_data.console_gui.bootstrap_renderer())
+            .end_subpass()
+            .build().unwrap();
+        window.renderer().set_render_pass(render_pass);
+
+        let mut board_view_lock = self.board_view.lock();
+        *board_view_lock = None;
+    }
+
     fn connect(
         &self,
         socket_addr: SocketAddr,
@@ -169,6 +188,15 @@ impl ReversiClient {
         self.set_board_view(board_view);
 
         Ok(())
+    }
+
+    fn close(
+        &self,
+        net: &Arc<ClientNetworking>,
+    ) {
+        self.clear_board_view();
+        net.close_sync();
+        self.server.shutdown();
     }
 }
 
@@ -240,15 +268,6 @@ impl Application<ClientGui> for ReversiClient {
             .font(console_font.clone())
             .build().unwrap();
 
-        let render_pass = EngineRenderPassBuilder::new(window.renderer().clone())
-            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0]).unwrap()
-            .begin_subpass()
-            .color_attachment("final_color")
-            .handler(console_gui.bootstrap_renderer())
-            .end_subpass()
-            .build().unwrap();
-        window.renderer().set_render_pass(render_pass);
-
         let render_data = RenderData {
             model_tile: model_tile.await.unwrap(),
             model_piece: model_piece.await.unwrap(),
@@ -265,12 +284,17 @@ impl Application<ClientGui> for ReversiClient {
         cmd_registry.register_command("connect", Box::new(ConnectCommand {
             client: engine.clone(),
         })).unwrap();
+        cmd_registry.register_command("close", Box::new(CloseCommand {
+            client: engine.clone(),
+        })).unwrap();
         cmd_registry.register_command("name", Box::new(NameCommand {
             client: engine.clone(),
         })).unwrap();
 
         self.window.set(window).unwrap();
         self.render_data.set(render_data).unwrap();
+
+        self.clear_board_view();
     }
 
     fn tick(&self, _engine: &Arc<Engine<Self, ClientGui>>, _delta: Duration) {
@@ -291,7 +315,8 @@ impl Command for HostCommand {
 
         let server = &self.client.app().server;
 
-        server.restart();
+        server.restart()
+            .map_err(|err| CommandError::CommandFailure(Box::new(err)))?;
 
         self.client.app().connect(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), REVERSI_PORT),
@@ -328,6 +353,21 @@ impl Command for ConnectCommand {
             socket_addr,
             self.client.side().net(),
         ).map_err(|err| CommandError::CommandFailure(Box::new(err)))
+    }
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
+struct CloseCommand {
+    #[educe(Debug(ignore))]
+    client: Arc<Engine<ReversiClient, ClientGui>>,
+}
+
+impl Command for CloseCommand {
+    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
+        ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
+        self.client.app().close(self.client.side().net());
+        Ok(())
     }
 }
 

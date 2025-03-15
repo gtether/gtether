@@ -10,10 +10,53 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::event::{EventBus, EventBusRegistry, EventCancellable};
 use crate::net::message::{Message, MessageDispatchError, MessageFlags, MessageRecv, MessageRepliable, MessageReplyFuture, MessageSend};
-use crate::net::{NetworkingBuildError, NetworkingBuilder};
+use crate::net::{DisconnectReason, NetworkingBuildError, NetworkingBuilder};
 use crate::net::message::client::ClientMessageHandler;
 use crate::net::message::dispatch::{MessageDispatch, MessageDispatchClient};
+use crate::NonExhaustive;
+
+/// Event describing when a [ClientNetworking] connects to an endpoint.
+///
+/// This event is cancellable, which will prevent the connection from occurring.
+///
+/// Note that this event is fired _before_ the connection actually occurs.
+#[derive(Debug)]
+pub struct ClientNetworkingConnectEvent {
+    _ne: NonExhaustive,
+}
+impl EventCancellable for ClientNetworkingConnectEvent {}
+
+impl ClientNetworkingConnectEvent {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            _ne: NonExhaustive(())
+        }
+    }
+}
+
+/// Event describing when a [ClientNetworking] disconnects from an endpoint.
+#[derive(Debug)]
+pub struct ClientNetworkingDisconnectEvent {
+    /// Reason for the disconnect occurring.
+    reason: DisconnectReason,
+}
+
+impl ClientNetworkingDisconnectEvent {
+    #[inline]
+    pub fn new(reason: DisconnectReason) -> Self {
+        Self {
+            reason,
+        }
+    }
+
+    #[inline]
+    pub fn reason(&self) -> DisconnectReason {
+        self.reason
+    }
+}
 
 /// Client-side raw API.
 ///
@@ -23,6 +66,9 @@ use crate::net::message::dispatch::{MessageDispatch, MessageDispatchClient};
 pub trait RawClientApi: Send + Sync + 'static {
     /// Dispatch raw message data to the networking stack for processing.
     fn dispatch_message(&self, msg: &[u8]) -> Result<(), MessageDispatchError>;
+
+    /// Access to the [EventBus] to fire client-networking events.
+    fn event_bus(&self) -> &EventBus;
 }
 
 /// Raw client representing a single connection.
@@ -111,6 +157,9 @@ pub enum ClientNetworkingError {
     /// The attempted connection was invalid.
     InvalidConnection(SocketAddr),
 
+    /// The operation was cancelled by the user.
+    Cancelled,
+
     /// A message failed to send because it could not be serialized.
     MalformedMessage(Box<dyn Error + Send + Sync>),
 
@@ -124,6 +173,8 @@ impl Display for ClientNetworkingError {
             Self::InternalError(msg) => write!(f, "Internal Error: {msg}"),
             Self::InvalidConnection(socket_addr) =>
                 write!(f, "Invalid connection: {socket_addr}"),
+            Self::Cancelled =>
+                write!(f, "The operation was cancelled by the user"),
             Self::MalformedMessage(err) =>
                 write!(f, "Malformed message; {err}"),
             Self::Closed => write!(f, "Client has been closed"),
@@ -163,19 +214,32 @@ impl From<ump::Error<ClientNetworkingError>> for ClientNetworkingError {
 
 struct Api {
     msg_dispatch: MessageDispatch<MessageDispatchClient>,
+    event_bus: EventBus,
 }
 
 impl Api {
     fn new() -> Self {
+        let event_bus = EventBus::builder()
+            .event_type::<ClientNetworkingConnectEvent>()
+            .event_type::<ClientNetworkingDisconnectEvent>()
+            .build();
+
         Self {
             msg_dispatch: MessageDispatch::new(),
+            event_bus,
         }
     }
 }
 
 impl RawClientApi for Api {
+    #[inline]
     fn dispatch_message(&self, msg: &[u8]) -> Result<(), MessageDispatchError> {
         self.msg_dispatch.dispatch(msg)
+    }
+
+    #[inline]
+    fn event_bus(&self) -> &EventBus {
+        &self.event_bus
     }
 }
 
@@ -212,6 +276,16 @@ impl ClientNetworking {
         }
     }
 
+    /// [EventBusRegistry] for [ClientNetworking] events.
+    ///
+    /// These include e.g.:
+    ///  * [ClientNetworkingConnectEvent]
+    ///  * [ClientNetworkingDisconnectEvent]
+    #[inline]
+    pub fn event_bus(&self) -> &EventBusRegistry {
+        self.api.event_bus.registry()
+    }
+
     /// Connect to a given [SocketAddr].
     ///
     /// If this [ClientNetworking] is already connected, closes the existing connection first.
@@ -220,15 +294,37 @@ impl ClientNetworking {
         if let Some(client) = inner.take() {
             client.close().await;
         }
-        *inner = Some(self.raw_factory.connect(self.api.clone(), socket_addr).await?);
-        self.next_msg_num.store(1, Ordering::SeqCst);
-        Ok(())
+        let event = self.api.event_bus.fire(ClientNetworkingConnectEvent::new());
+        if event.is_cancelled() {
+            Err(ClientNetworkingError::Cancelled)
+        } else {
+            *inner = Some(self.raw_factory.connect(self.api.clone(), socket_addr).await?);
+            self.next_msg_num.store(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     /// Convenience wrapper for a sync version of [Self::connect()].
     #[inline]
     pub fn connect_sync(&self, socket_addr: SocketAddr) -> Result<(), ClientNetworkingError> {
         future::block_on(self.connect(socket_addr))
+    }
+
+    /// Close the [ClientNetworking].
+    ///
+    /// Any future operations e.g. [Self::send()] will yield [ClientNetworkingError::Closed], until
+    /// the [ClientNetworking] is reconnected via [Self::connect()].
+    #[inline]
+    pub async fn close(&self) {
+        if let Some(client) = self.inner.write().await.take() {
+            client.close().await;
+        }
+    }
+
+    /// Convenience wrapper for a sync version of [Self::close()].
+    #[inline]
+    pub fn close_sync(&self) {
+        future::block_on(self.close());
     }
 
     /// Insert a message handler into this [ClientNetworking] stack.
