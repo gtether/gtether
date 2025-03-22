@@ -161,14 +161,14 @@ impl MessageHeader {
         self.reply_num
     }
 
-    fn encode(&self) -> impl Iterator<Item=u8> {
+    pub(in crate::net) fn encode(&self) -> impl Iterator<Item=u8> {
         let bytes = bitcode::encode(self);
         let len = bytes.len() as u16;
         len.to_be_bytes().into_iter()
             .chain(bytes)
     }
 
-    fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), MessageDecodeError> {
+    pub(in crate::net) fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), MessageDecodeError> {
         let header_len = if bytes.len() >= 2 {
             u16::from_be_bytes(bytes[0..2].try_into()
                 .map_err(|err| MessageDecodeError {

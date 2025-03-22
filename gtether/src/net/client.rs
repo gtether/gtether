@@ -6,16 +6,22 @@ use smol::future;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::ops::Deref;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use ahash::{HashSet, HashSetExt};
+use arrayvec::ArrayVec;
+use parking_lot::Mutex;
+use tracing::warn;
 
 use crate::event::{EventBus, EventBusRegistry, EventCancellable};
-use crate::net::message::{Message, MessageDispatchError, MessageFlags, MessageRecv, MessageRepliable, MessageReplyFuture, MessageSend};
+use crate::net::message::{Message, MessageDispatchError, MessageEncodeError, MessageFlags, MessageHeader, MessageRecv, MessageRepliable, MessageReplyFuture, MessageSend};
 use crate::net::{DisconnectReason, NetworkingBuildError, NetworkingBuilder};
 use crate::net::message::client::ClientMessageHandler;
 use crate::net::message::dispatch::{MessageDispatch, MessageDispatchClient};
 use crate::NonExhaustive;
+
+const CONNECT_BUFFER_SIZE: usize = 64;
 
 /// Event describing when a [ClientNetworking] connects to an endpoint.
 ///
@@ -212,9 +218,123 @@ impl From<ump::Error<ClientNetworkingError>> for ClientNetworkingError {
     }
 }
 
+impl From<MessageEncodeError> for ClientNetworkingError {
+    #[inline]
+    fn from(value: MessageEncodeError) -> Self {
+        Self::MalformedMessage(Box::new(value))
+    }
+}
+
+struct ConnectBuffer {
+    buffer: Mutex<ArrayVec<Box<[u8]>, CONNECT_BUFFER_SIZE>>,
+    active_replies: Mutex<HashSet<NonZeroU64>>,
+}
+
+impl ConnectBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: Mutex::new(ArrayVec::new()),
+            active_replies: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn try_push(&self, msg: &[u8]) -> Result<(), MessageDispatchError> {
+        match self.buffer.lock().try_push(Box::from(msg)) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(MessageDispatchError::DispatchFailed(Box::from(
+                "ConnectBuffer is full".to_owned()
+            ))),
+        }
+    }
+
+    fn register_reply<M>(&self, msg: &Message<M>)
+    where
+        M: MessageSend + MessageRepliable,
+        M::Reply: MessageRecv,
+    {
+        let msg_num = msg.header().msg_num()
+            .expect("msg_num should already be set");
+        self.active_replies.lock().insert(msg_num);
+    }
+
+    fn check_reply(&self, msg: &[u8]) -> Result<bool, MessageDispatchError> {
+        let (msg_header, _) = MessageHeader::decode(msg)?;
+        if let Some(reply_num) = msg_header.reply_num() {
+            Ok(self.active_replies.lock().remove(&reply_num))
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn drain(&self, msg_dispatch: &Arc<MessageDispatch<MessageDispatchClient>>) {
+        let mut buffer = self.buffer.lock();
+        let range = 0..buffer.len();
+        for msg in buffer.drain(range) {
+            match msg_dispatch.dispatch(&*msg) {
+                Ok(_) => {},
+                Err(error) =>
+                    warn!(?error, "Failed to dispatch buffered ConnectContext message"),
+            }
+        }
+    }
+}
+
+/// Context representing a connection that is being established.
+///
+/// This context is used while a connection is actively being established to hold messages while
+/// handlers are being installed in the [ClientNetworking] stack. This ensures that no messages
+/// might be lost during the initial connection.
+///
+/// Additionally, if communication is needed to finish establishing the connection,
+/// [ClientConnectContext::send_recv()] can be used to send messages during this period.
+///
+/// Once this context is dropped, any buffered messages will be dispatched, and [ClientNetworking]
+/// will start operating as normal.
+pub struct ClientConnectContext {
+    msg_dispatch: Arc<MessageDispatch<MessageDispatchClient>>,
+    connect_buffer: Arc<ConnectBuffer>,
+    client: Option<Arc<dyn RawClient>>,
+}
+
+impl ClientConnectContext {
+    fn set_client(&mut self, client: Arc<dyn RawClient>) {
+        self.client = Some(client);
+    }
+
+    /// Send a [Message] and wait for a response.
+    ///
+    /// This is functionally the same as [ClientNetworking::send_recv()], but can be used while a
+    /// connection is being established.
+    pub fn send_recv<M>(
+        &self,
+        msg: impl Into<Message<M>>,
+    ) -> Result<MessageReplyFuture<M::Reply>, ClientNetworkingError>
+    where
+        M: MessageSend + MessageRepliable,
+        M::Reply: MessageRecv + Send + 'static,
+    {
+        let client = self.client.as_ref()
+            .expect("'client' should already be connected and set");
+        let mut msg = msg.into();
+        msg.set_msg_num(self.msg_dispatch.gen_msg_num());
+        let bytes = msg.encode()?;
+        self.connect_buffer.register_reply(&msg);
+        let fut = self.msg_dispatch.register_reply(&msg);
+        client.send(bytes, M::flags())?;
+        Ok(fut)
+    }
+}
+
+impl Drop for ClientConnectContext {
+    fn drop(&mut self) {
+        self.connect_buffer.drain(&self.msg_dispatch);
+    }
+}
+
 struct Api {
-    msg_dispatch: MessageDispatch<MessageDispatchClient>,
+    msg_dispatch: Arc<MessageDispatch<MessageDispatchClient>>,
     event_bus: EventBus,
+    connect_buffer: Mutex<Option<Weak<ConnectBuffer>>>,
 }
 
 impl Api {
@@ -225,8 +345,21 @@ impl Api {
             .build();
 
         Self {
-            msg_dispatch: MessageDispatch::new(),
+            msg_dispatch: Arc::new(MessageDispatch::new()),
             event_bus,
+            connect_buffer: Mutex::new(None),
+        }
+    }
+
+    fn connect_ctx(&self) -> ClientConnectContext {
+        let connect_buffer = Arc::new(ConnectBuffer::new());
+
+        *self.connect_buffer.lock() = Some(Arc::downgrade(&connect_buffer));
+
+        ClientConnectContext {
+            msg_dispatch: self.msg_dispatch.clone(),
+            connect_buffer,
+            client: None,
         }
     }
 }
@@ -234,7 +367,17 @@ impl Api {
 impl RawClientApi for Api {
     #[inline]
     fn dispatch_message(&self, msg: &[u8]) -> Result<(), MessageDispatchError> {
-        self.msg_dispatch.dispatch(msg)
+        let mut connect_buffer = self.connect_buffer.lock();
+        if let Some(connect_buffer) = connect_buffer.as_ref().map(|w| w.upgrade()).flatten() {
+            if connect_buffer.check_reply(msg)? {
+                self.msg_dispatch.dispatch(msg)
+            } else {
+                connect_buffer.try_push(msg)
+            }
+        } else {
+            *connect_buffer = None;
+            self.msg_dispatch.dispatch(msg)
+        }
     }
 
     #[inline]
@@ -251,7 +394,6 @@ pub struct ClientNetworking {
     raw_factory: Box<dyn RawClientFactory>,
     api: Arc<Api>,
     inner: smol::lock::RwLock<Option<Arc<dyn RawClient>>>,
-    next_msg_num: AtomicU64,
 }
 
 impl ClientNetworking {
@@ -272,7 +414,6 @@ impl ClientNetworking {
             raw_factory,
             api,
             inner: smol::lock::RwLock::new(None),
-            next_msg_num: AtomicU64::new(1),
         }
     }
 
@@ -289,7 +430,15 @@ impl ClientNetworking {
     /// Connect to a given [SocketAddr].
     ///
     /// If this [ClientNetworking] is already connected, closes the existing connection first.
-    pub async fn connect(&self, socket_addr: SocketAddr) -> Result<(), ClientNetworkingError> {
+    ///
+    /// This yields a [ClientConnectContext], which is used while establishing a connection to
+    /// intercept and buffer any incoming messages. This allows message handlers to be installed
+    /// after the connection is made but before messages are dispatched, preventing any messages
+    /// from being dropped due to missing a handler.
+    pub async fn connect(
+        &self,
+        socket_addr: SocketAddr,
+    ) -> Result<ClientConnectContext, ClientNetworkingError> {
         let mut inner = self.inner.write().await;
         if let Some(client) = inner.take() {
             client.close().await;
@@ -298,15 +447,20 @@ impl ClientNetworking {
         if event.is_cancelled() {
             Err(ClientNetworkingError::Cancelled)
         } else {
-            *inner = Some(self.raw_factory.connect(self.api.clone(), socket_addr).await?);
-            self.next_msg_num.store(1, Ordering::SeqCst);
-            Ok(())
+            let mut connect_ctx = self.api.connect_ctx();
+            let client = self.raw_factory.connect(self.api.clone(), socket_addr).await?;
+            connect_ctx.set_client(client.clone());
+            *inner = Some(client);
+            Ok(connect_ctx)
         }
     }
 
     /// Convenience wrapper for a sync version of [Self::connect()].
     #[inline]
-    pub fn connect_sync(&self, socket_addr: SocketAddr) -> Result<(), ClientNetworkingError> {
+    pub fn connect_sync(
+        &self,
+        socket_addr: SocketAddr,
+    ) -> Result<ClientConnectContext, ClientNetworkingError> {
         future::block_on(self.connect(socket_addr))
     }
 
@@ -360,7 +514,7 @@ impl ClientNetworking {
         let inner = self.inner.read_blocking();
         if let Some(client) = &*inner {
             let mut msg = msg.into();
-            msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+            msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
             let bytes = msg.encode()
                 .map_err(|err| ClientNetworkingError::MalformedMessage(Box::new(err)))?;
             client.send(bytes, M::flags())
@@ -389,9 +543,8 @@ impl ClientNetworking {
         let inner = self.inner.read_blocking();
         if let Some(client) = &*inner {
             let mut msg = msg.into();
-            msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
-            let bytes = msg.encode()
-                .map_err(|err| ClientNetworkingError::MalformedMessage(Box::new(err)))?;
+            msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
+            let bytes = msg.encode()?;
             let fut = self.api.msg_dispatch.register_reply(&msg);
             client.send(bytes, M::flags())?;
             Ok(fut)

@@ -165,10 +165,10 @@ impl ReversiClient {
         let window = self.window.get().unwrap();
         let render_data = self.render_data.get().unwrap();
 
-        net.connect_sync(socket_addr)?;
+        let connect_ctx = net.connect_sync(socket_addr)?;
 
         let msg = PlayerConnect::new(&*self.preferred_name.read(), None);
-        let reply = net.send_recv(msg)?.wait();
+        let reply = connect_ctx.send_recv(msg)?.wait();
         let reply_body = reply.into_body();
 
         let local_players = match reply_body.player_idx() {

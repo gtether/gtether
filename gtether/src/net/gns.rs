@@ -43,7 +43,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::net::client::{ClientNetworkingConnectEvent, ClientNetworkingDisconnectEvent, ClientNetworkingError, RawClient, RawClientApi, RawClientFactory};
+use crate::net::client::{ClientNetworkingDisconnectEvent, ClientNetworkingError, RawClient, RawClientApi, RawClientFactory};
 use crate::net::DisconnectReason;
 use crate::net::message::MessageFlags;
 use crate::net::server::{Connection, RawServer, RawServerApi, RawServerFactory, ServerNetworkingConnectEvent, ServerNetworkingDisconnectEvent, ServerNetworkingError};

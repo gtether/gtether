@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::error::Error;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use crate::net::message::client::ClientMessageHandler;
@@ -169,6 +170,7 @@ impl MessageDispatchEntry<MessageDispatchServer> {
 pub struct MessageDispatch<S: MessageDispatchSide> {
     handlers: Mutex<HashMap<String, MessageDispatchEntry<S>>>,
     reply_handlers: Mutex<HashMap<NonZeroU64, MessageDispatchEntry<S>>>,
+    next_msg_num: AtomicU64,
 }
 
 impl<S: MessageDispatchSide> MessageDispatch<S> {
@@ -177,7 +179,12 @@ impl<S: MessageDispatchSide> MessageDispatch<S> {
         Self {
             handlers: Mutex::new(HashMap::new()),
             reply_handlers: Mutex::new(HashMap::new()),
+            next_msg_num: AtomicU64::new(1),
         }
+    }
+
+    pub fn gen_msg_num(&self) -> NonZeroU64 {
+        self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap()
     }
 
     pub fn register_reply<M>(

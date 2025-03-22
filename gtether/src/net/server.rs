@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::event::{EventBus, EventBusRegistry};
@@ -268,7 +268,6 @@ impl RawServerApi for Api {
 pub struct ServerNetworking {
     api: Arc<Api>,
     inner: Arc<dyn RawServer>,
-    next_msg_num: AtomicU64,
 }
 
 impl ServerNetworking {
@@ -294,7 +293,6 @@ impl ServerNetworking {
         Ok(Self {
             api,
             inner,
-            next_msg_num: AtomicU64::new(1),
         })
     }
 
@@ -340,7 +338,7 @@ impl ServerNetworking {
         M: MessageSend,
     {
         let mut msg = msg.into();
-        msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+        msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()
             .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
         self.inner.send(connection, bytes, M::flags())
@@ -354,7 +352,7 @@ impl ServerNetworking {
         M: MessageSend,
     {
         let mut msg = msg.into();
-        msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+        msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()
             .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
         self.inner.broadcast(bytes, M::flags())
@@ -379,7 +377,7 @@ impl ServerNetworking {
         M::Reply: MessageRecv + Send + 'static,
     {
         let mut msg = msg.into();
-        msg.set_msg_num(self.next_msg_num.fetch_add(1, Ordering::SeqCst).try_into().unwrap());
+        msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()
             .map_err(|err| ServerNetworkingError::MalformedMessage(Box::new(err)))?;
         let fut = self.api.msg_dispatch.register_reply(&msg);
