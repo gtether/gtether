@@ -2,62 +2,56 @@
 //!
 //! This module contains anything that may be considered to be "server-side".
 
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 use smol::future;
 
 use crate::{Application, EngineStage, EngineState, Side};
-use crate::net::NetworkingBuildError;
-use crate::net::server::ServerNetworking;
 use crate::util::tick_loop::TickLoopBuilder;
 
 /// Server [Side] implementation.
 ///
 /// # Examples
 /// ```no_run
-/// # use std::sync::Arc;
-/// # use std::time::Duration;
-/// # use async_trait::async_trait;
+/// use std::net::{Ipv4Addr, SocketAddr};
+/// use std::sync::Arc;
+/// use std::time::Duration;
+/// use async_trait::async_trait;
 /// use gtether::Engine;
-/// # use gtether::Application;
-/// use gtether::net::gns::GnsSubsystem;
-/// use gtether::net::server::ServerNetworking;
+/// use gtether::Application;
+/// use gtether::net::Networking;
+/// use gtether::net::gns::{GnsServerDriver, GnsSubsystem};
 /// use gtether::server::Server;
-/// # use gtether::server::ServerBuildError;
 ///
-/// # struct MyApp {}
-/// #
-/// # #[async_trait(?Send)]
-/// # impl Application<Server> for MyApp {
-/// #     // Implement relevant functions...
-/// #     async fn init(&self, engine: &Arc<Engine<Self, Server>>) {}
-/// #     fn tick(&self, engine: &Arc<Engine<Self, Server>>, delta: Duration) {}
-/// # }
-/// #
-/// # let app = MyApp {};
+/// struct MyApp {}
 ///
-/// let networking = ServerNetworking::builder()
-///     .raw_factory(GnsSubsystem::get())
-///     .port(9001)
-///     .build()?;
+/// #[async_trait(?Send)]
+/// impl Application<Server> for MyApp {
+///     type NetworkingDriver = GnsServerDriver;
+///
+///     async fn init(&self, engine: &Arc<Engine<Self, Server>>) {
+///         engine.net().listen(SocketAddr::new(
+///             Ipv4Addr::LOCALHOST.into(),
+///             9001,
+///         )).await.unwrap();
+///     }
+///
+///     fn tick(&self, engine: &Arc<Engine<Self, Server>>, delta: Duration) { todo!() }
+/// }
+///
+/// let app = MyApp {};
 ///
 /// let side = Server::builder()
 ///     // 60 ticks per second
 ///     .tick_rate(60)
-///     .networking(networking)
-///     .build()?;
+///     .build();
 ///
 /// let engine = Engine::builder()
 ///     .app(app)
 ///     .side(side)
+///     .networking_driver(GnsSubsystem::get())
 ///     .build();
-/// #
-/// # Ok::<(), ServerBuildError>(())
 /// ```
 pub struct Server {
     tick_rate: usize,
-    net: Arc<ServerNetworking>,
 }
 
 impl Server {
@@ -67,12 +61,6 @@ impl Server {
     #[inline]
     pub fn builder() -> ServerBuilder {
         ServerBuilder::new()
-    }
-
-    /// Reference to the server's [ServerNetworking] instance.
-    #[inline]
-    pub fn net(&self) -> &Arc<ServerNetworking> {
-        &self.net
     }
 }
 
@@ -103,82 +91,28 @@ impl Side for Server {
     }
 }
 
-/// Errors that can occur while building a [Server].
-#[derive(Debug)]
-pub enum ServerBuildError {
-    /// A required option was not specified.
-    MissingOption { name: String },
-
-    /// There was an error while initializing the [ServerNetworking] instance.
-    Networking(NetworkingBuildError),
-}
-
-impl Display for ServerBuildError {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingOption { name } => write!(f, "Missing required option: '{name}'"),
-            Self::Networking(err) => Display::fmt(err, f),
-        }
-    }
-}
-
-impl Error for ServerBuildError {}
-
-impl ServerBuildError {
-    fn missing_option(name: impl Into<String>) -> Self {
-        Self::MissingOption { name: name.into() }
-    }
-}
-
-impl From<NetworkingBuildError> for ServerBuildError {
-    #[inline]
-    fn from(value: NetworkingBuildError) -> Self {
-        Self::Networking(value)
-    }
-}
-
 /// Builder pattern for [Server].
 ///
 /// # Examples
 ///
 /// Minimal example
 /// ```no_run
-/// use gtether::net::gns::GnsSubsystem;
-/// use gtether::net::server::ServerNetworking;
 /// use gtether::server::Server;
-/// # use gtether::server::ServerBuildError;
 ///
 /// let side = Server::builder()
-///     .networking(ServerNetworking::builder()
-///         .raw_factory(GnsSubsystem::get())
-///         .port(9001)
-///         .build()?)
-///     .build()?;
-/// #
-/// # Ok::<(), ServerBuildError>(())
+///     .build();
 /// ```
 ///
 /// Custom tick rate
 /// ```no_run
-/// use gtether::net::gns::GnsSubsystem;
-/// use gtether::net::server::ServerNetworking;
 /// use gtether::server::Server;
-/// # use gtether::server::ServerBuildError;
 ///
 /// let side = Server::builder()
 ///     .tick_rate(120)
-///     .networking(ServerNetworking::builder()
-///         .raw_factory(GnsSubsystem::get())
-///         .port(9001)
-///         .build()?)
-///     .build()?;
-/// #
-/// # Ok::<(), ServerBuildError>(())
+///     .build();
 /// ```
 pub struct ServerBuilder {
     tick_rate: Option<usize>,
-    networking: Option<Arc<ServerNetworking>>,
 }
 
 impl ServerBuilder {
@@ -189,7 +123,6 @@ impl ServerBuilder {
     pub fn new() -> Self {
         Self {
             tick_rate: None,
-            networking: None,
         }
     }
 
@@ -206,25 +139,13 @@ impl ServerBuilder {
         self
     }
 
-    /// Set the networking stack for server-side networking.
-    ///
-    /// This is a required option.
-    #[inline]
-    pub fn networking(mut self, networking: Arc<ServerNetworking>) -> Self {
-        self.networking = Some(networking);
-        self
-    }
-
     /// Build a new [Server].
-    pub fn build(self) -> Result<Server, ServerBuildError> {
+    pub fn build(self) -> Server {
         let tick_rate = self.tick_rate
             .unwrap_or(60);
-        let net = self.networking
-            .ok_or(ServerBuildError::missing_option("networking"))?;
 
-        Ok(Server {
+        Server {
             tick_rate,
-            net,
-        })
+        }
     }
 }

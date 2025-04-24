@@ -6,8 +6,9 @@ use bitcode::{Decode, Encode};
 use educe::Educe;
 use tracing::{info, warn};
 use gtether::net::message::{Message, MessageBody};
-use gtether::net::message::server::ServerMessageHandler;
-use gtether::net::server::{Connection, ServerNetworking};
+use gtether::net::message::MessageHandler;
+use gtether::net::{Connection, Networking};
+use gtether::net::gns::GnsServerDriver;
 
 use crate::board::{BoardState, GameState};
 use crate::board::view::MessageUpdateBoard;
@@ -61,14 +62,14 @@ pub struct BoardController {
     weak: Weak<Self>,
     state: RwLock<BoardControllerState>,
     #[educe(Debug(ignore))]
-    net: Arc<ServerNetworking>,
+    net: Arc<Networking<GnsServerDriver>>,
 }
 
 impl BoardController {
     pub fn new(
         mut board: BoardState,
         players: Vec<Arc<Player>>,
-        net: &Arc<ServerNetworking>,
+        net: &Arc<Networking<GnsServerDriver>>,
     ) -> Arc<Self> {
         board.set_players(players.iter()
             .map(|p| p.info().clone())
@@ -177,7 +178,7 @@ impl BoardController {
     }
 }
 
-impl ServerMessageHandler<MessagePlay, Infallible> for BoardController {
+impl MessageHandler<MessagePlay, Infallible> for BoardController {
     fn handle(&self, connection: Connection, msg: Message<MessagePlay>) -> Result<(), Infallible> {
         let msg = msg.into_body();
 

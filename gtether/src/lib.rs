@@ -10,7 +10,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use net::driver::NetDriverFactory;
 
+use crate::net::driver::NetDriver;
+use crate::net::Networking;
 use crate::resource::manager::ResourceManager;
 
 pub mod client;
@@ -41,6 +44,7 @@ pub mod util;
 /// use async_trait::async_trait;
 /// use gtether::{Application, Engine};
 /// use gtether::client::Client;
+/// use gtether::net::driver::NoNetDriver;
 ///
 /// struct BasicApp {
 ///     value_a: u32,
@@ -49,6 +53,8 @@ pub mod util;
 ///
 /// #[async_trait(?Send)]
 /// impl Application<Client> for BasicApp {
+///     type NetworkingDriver = NoNetDriver;
+///
 ///     async fn init(&self, _engine: &Arc<Engine<Self, Client>>) {
 ///         self.value_b.set(9001).unwrap();
 ///     }
@@ -63,6 +69,12 @@ pub trait Application<S>: Sized + Send + Sync
 where
     S: Side,
 {
+    /// [NetDriver] type that will be used to handle networking for this application.
+    ///
+    /// If networking is not required, [NoNetDriver](net::driver::NoNetDriver) is an appropriate
+    /// type to use.
+    type NetworkingDriver: NetDriver;
+
     /// Initialize this Application.
     ///
     /// This will be called once when the [Engine] is [initializing](EngineStage::Init). It may be
@@ -320,6 +332,7 @@ where
     side: S,
     state: Arc<RwLock<EngineStateInner>>,
     resources: Arc<ResourceManager>,
+    networking: Arc<Networking<A::NetworkingDriver>>,
 }
 
 impl<A, S> Engine<A, S>
@@ -346,6 +359,12 @@ where
     /// The engine's main [ResourceManager].
     #[inline]
     pub fn resources(&self) -> &Arc<ResourceManager> { &self.resources }
+
+    /// The engine's [Networking] stack.
+    #[inline]
+    pub fn net(&self) -> &Arc<Networking<A::NetworkingDriver>> {
+        &self.networking
+    }
 
     pub fn start(self: &Arc<Self>) {
         let engine_state = EngineState {
@@ -458,13 +477,14 @@ where
 /// # use std::time::Duration;
 /// use async_trait::async_trait;
 /// use gtether::{Application, Engine};
-/// # use gtether::client::ClientBuildError;
 /// use gtether::client::Client;
+/// use gtether::net::driver::NoNetDriver;
 ///
 /// struct MyApp {}
 ///
 /// #[async_trait(?Send)]
 /// impl Application<Client> for MyApp {
+///    type NetworkingDriver = NoNetDriver;
 ///     // Implement relevant functions...
 /// #    async fn init(&self, engine: &Arc<Engine<Self, Client>>) {}
 /// #    fn tick(&self, engine: &Arc<Engine<Self, Client>>, delta: Duration) {}
@@ -473,10 +493,9 @@ where
 /// let app = MyApp {};
 /// let engine = Engine::builder()
 ///     .app(app)
-///     .side(Client::builder().build()?)
+///     .side(Client::builder().build())
+///     .networking_driver(NoNetDriver::new())
 ///     .build();
-///
-/// Ok::<(), ClientBuildError>(())
 /// ```
 pub struct EngineBuilder<A, S>
 where
@@ -486,6 +505,7 @@ where
     app: Option<A>,
     side: Option<S>,
     resources: Option<Arc<ResourceManager>>,
+    networking: Option<Arc<Networking<A::NetworkingDriver>>>,
 }
 
 impl<A, S> EngineBuilder<A, S>
@@ -498,6 +518,7 @@ where
             app: None,
             side: None,
             resources: None,
+            networking: None,
         }
     }
 
@@ -520,6 +541,17 @@ where
         self
     }
 
+    /// Configure the [networking driver](NetDriver) for the engine.
+    ///
+    /// This is required.
+    pub fn networking_driver(
+        mut self,
+        driver_factory: impl NetDriverFactory<A::NetworkingDriver>,
+    ) -> Self {
+        self.networking = Some(Arc::new(Networking::new(driver_factory)));
+        self
+    }
+
     pub fn build(self) -> Arc<Engine<A, S>> {
         let app = self.app
             .expect(".app() is required");
@@ -530,11 +562,15 @@ where
         let resources = self.resources
             .unwrap_or_else(|| ResourceManager::builder().build());
 
+        let networking = self.networking
+            .expect(".networking_driver() is required");
+
         Arc::new(Engine {
             app,
             side,
             state: Arc::new(RwLock::new(EngineStateInner::default())),
             resources,
+            networking,
         })
     }
 }
@@ -571,5 +607,5 @@ where
 /// This allows structures to be created via a constructor function or by update syntax in
 /// combination with `Default::default()`. Copied from and inspired by Vulkano's NonExhaustive.
 ///
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NonExhaustive(pub(crate) ());

@@ -27,6 +27,7 @@ use gtether::resource::source::constant::ConstantResourceSource;
 use gtether::{Application, Engine, EngineBuilder};
 use gtether::client::Client;
 use gtether::client::gui::ClientGui;
+use gtether::net::driver::NoNetDriver;
 use crate::render::ambient::{AmbientLight, AmbientRendererBootstrap};
 use crate::render::cube::CubeRendererBootstrap;
 use crate::render::directional::{DirectionalRendererBootstrap, PointLight};
@@ -236,6 +237,8 @@ impl WindowsApp {
 
 #[async_trait(?Send)]
 impl Application<ClientGui> for WindowsApp {
+    type NetworkingDriver = NoNetDriver;
+
     async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {
         let mut cmd_registry = self.console.registry();
 
@@ -455,8 +458,9 @@ fn main() {
         .side(Client::builder()
             .application_name("gTether Example - windows")
             .enable_gui()
-            .build().unwrap())
+            .build())
         .resources(resources)
+        .networking_driver(NoNetDriver::new())
         .build()
         .start();
 }

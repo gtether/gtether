@@ -7,7 +7,6 @@ use gtether::console::gui::ConsoleGui;
 use gtether::console::log::ConsoleLog;
 use gtether::console::Console;
 use gtether::event::Event;
-use gtether::net::client::{ClientNetworking, ClientNetworkingError};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::font::Font;
 use gtether::render::model::obj::ModelObjLoader;
@@ -27,7 +26,10 @@ use tracing::info;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
+use gtether::net::{Networking, NetworkingError};
+use gtether::net::gns::GnsClientDriver;
 use gtether::render::RendererStaleEvent;
+
 use crate::board::view::BoardView;
 use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight, MN, VP};
 use crate::server::{PlayerConnect, ReversiServerManager, REVERSI_PORT};
@@ -160,15 +162,15 @@ impl ReversiClient {
     fn connect(
         &self,
         socket_addr: SocketAddr,
-        net: &Arc<ClientNetworking>,
-    ) -> Result<(), ClientNetworkingError> {
+        net: &Arc<Networking<GnsClientDriver>>,
+    ) -> Result<(), NetworkingError> {
         let window = self.window.get().unwrap();
         let render_data = self.render_data.get().unwrap();
 
-        let connect_ctx = net.connect_sync(socket_addr)?;
+        let _connect_ctx = net.connect_sync(socket_addr)?;
 
         let msg = PlayerConnect::new(&*self.preferred_name.read(), None);
-        let reply = connect_ctx.send_recv(msg)?.wait();
+        let reply = net.send_recv(msg)?.wait();
         let reply_body = reply.into_body();
 
         let local_players = match reply_body.player_idx() {
@@ -192,7 +194,7 @@ impl ReversiClient {
 
     fn close(
         &self,
-        net: &Arc<ClientNetworking>,
+        net: &Arc<Networking<GnsClientDriver>>,
     ) {
         self.clear_board_view();
         net.close_sync();
@@ -202,6 +204,8 @@ impl ReversiClient {
 
 #[async_trait(?Send)]
 impl Application<ClientGui> for ReversiClient {
+    type NetworkingDriver = GnsClientDriver;
+
     async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {
         let mut cmd_registry = self.console.registry();
 
@@ -320,7 +324,7 @@ impl Command for HostCommand {
 
         self.client.app().connect(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), REVERSI_PORT),
-            self.client.side().net(),
+            self.client.net(),
         ).map_err(|err| CommandError::CommandFailure(Box::new(err)))
     }
 }
@@ -351,7 +355,7 @@ impl Command for ConnectCommand {
 
         self.client.app().connect(
             socket_addr,
-            self.client.side().net(),
+            self.client.net(),
         ).map_err(|err| CommandError::CommandFailure(Box::new(err)))
     }
 }
@@ -366,7 +370,7 @@ struct CloseCommand {
 impl Command for CloseCommand {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
         ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
-        self.client.app().close(self.client.side().net());
+        self.client.app().close(self.client.net());
         Ok(())
     }
 }

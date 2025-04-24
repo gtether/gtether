@@ -1,4 +1,4 @@
-//! An implementation of gTether networking APIs using
+//! An implementation of gTether networking [drivers](NetDriver) using
 //! [Game Networking Sockets](https://github.com/ValveSoftware/GameNetworkingSockets).
 //!
 //! When GNS is used, it will spawn a subsystem that runs on a separate thread. That subsystem will
@@ -6,26 +6,25 @@
 //!
 //! Users will almost never directly interact with GNS, but instead can retrieve a handle to the GNS
 //! subsystem via [GnsSubsystem::get()]. This handle does not do much by itself, but it does
-//! implement both [RawClientFactory] and [RawServerFactory], making it suitable to use as an
-//! implementation for [ClientNetworking](crate::net::client::ClientNetworking) and
-//! [ServerNetworking](crate::net::server::ServerNetworking).
+//! implement [NetDriverFactory] for both [GnsClientDriver] and [GnsServerDriver], making it
+//! suitable to use when creating a [Networking](super::Networking) stack.
 //!
 //! # Examples
 //!
 //! To use for client networking:
 //! ```no_run
-//! use gtether::net::client::RawClientFactory;
-//! use gtether::net::gns::GnsSubsystem;
+//! use gtether::net::gns::{GnsClientDriver, GnsSubsystem};
+//! use gtether::net::driver::NetDriverFactory;
 //!
-//! let client_factory: Box<dyn RawClientFactory> = Box::new(GnsSubsystem::get());
+//! let client_factory: Box<dyn NetDriverFactory<GnsClientDriver>> = Box::new(GnsSubsystem::get());
 //! ```
 //!
 //! To use for server networking:
 //! ```no_run
-//! use gtether::net::gns::GnsSubsystem;
-//! use gtether::net::server::RawServerFactory;
+//! use gtether::net::gns::{GnsServerDriver, GnsSubsystem};
+//! use gtether::net::driver::NetDriverFactory;
 //!
-//! let server_factory: Box<dyn RawServerFactory> = Box::new(GnsSubsystem::get());
+//! let server_factory: Box<dyn NetDriverFactory<GnsServerDriver>> = Box::new(GnsSubsystem::get());
 //! ```
 
 use async_trait::async_trait;
@@ -43,10 +42,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::net::client::{ClientNetworkingDisconnectEvent, ClientNetworkingError, RawClient, RawClientApi, RawClientFactory};
-use crate::net::DisconnectReason;
+use crate::net::{Connection, DisconnectReason, NetworkingApi, NetworkingError};
+use crate::net::driver::{NetDriver, NetDriverBroadcast, NetDriverCloseConnection, NetDriverConnect, NetDriverFactory, NetDriverListen, NetDriverSend, NetDriverSendTo};
 use crate::net::message::MessageFlags;
-use crate::net::server::{Connection, RawServer, RawServerApi, RawServerFactory, ServerNetworkingConnectEvent, ServerNetworkingDisconnectEvent, ServerNetworkingError};
 use crate::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
 
 fn msg_send_flags_to_gns(flags: FlagSet<MessageFlags>) -> std::os::raw::c_int {
@@ -69,34 +67,35 @@ enum ClientMessage {
 }
 
 struct GnsClient<'gu> {
-    api: Arc<dyn RawClientApi>,
+    api: Arc<NetworkingApi>,
+    api_connection: Connection,
     socket: Option<GnsSocket<'gu, 'gu, IsClient>>,
-    msg_recv: ump::Server<ClientMessage, (), ClientNetworkingError>,
+    msg_recv: ump::Server<ClientMessage, (), NetworkingError>,
 }
 
 impl<'gu> GnsClient<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
-        api: Arc<dyn RawClientApi>,
+        api: Arc<NetworkingApi>,
+        api_connection: Connection,
         socket_addr: SocketAddr,
-    ) -> Result<(Self, Arc<dyn RawClient>), ClientNetworkingError> {
+    ) -> Result<(Self, GnsClientHandle), NetworkingError> {
         let socket = GnsSocket::new(gns_global, gns_utils)
-            .ok_or(ClientNetworkingError::internal_error("Failed to create socket"))?
+            .ok_or(NetworkingError::internal_error("Failed to create socket"))?
             .connect(socket_addr.ip(), socket_addr.port())
-            .map_err(|_| ClientNetworkingError::InvalidConnection(socket_addr))?;
+            .map_err(|_| NetworkingError::InvalidAddress(socket_addr))?;
 
         let (msg_recv, msg_send) = ump::channel();
 
         let client = Self {
             api,
+            api_connection,
             socket: Some(socket),
             msg_recv,
         };
 
-        let client_handle = Arc::new(GnsClientHandle {
-            msg_send,
-        });
+        let client_handle = GnsClientHandle(msg_send);
 
         Ok((client, client_handle))
     }
@@ -105,9 +104,7 @@ impl<'gu> GnsClient<'gu> {
         // Take and drop the socket
         if let Some(socket) = self.socket.take() {
             socket.poll_callbacks();
-            self.api.event_bus().fire(ClientNetworkingDisconnectEvent::new(
-                DisconnectReason::ClosedLocally,
-            ));
+            self.api.disconnect(self.api_connection, DisconnectReason::ClosedLocally);
         }
     }
 
@@ -146,18 +143,14 @@ impl<'gu> GnsClient<'gu> {
             match (event.old_state(), event.info().state()) {
                 (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
                     // Got disconnected or lost the connection
-                    self.api.event_bus().fire(ClientNetworkingDisconnectEvent::new(
-                        DisconnectReason::ClosedByPeer,
-                    ));
+                    self.api.disconnect(self.api_connection, DisconnectReason::ClosedByPeer);
                     quit = true;
                     return;
                 }
 
                 (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
                     // Lost the connection
-                    self.api.event_bus().fire(ClientNetworkingDisconnectEvent::new(
-                        DisconnectReason::Unexpected,
-                    ));
+                    self.api.disconnect(self.api_connection, DisconnectReason::Unexpected);
                     quit = true;
                     return;
                 }
@@ -169,7 +162,7 @@ impl<'gu> GnsClient<'gu> {
         });
 
         socket.poll_messages::<100>(|message| {
-            match self.api.dispatch_message(&mut message.payload()) {
+            match self.api.dispatch_message(self.api_connection, &mut message.payload()) {
                 Ok(_) => {},
                 Err(error) => {
                     warn!(?error, "Failed to dispatch message");
@@ -198,35 +191,7 @@ impl<'gu> GnsClient<'gu> {
     }
 }
 
-struct GnsClientHandle {
-    msg_send: ump::Client<ClientMessage, (), ClientNetworkingError>,
-}
-
-#[async_trait]
-impl RawClient for GnsClientHandle {
-    #[inline]
-    fn send(
-        &self,
-        msg: Vec<u8>,
-        flags: FlagSet<MessageFlags>,
-    ) -> Result<(), ClientNetworkingError> {
-        self.msg_send.req_async(ClientMessage::Send { msg, flags })
-            // We're firing and forgetting, so we don't care about the WaitReply<>
-            .map(|_| ())
-            .map_err(ClientNetworkingError::from)
-    }
-
-    #[inline]
-    async fn close(&self) {
-        let result = self.msg_send.areq(ClientMessage::Close).await
-            .map_err(ClientNetworkingError::from);
-        match result {
-            Ok(_) | Err(ClientNetworkingError::Closed) => {},
-            result => result
-                .expect("Closing a server should not error"),
-        }
-    }
-}
+struct GnsClientHandle(ump::Client<ClientMessage, (), NetworkingError>);
 
 #[derive(Debug)]
 enum ServerMessage {
@@ -240,28 +205,31 @@ enum ServerMessage {
         flags: FlagSet<MessageFlags>,
     },
     Close,
+    CloseConnection {
+        connection: Connection,
+    },
 }
 
 type ClientsMap = BiHashMap<GnsConnection, Connection, ahash::RandomState, ahash::RandomState>;
 
 struct GnsServer<'gu> {
-    api: Arc<dyn RawServerApi>,
+    api: Arc<NetworkingApi>,
     socket: Option<GnsSocket<'gu, 'gu, IsServer>>,
     clients: Arc<RwLock<ClientsMap>>,
-    msg_recv: ump::Server<ServerMessage, (), ServerNetworkingError>,
+    msg_recv: ump::Server<ServerMessage, (), NetworkingError>,
 }
 
 impl<'gu> GnsServer<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
-        api: Arc<dyn RawServerApi>,
+        api: Arc<NetworkingApi>,
         socket_addr: SocketAddr,
-    ) -> Result<(Self, Arc<dyn RawServer>), ServerNetworkingError> {
+    ) -> Result<(Self, GnsServerHandle), NetworkingError> {
         let socket = GnsSocket::new(gns_global, gns_utils)
-            .ok_or(ServerNetworkingError::internal_error("Failed to create socket"))?
+            .ok_or(NetworkingError::internal_error("Failed to create socket"))?
             .listen(socket_addr.ip(), socket_addr.port())
-            .map_err(|_| ServerNetworkingError::InvalidListen(socket_addr))?;
+            .map_err(|_| NetworkingError::InvalidAddress(socket_addr))?;
 
         let (msg_recv, msg_send) = ump::channel();
 
@@ -277,10 +245,10 @@ impl<'gu> GnsServer<'gu> {
             msg_recv,
         };
 
-        let server_handle = Arc::new(GnsServerHandle {
+        let server_handle = GnsServerHandle {
             msg_send,
             clients,
-        });
+        };
 
         Ok((server, server_handle))
     }
@@ -289,8 +257,9 @@ impl<'gu> GnsServer<'gu> {
         // Take and drop the socket
         if let Some(socket) = self.socket.take() {
             let mut clients = self.clients.write();
-            clients.retain(|connection, _| {
+            clients.retain(|connection, api_connection| {
                 socket.close_connection(*connection, 0, "", false);
+                self.api.disconnect(*api_connection, DisconnectReason::ClosedLocally);
                 false
             });
             socket.poll_callbacks();
@@ -300,6 +269,7 @@ impl<'gu> GnsServer<'gu> {
     fn tick(&mut self) -> bool {
         let mut msgs_to_send = Vec::new();
         let mut msgs_to_broadcast = Vec::new();
+        let mut connections_to_close = Vec::new();
 
         while let Some((msg, reply_ctx)) = match self.msg_recv.try_pop() {
             Ok(val) => val,
@@ -321,6 +291,9 @@ impl<'gu> GnsServer<'gu> {
                     reply_ctx.reply(()).unwrap();
                     return false;
                 },
+                ServerMessage::CloseConnection {connection} => {
+                    connections_to_close.push(connection);
+                }
             }
         }
 
@@ -342,13 +315,13 @@ impl<'gu> GnsServer<'gu> {
                     let remote_addr = event.info().remote_address();
                     match socket.accept(connection) {
                         Ok(_) => {
-                            info!(?remote_addr, "Client connected");
-                            let api_connection = self.api.init_connection();
-                            let mut clients = self.clients.write();
-                            clients.insert(connection, api_connection);
-                            self.api.event_bus().fire(ServerNetworkingConnectEvent::new(
-                                api_connection,
-                            ));
+                            if let Some(api_connection) = self.api.try_init_connect(remote_addr) {
+                                info!(?remote_addr, ?api_connection, "Client connected");
+                                let mut clients = self.clients.write();
+                                clients.insert(connection, api_connection);
+                            } else {
+                                info!(?remote_addr, "Client connection cancelled");
+                            }
                         },
                         Err(_) => {
                             warn!(?remote_addr, "Failed to accept client");
@@ -363,10 +336,7 @@ impl<'gu> GnsServer<'gu> {
                     let mut clients = self.clients.write();
                     let (_, api_connection) = clients.remove_by_left(&connection).unwrap();
                     socket.close_connection(connection, 0, "", false);
-                    self.api.event_bus().fire(ServerNetworkingDisconnectEvent::new(
-                        api_connection,
-                        DisconnectReason::ClosedByPeer,
-                    ));
+                    self.api.disconnect(api_connection, DisconnectReason::ClosedByPeer);
                 }
 
                 (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
@@ -376,10 +346,7 @@ impl<'gu> GnsServer<'gu> {
                     let mut clients = self.clients.write();
                     let (_, api_connection) = clients.remove_by_left(&connection).unwrap();
                     socket.close_connection(connection, 0, "", false);
-                    self.api.event_bus().fire(ServerNetworkingDisconnectEvent::new(
-                        api_connection,
-                        DisconnectReason::Unexpected,
-                    ));
+                    self.api.disconnect(api_connection, DisconnectReason::Unexpected);
                 }
 
                 // A client state is changing
@@ -441,53 +408,22 @@ impl<'gu> GnsServer<'gu> {
             }
         }
 
+        for api_connection in connections_to_close {
+            let mut clients = self.clients.write();
+            if let Some((connection, _)) = clients.remove_by_right(&api_connection) {
+                info!(?api_connection, "Closing connection");
+                socket.close_connection(connection, 0, "", false);
+                self.api.disconnect(api_connection, DisconnectReason::ClosedLocally);
+            }
+        }
+
         true
     }
 }
 
 struct GnsServerHandle {
-    msg_send: ump::Client<ServerMessage, (), ServerNetworkingError>,
+    msg_send: ump::Client<ServerMessage, (), NetworkingError>,
     clients: Arc<RwLock<ClientsMap>>,
-}
-
-#[async_trait]
-impl RawServer for GnsServerHandle {
-    fn send(
-        &self,
-        connection: Connection,
-        msg: Vec<u8>,
-        flags: FlagSet<MessageFlags>,
-    ) -> Result<(), ServerNetworkingError> {
-        let clients = self.clients.read();
-        if clients.contains_right(&connection) {
-            self.msg_send.req_async(ServerMessage::Send { connection, msg, flags })
-                .map(|_| ())
-                .map_err(ServerNetworkingError::from)
-        } else {
-            Err(ServerNetworkingError::InvalidConnection(connection))
-        }
-    }
-
-    fn broadcast(
-        &self,
-        msg: Vec<u8>,
-        flags: FlagSet<MessageFlags>,
-    ) -> Result<(), ServerNetworkingError> {
-        self.msg_send.req_async(ServerMessage::Broadcast { msg, flags })
-            .map(|_| ())
-            .map_err(ServerNetworkingError::from)
-    }
-
-    #[inline]
-    async fn close(&self) {
-        let result = self.msg_send.areq(ServerMessage::Close).await
-            .map_err(ServerNetworkingError::from);
-        match result {
-            Ok(_) | Err(ServerNetworkingError::Closed) => {},
-            result => result
-                .expect("Closing a server should not error"),
-        }
-    }
 }
 
 static SUBSYSTEM: LazyLock<Arc<GnsSubsystem>> = LazyLock::new(|| {
@@ -498,9 +434,10 @@ static SUBSYSTEM: LazyLock<Arc<GnsSubsystem>> = LazyLock::new(|| {
 #[derive(Educe)]
 #[educe(Debug)]
 struct CreateClientReq {
+    connection: Connection,
     socket_addr: SocketAddr,
     #[educe(Debug(ignore))]
-    api: Arc<dyn RawClientApi>,
+    api: Arc<NetworkingApi>,
 }
 
 #[derive(Educe)]
@@ -508,7 +445,7 @@ struct CreateClientReq {
 struct CreateServerReq {
     socket_addr: SocketAddr,
     #[educe(Debug(ignore))]
-    api: Arc<dyn RawServerApi>,
+    api: Arc<NetworkingApi>,
 }
 
 #[self_referencing]
@@ -521,21 +458,21 @@ struct SubsystemData {
     #[borrows(gns_global, gns_utils)]
     #[not_covariant]
     servers: Vec<GnsServer<'this>>,
-    msg_create_client_recv: ump::Server<CreateClientReq, Arc<dyn RawClient>, ClientNetworkingError>,
-    msg_create_server_recv: ump::Server<CreateServerReq, Arc<dyn RawServer>, ServerNetworkingError>,
+    msg_create_client_recv: ump::Server<CreateClientReq, GnsClientHandle, NetworkingError>,
+    msg_create_server_recv: ump::Server<CreateServerReq, GnsServerHandle, NetworkingError>,
 }
 
 /// Handle for the GNS subsystem.
 ///
 /// This handle can be used to interact with the internally running GNS thread. This handle also
-/// implements both [RawClientFactory] and [RawServerFactory] for Arcs.
+/// implements [NetDriverFactory] for both [GnsClientDriver] and [GnsServerDriver] for Arcs.
 ///
 /// For users, you probably want [GnsSubsystem::get()], which retrieves a reference to this handle.
 pub struct GnsSubsystem {
     #[allow(unused)]
     tick_loop: TickLoopHandle,
-    msg_create_client_send: ump::Client<CreateClientReq, Arc<dyn RawClient>, ClientNetworkingError>,
-    msg_create_server_send: ump::Client<CreateServerReq, Arc<dyn RawServer>, ServerNetworkingError>,
+    msg_create_client_send: ump::Client<CreateClientReq, GnsClientHandle, NetworkingError>,
+    msg_create_server_send: ump::Client<CreateServerReq, GnsServerHandle, NetworkingError>,
 }
 
 impl GnsSubsystem {
@@ -547,6 +484,7 @@ impl GnsSubsystem {
                     data.gns_global,
                     data.gns_utils,
                     req.api,
+                    req.connection,
                     req.socket_addr,
                 ) {
                     Ok((client, client_handle)) => {
@@ -637,34 +575,30 @@ impl GnsSubsystem {
     pub fn get() -> Arc<Self> {
         SUBSYSTEM.clone()
     }
-}
 
-#[async_trait]
-impl RawClientFactory for Arc<GnsSubsystem> {
-    async fn connect(
+    async fn connect_client(
         &self,
-        api: Arc<dyn RawClientApi>,
+        api: Arc<NetworkingApi>,
+        connection: Connection,
         socket_addr: SocketAddr,
-    ) -> Result<Arc<dyn RawClient>, ClientNetworkingError> {
+    ) -> Result<GnsClientHandle, NetworkingError> {
         let req = CreateClientReq {
+            connection,
             socket_addr,
             api,
         };
         self.msg_create_client_send.areq(req).await
             .map_err(|err| match err {
                 ump::Error::App(err) => err,
-                _ => ClientNetworkingError::internal_error("No response from subsystem"),
+                _ => NetworkingError::internal_error("No response from subsystem"),
             })
     }
-}
 
-#[async_trait]
-impl RawServerFactory for Arc<GnsSubsystem> {
-    async fn listen(
+    async fn listen_server(
         &self,
-        api: Arc<dyn RawServerApi>,
+        api: Arc<NetworkingApi>,
         socket_addr: SocketAddr,
-    ) -> Result<Arc<dyn RawServer>, ServerNetworkingError> {
+    ) -> Result<GnsServerHandle, NetworkingError> {
         let req = CreateServerReq {
             socket_addr,
             api,
@@ -672,7 +606,174 @@ impl RawServerFactory for Arc<GnsSubsystem> {
         self.msg_create_server_send.areq(req).await
             .map_err(|err| match err {
                 ump::Error::App(err) => err,
-                _ => ServerNetworkingError::internal_error("No response from subsystem"),
+                _ => NetworkingError::internal_error("No response from subsystem"),
             })
+    }
+}
+
+/// Client-side [GNS](https://github.com/ValveSoftware/GameNetworkingSockets)-based [NetDriver].
+///
+/// Connects to a single endpoint to send messages. Connecting to a different endpoint will close
+/// the existing connection.
+///
+/// Created using the [factory](NetDriverFactory) implementation on [GnsSubsystem].
+pub struct GnsClientDriver {
+    subsystem: Arc<GnsSubsystem>,
+    api: Arc<NetworkingApi>,
+    handle: smol::lock::RwLock<Option<GnsClientHandle>>,
+}
+
+#[async_trait]
+impl NetDriver for GnsClientDriver {
+    async fn close(&self) {
+        if let Some(handle) = self.handle.write().await.take() {
+            let result = handle.0.areq(ClientMessage::Close).await
+                .map_err(NetworkingError::from);
+            match result {
+                Ok(_) | Err(NetworkingError::Closed) => {},
+                result => result
+                    .expect("Closing a client should not error"),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl NetDriverConnect for GnsClientDriver {
+    async fn connect(
+        &self,
+        connection: Connection,
+        socket_addr: SocketAddr,
+    ) -> Result<(), NetworkingError> {
+        self.close().await;
+        let handle = self.subsystem.connect_client(
+            self.api.clone(),
+            connection,
+            socket_addr,
+        ).await?;
+        *self.handle.write().await = Some(handle);
+        Ok(())
+    }
+}
+
+impl NetDriverSend for GnsClientDriver {
+    fn send(&self, msg: Vec<u8>, flags: FlagSet<MessageFlags>) -> Result<(), NetworkingError> {
+        if let Some(handle) = &*self.handle.read_blocking() {
+            handle.0.req_async(ClientMessage::Send { msg, flags })
+                // We're firing and forgetting, so we don't care about the WaitReply<>
+                .map(|_| ())
+                .map_err(NetworkingError::from)
+        } else {
+            Err(NetworkingError::Closed)
+        }
+    }
+}
+
+impl NetDriverFactory<GnsClientDriver> for Arc<GnsSubsystem> {
+    fn create(&self, api: Arc<NetworkingApi>) -> Arc<GnsClientDriver> {
+        Arc::new(GnsClientDriver {
+            subsystem: self.clone(),
+            api,
+            handle: smol::lock::RwLock::new(None),
+        })
+    }
+}
+
+/// Server-side [GNS](https://github.com/ValveSoftware/GameNetworkingSockets)-based [NetDriver].
+///
+/// Listens on a socket and accepts many connections.
+///
+/// Created using the [factory](NetDriverFactory) implementation on [GnsSubsystem].
+pub struct GnsServerDriver {
+    subsystem: Arc<GnsSubsystem>,
+    api: Arc<NetworkingApi>,
+    handle: smol::lock::RwLock<Option<GnsServerHandle>>,
+}
+
+#[async_trait]
+impl NetDriver for GnsServerDriver {
+    async fn close(&self) {
+        if let Some(handle) = self.handle.write().await.take() {
+            let result = handle.msg_send.areq(ServerMessage::Close).await
+                .map_err(NetworkingError::from);
+            match result {
+                Ok(_) | Err(NetworkingError::Closed) => {},
+                result => result
+                    .expect("Closing a server should not error"),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl NetDriverCloseConnection for GnsServerDriver {
+    async fn close_connection(&self, connection: Connection) {
+        if let Some(handle) = &*self.handle.read().await {
+            let result = handle.msg_send.areq(ServerMessage::CloseConnection { connection }).await
+                .map_err(NetworkingError::from);
+            match result {
+                Ok(_) | Err(NetworkingError::Closed) => {},
+                result => result
+                    .expect("Closing a connection should not error"),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl NetDriverListen for GnsServerDriver {
+    async fn listen(&self, socket_addr: SocketAddr) -> Result<(), NetworkingError> {
+        self.close().await;
+        let handle = self.subsystem.listen_server(self.api.clone(), socket_addr).await?;
+        *self.handle.write().await = Some(handle);
+        Ok(())
+    }
+}
+
+impl NetDriverSendTo for GnsServerDriver {
+    fn send_to(
+        &self,
+        connection: Connection,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), NetworkingError> {
+        if let Some(handle) = &*self.handle.read_blocking() {
+            let clients = handle.clients.read();
+            if clients.contains_right(&connection) {
+                handle.msg_send.req_async(ServerMessage::Send { connection, msg, flags })
+                    .map(|_| ())
+                    .map_err(NetworkingError::from)
+            } else {
+                Err(NetworkingError::InvalidConnection(connection))
+            }
+        } else {
+            Err(NetworkingError::Closed)
+        }
+    }
+}
+
+impl NetDriverBroadcast for GnsServerDriver {
+    fn broadcast(
+        &self,
+        msg: Vec<u8>,
+        flags: FlagSet<MessageFlags>,
+    ) -> Result<(), NetworkingError> {
+        if let Some(handle) = &*self.handle.read_blocking() {
+            handle.msg_send.req_async(ServerMessage::Broadcast { msg, flags })
+                .map(|_| ())
+                .map_err(NetworkingError::from)
+        } else {
+            Err(NetworkingError::Closed)
+        }
+    }
+}
+
+impl NetDriverFactory<GnsServerDriver> for Arc<GnsSubsystem> {
+    fn create(&self, api: Arc<NetworkingApi>) -> Arc<GnsServerDriver> {
+        Arc::new(GnsServerDriver {
+            subsystem: self.clone(),
+            api,
+            handle: smol::lock::RwLock::new(None),
+        })
     }
 }

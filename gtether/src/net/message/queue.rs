@@ -4,9 +4,8 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use crate::net::message::{Message, MessageBody};
-use crate::net::message::client::ClientMessageHandler;
-use crate::net::message::server::ServerMessageHandler;
-use crate::net::server::Connection;
+use crate::net::message::MessageHandler;
+use crate::net::Connection;
 
 /// Error that occurs when the [MessageQueue] is full.
 #[derive(Debug)]
@@ -29,20 +28,19 @@ impl Error for MessageQueueFull {}
 ///
 /// # Message Handling
 ///
-/// [ClientMessageHandler] is implemented on `Arc<MessageQueue<Message<M>>>`, and
-/// [ServerMessageHandler] is implemented on `Arc<MessageQueue<(Connection, Message<M>)>>`. This
+/// [MessageHandler] is implemented on `Arc<MessageQueue<(Connection, Message<M>)>>`. This
 /// means a MessageQueue reference may be used as a message handler if it uses the right generic
 /// type.
 pub struct MessageQueue<M>
 where
-    M: Send + Sync + 'static,
+    M: MessageBody + Send + Sync + 'static,
 {
-    inner: ArrayQueue<M>,
+    inner: ArrayQueue<(Connection, Message<M>)>,
 }
 
 impl<M> MessageQueue<M>
 where
-    M: Send + Sync + 'static,
+    M: MessageBody + Send + Sync + 'static,
 {
     /// Creates a new bounded queue with the given capacity.
     ///
@@ -52,9 +50,13 @@ where
     ///
     /// # Examples
     /// ```
+    /// use gtether::net::message::MessageBody;
     /// use gtether::net::message::queue::MessageQueue;
     ///
-    /// let q = MessageQueue::<()>::new(100);
+    /// #[derive(MessageBody)]
+    /// struct MyMessage;
+    ///
+    /// let q = MessageQueue::<MyMessage>::new(100);
     /// ```
     #[inline]
     pub fn new(cap: usize) -> Arc<Self> {
@@ -69,28 +71,27 @@ where
     ///
     /// # Examples
     /// ```
+    /// # use gtether::net::Connection;
     /// # use gtether::net::message::queue::MessageQueueFull;
-    /// use gtether::net::message::client::ClientMessageHandler;
     /// use gtether::net::message::queue::MessageQueue;
-    /// use gtether::net::message::{Message, MessageBody};
+    /// use gtether::net::message::{Message, MessageBody, MessageHandler};
+    /// #
+    /// # let connection = Connection::INVALID;
     ///
-    /// #[derive(Debug, PartialEq, Eq)]
+    /// #[derive(Debug, PartialEq, Eq, MessageBody)]
     /// struct MyMessage(u64);
-    /// impl MessageBody for MyMessage {
-    ///     const KEY: &'static str = "my-message";
-    /// }
     ///
     /// let q = MessageQueue::new(100);
-    /// q.handle(Message::new(MyMessage(42)))?;
+    /// q.handle(connection, Message::new(MyMessage(42)))?;
     ///
-    /// assert_eq!(q.pop(), Some(Message::new(MyMessage(42))));
+    /// assert_eq!(q.pop(), Some((connection, Message::new(MyMessage(42)))));
     /// assert_eq!(q.pop(), None);
     /// #
     /// # Ok::<_, MessageQueueFull>(())
     /// ```
     ///
     #[inline]
-    pub fn pop(&self) -> Option<M> {
+    pub fn pop(&self) -> Option<(Connection, Message<M>)> {
         self.inner.pop()
     }
 
@@ -98,9 +99,13 @@ where
     ///
     /// # Examples
     /// ```
+    /// use gtether::net::message::MessageBody;
     /// use gtether::net::message::queue::MessageQueue;
     ///
-    /// let q = MessageQueue::<()>::new(100);
+    /// #[derive(MessageBody)]
+    /// struct MyMessage;
+    ///
+    /// let q = MessageQueue::<MyMessage>::new(100);
     /// assert_eq!(q.capacity(), 100);
     /// ```
     #[inline]
@@ -112,21 +117,20 @@ where
     ///
     /// # Examples
     /// ```
+    /// # use gtether::net::Connection;
     /// # use gtether::net::message::queue::MessageQueueFull;
-    /// use gtether::net::message::client::ClientMessageHandler;
     /// use gtether::net::message::queue::MessageQueue;
-    /// use gtether::net::message::{Message, MessageBody};
+    /// use gtether::net::message::{Message, MessageBody, MessageHandler};
+    /// #
+    /// # let connection = Connection::INVALID;
     ///
-    /// #[derive(Debug, PartialEq, Eq)]
+    /// #[derive(Debug, PartialEq, Eq, MessageBody)]
     /// struct MyMessage(u64);
-    /// impl MessageBody for MyMessage {
-    ///     const KEY: &'static str = "my-message";
-    /// }
     ///
     /// let q = MessageQueue::new(100);
     ///
     /// assert!(q.is_empty());
-    /// q.handle(Message::new(MyMessage(42)))?;
+    /// q.handle(connection, Message::new(MyMessage(42)))?;
     /// assert!(!q.is_empty());
     /// #
     /// # Ok::<_, MessageQueueFull>(())
@@ -140,21 +144,20 @@ where
     ///
     /// # Examples
     /// ```
+    /// # use gtether::net::Connection;
     /// # use gtether::net::message::queue::MessageQueueFull;
-    /// use gtether::net::message::client::ClientMessageHandler;
     /// use gtether::net::message::queue::MessageQueue;
-    /// use gtether::net::message::{Message, MessageBody};
+    /// use gtether::net::message::{Message, MessageBody, MessageHandler};
+    /// #
+    /// # let connection = Connection::INVALID;
     ///
-    /// #[derive(Debug, PartialEq, Eq)]
+    /// #[derive(Debug, PartialEq, Eq, MessageBody)]
     /// struct MyMessage(u64);
-    /// impl MessageBody for MyMessage {
-    ///     const KEY: &'static str = "my-message";
-    /// }
     ///
     /// let q = MessageQueue::new(1);
     ///
     /// assert!(!q.is_full());
-    /// q.handle(Message::new(MyMessage(42)))?;
+    /// q.handle(connection, Message::new(MyMessage(42)))?;
     /// assert!(q.is_full());
     /// #
     /// # Ok::<_, MessageQueueFull>(())
@@ -168,24 +171,23 @@ where
     ///
     /// # Examples
     /// ```
+    /// # use gtether::net::Connection;
     /// # use gtether::net::message::queue::MessageQueueFull;
-    /// use gtether::net::message::client::ClientMessageHandler;
     /// use gtether::net::message::queue::MessageQueue;
-    /// use gtether::net::message::{Message, MessageBody};
+    /// use gtether::net::message::{Message, MessageBody, MessageHandler};
+    /// #
+    /// # let connection = Connection::INVALID;
     ///
-    /// #[derive(Debug, PartialEq, Eq)]
+    /// #[derive(Debug, PartialEq, Eq, MessageBody)]
     /// struct MyMessage(u64);
-    /// impl MessageBody for MyMessage {
-    ///     const KEY: &'static str = "my-message";
-    /// }
     ///
     /// let q = MessageQueue::new(100);
     /// assert_eq!(q.len(), 0);
     ///
-    /// q.handle(Message::new(MyMessage(1)))?;
+    /// q.handle(connection, Message::new(MyMessage(1)))?;
     /// assert_eq!(q.len(), 1);
     ///
-    /// q.handle(Message::new(MyMessage(2)))?;
+    /// q.handle(connection, Message::new(MyMessage(2)))?;
     /// assert_eq!(q.len(), 2);
     /// #
     /// # Ok::<_, MessageQueueFull>(())
@@ -202,26 +204,25 @@ where
     ///
     /// # Examples
     /// ```
+    /// # use gtether::net::Connection;
     /// # use gtether::net::message::queue::MessageQueueFull;
-    /// use gtether::net::message::client::ClientMessageHandler;
     /// use gtether::net::message::queue::MessageQueue;
-    /// use gtether::net::message::{Message, MessageBody};
+    /// use gtether::net::message::{Message, MessageBody, MessageHandler};
+    /// #
+    /// # let connection = Connection::INVALID;
     ///
-    /// #[derive(Debug, PartialEq, Eq)]
+    /// #[derive(Debug, PartialEq, Eq, MessageBody)]
     /// struct MyMessage(u64);
-    /// impl MessageBody for MyMessage {
-    ///     const KEY: &'static str = "my-message";
-    /// }
     ///
     /// let q = MessageQueue::new(100);
-    /// q.handle(Message::new(MyMessage(1)))?;
-    /// q.handle(Message::new(MyMessage(2)))?;
-    /// q.handle(Message::new(MyMessage(4)))?;
+    /// q.handle(connection, Message::new(MyMessage(1)))?;
+    /// q.handle(connection, Message::new(MyMessage(2)))?;
+    /// q.handle(connection, Message::new(MyMessage(4)))?;
     ///
     /// let mut iterator = q.iter();
-    /// assert_eq!(iterator.next(), Some(Message::new(MyMessage(1))));
-    /// assert_eq!(iterator.next(), Some(Message::new(MyMessage(2))));
-    /// assert_eq!(iterator.next(), Some(Message::new(MyMessage(4))));
+    /// assert_eq!(iterator.next(), Some((connection, Message::new(MyMessage(1)))));
+    /// assert_eq!(iterator.next(), Some((connection, Message::new(MyMessage(2)))));
+    /// assert_eq!(iterator.next(), Some((connection, Message::new(MyMessage(4)))));
     /// assert_eq!(iterator.next(), None);
     /// #
     /// # Ok::<_, MessageQueueFull>(())
@@ -232,18 +233,7 @@ where
     }
 }
 
-impl<M> ClientMessageHandler<M, MessageQueueFull> for MessageQueue<Message<M>>
-where
-    M: MessageBody + Send + Sync + 'static,
-{
-    #[inline]
-    fn handle(&self, msg: Message<M>) -> Result<(), MessageQueueFull> {
-        self.inner.push(msg)
-            .map_err(|_| MessageQueueFull {})
-    }
-}
-
-impl<M> ServerMessageHandler<M, MessageQueueFull> for MessageQueue<(Connection, Message<M>)>
+impl<M> MessageHandler<M, MessageQueueFull> for MessageQueue<M>
 where
     M: MessageBody + Send + Sync + 'static,
 {
@@ -256,9 +246,9 @@ where
 
 impl<'a, M> IntoIterator for &'a MessageQueue<M>
 where
-    M: Send + Sync + 'static,
+    M: MessageBody + Send + Sync + 'static,
 {
-    type Item = M;
+    type Item = (Connection, Message<M>);
     type IntoIter = MessageQueueIter<'a, M>;
 
     #[inline]
@@ -270,16 +260,16 @@ where
 /// Iterator for messages in [MessageQueue].
 pub struct MessageQueueIter<'a, M>
 where
-    M: Send + Sync + 'static,
+    M: MessageBody + Send + Sync + 'static,
 {
     queue: &'a MessageQueue<M>,
 }
 
 impl<'a, M> Iterator for MessageQueueIter<'a, M>
 where
-    M: Send + Sync + 'static,
+    M: MessageBody + Send + Sync + 'static,
 {
-    type Item = M;
+    type Item = (Connection, Message<M>);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {

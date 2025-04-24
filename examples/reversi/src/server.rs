@@ -1,21 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::net::{Ipv4Addr, SocketAddr};
 use async_trait::async_trait;
 use bitcode::{Decode, Encode};
 use educe::Educe;
-use gtether::net::gns::GnsSubsystem;
-use gtether::net::message::server::ServerMessageHandler;
+use gtether::net::gns::{GnsServerDriver, GnsSubsystem};
+use gtether::net::message::MessageHandler;
 use gtether::net::message::{Message, MessageBody};
-use gtether::net::server::{Connection, ServerNetworking, ServerNetworkingDisconnectEvent, ServerNetworkingError};
-use gtether::server::{Server, ServerBuildError};
+use gtether::server::Server;
 use gtether::{Application, Engine, EngineBuilder, EngineJoinHandle};
 use parking_lot::{Mutex, RwLock};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, info};
 use gtether::event::{Event, EventHandler};
-use gtether::net::NetworkingBuildError;
+use gtether::net::{Connection, Networking, NetworkingDisconnectEvent, NetworkingError};
+
 use crate::board::controller::BoardController;
 use crate::board::BoardState;
 use crate::bot::minimax::MinimaxAlgorithm;
@@ -129,13 +130,13 @@ struct PlayerManager {
     state: RwLock<PlayerManagerState>,
     board_controller: Arc<BoardController>,
     #[educe(Debug(ignore))]
-    net: Arc<ServerNetworking>,
+    net: Arc<Networking<GnsServerDriver>>,
 }
 
 impl PlayerManager {
     fn new(
         board_controller: Arc<BoardController>,
-        net: &Arc<ServerNetworking>,
+        net: &Arc<Networking<GnsServerDriver>>,
     ) -> Arc<Self> {
         let state = RwLock::new(PlayerManagerState {
             players: HashMap::new(),
@@ -190,8 +191,8 @@ impl PlayerManager {
     }
 }
 
-impl ServerMessageHandler<PlayerConnect, ServerNetworkingError> for PlayerManager {
-    fn handle(&self, connection: Connection, msg: Message<PlayerConnect>) -> Result<(), ServerNetworkingError> {
+impl MessageHandler<PlayerConnect, NetworkingError> for PlayerManager {
+    fn handle(&self, connection: Connection, msg: Message<PlayerConnect>) -> Result<(), NetworkingError> {
         let mut state = self.state.write();
         let msg_body = msg.body();
 
@@ -224,7 +225,7 @@ impl ServerMessageHandler<PlayerConnect, ServerNetworkingError> for PlayerManage
                     player_idx,
                     self.board_controller.board().clone(),
                 ));
-                self.net.send(connection, reply)?;
+                self.net.send_to(connection, reply)?;
 
                 return Ok(());
             }
@@ -238,14 +239,14 @@ impl ServerMessageHandler<PlayerConnect, ServerNetworkingError> for PlayerManage
             name,
             self.board_controller.board().clone(),
         ));
-        self.net.send(connection, reply)?;
+        self.net.send_to(connection, reply)?;
 
         Ok(())
     }
 }
 
-impl EventHandler<ServerNetworkingDisconnectEvent> for PlayerManager {
-    fn handle_event(&self, event: &mut Event<ServerNetworkingDisconnectEvent>) {
+impl EventHandler<NetworkingDisconnectEvent> for PlayerManager {
+    fn handle_event(&self, event: &mut Event<NetworkingDisconnectEvent>) {
         let mut state = self.state.write();
 
         if let Some(remote_player) = state.players.remove(&event.connection()) {
@@ -284,7 +285,15 @@ impl ReversiServer {
 
 #[async_trait(?Send)]
 impl Application<Server> for ReversiServer {
+    type NetworkingDriver = GnsServerDriver;
+
     async fn init(&self, engine: &Arc<Engine<Self, Server>>) {
+        // TODO: Add error propagation from init()?
+        engine.net().listen(SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            REVERSI_PORT,
+        )).await.expect("socket should be bindable");
+
         let board_state = BoardState::new(
             glm::vec2(8, 8),
         );
@@ -303,12 +312,12 @@ impl Application<Server> for ReversiServer {
                     MinimaxAlgorithm::new(5),
                 )),
             ],
-            engine.side().net(),
+            engine.net(),
         );
 
         let player_manager = PlayerManager::new(
             board_controller.clone(),
-            engine.side().net(),
+            engine.net(),
         );
 
         self.board_controller.set(board_controller)
@@ -344,18 +353,9 @@ impl Error for ServerStartError {
     }
 }
 
-impl From<NetworkingBuildError> for ServerStartError {
+impl From<NetworkingError> for ServerStartError {
     #[inline]
-    fn from(value: NetworkingBuildError) -> Self {
-        Self {
-            source: Some(Box::new(value)),
-        }
-    }
-}
-
-impl From<ServerBuildError> for ServerStartError {
-    #[inline]
-    fn from(value: ServerBuildError) -> Self {
+    fn from(value: NetworkingError) -> Self {
         Self {
             source: Some(Box::new(value)),
         }
@@ -393,16 +393,12 @@ impl ReversiServerManager {
     ) -> Result<(), ServerStartError> {
         info!("Starting server...");
         let app = ReversiServer::new();
-        let networking = ServerNetworking::builder()
-            .raw_factory(GnsSubsystem::get())
-            .port(REVERSI_PORT)
-            .build()?;
         let side = Server::builder()
-            .networking(networking)
-            .build()?;
+            .build();
         let join_handle = EngineBuilder::new()
             .app(app)
             .side(side)
+            .networking_driver(GnsSubsystem::get())
             .spawn();
         *inner = Some(join_handle);
         info!("Server started.");

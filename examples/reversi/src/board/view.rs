@@ -1,9 +1,10 @@
 use bitcode::{Decode, Encode};
 use gtether::client::gui::input::{ElementState, InputDelegate, InputDelegateEvent, InputDelegateJoinHandle, MouseButton};
 use gtether::event::{Event, EventHandler};
-use gtether::net::client::ClientNetworking;
-use gtether::net::message::client::ClientMessageHandler;
+use gtether::net::gns::GnsClientDriver;
+use gtether::net::message::MessageHandler;
 use gtether::net::message::{Message, MessageBody};
+use gtether::net::{Connection, Networking};
 use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::font::compositor::FontCompositor;
 use gtether::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
@@ -134,7 +135,7 @@ impl BoardView {
     pub fn new(
         board: BoardState,
         input: InputDelegate,
-        net: Arc<ClientNetworking>,
+        net: Arc<Networking<GnsClientDriver>>,
         local_players: HashSet<usize>,
         transform: Arc<Uniform<MN, ModelTransform>>,
         camera: Arc<Uniform<VP, Camera>>,
@@ -271,8 +272,8 @@ impl Drop for BoardView {
     }
 }
 
-impl ClientMessageHandler<MessageUpdateBoard, Infallible> for BoardView {
-    fn handle(&self, msg: Message<MessageUpdateBoard>) -> Result<(), Infallible> {
+impl MessageHandler<MessageUpdateBoard, Infallible> for BoardView {
+    fn handle(&self, _connection: Connection, msg: Message<MessageUpdateBoard>) -> Result<(), Infallible> {
         let mut state = self.state.write();
 
         let board = msg.into_body().into_board_state();

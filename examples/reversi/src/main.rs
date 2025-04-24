@@ -4,7 +4,6 @@ extern crate nalgebra_glm as glm;
 
 use gtether::client::Client;
 use gtether::console::log::ConsoleLogLayer;
-use gtether::net::client::ClientNetworking;
 use gtether::net::gns::GnsSubsystem;
 use gtether::resource::manager::ResourceManager;
 use gtether::resource::source::constant::ConstantResourceSource;
@@ -45,18 +44,14 @@ fn main() {
             .build())
         .build();
 
-    let client_networking = ClientNetworking::builder()
-        .raw_factory(GnsSubsystem::get())
-        .build().unwrap();
-
     EngineBuilder::new()
         .app(app)
         .side(Client::builder()
             .application_name("gTether Example - reversi")
-            .networking(client_networking)
             .enable_gui()
-            .build().unwrap())
+            .build())
         .resources(resources)
+        .networking_driver(GnsSubsystem::get())
         .build()
         .start();
 }

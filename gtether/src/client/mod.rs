@@ -11,13 +11,9 @@
 //! for more.
 
 use smol::future;
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-use crate::net::client::{ClientNetworking, ClosedClientFactory};
+
 use crate::util::tick_loop::TickLoopBuilder;
 use crate::{Application, EngineStage, EngineState, Side};
-use crate::net::NetworkingBuildError;
 
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -29,41 +25,41 @@ pub mod gui;
 ///
 /// # Examples
 /// ```
-/// # use std::sync::Arc;
-/// # use std::time::Duration;
-/// # use async_trait::async_trait;
-/// # use gtether::client::ClientBuildError;
+/// use std::sync::Arc;
+/// use std::time::Duration;
+/// use async_trait::async_trait;
 /// use gtether::client::Client;
 /// use gtether::Engine;
-/// # use gtether::Application;
-/// #
-/// # struct MyApp {}
-/// #
-/// # #[async_trait(?Send)]
-/// # impl Application<Client> for MyApp {
-/// #     // Implement relevant functions...
-/// #     async fn init(&self, engine: &Arc<Engine<Self, Client>>) {}
-/// #     fn tick(&self, engine: &Arc<Engine<Self, Client>>, delta: Duration) {}
-/// # }
-/// #
-/// # let app = MyApp {};
+/// use gtether::Application;
+///
+/// use gtether::net::gns::{GnsClientDriver, GnsSubsystem};
+///
+/// struct MyApp {}
+///
+/// #[async_trait(?Send)]
+/// impl Application<Client> for MyApp {
+///     type NetworkingDriver = GnsClientDriver;
+///
+///     async fn init(&self, engine: &Arc<Engine<Self, Client>>) { todo!() }
+///     fn tick(&self, engine: &Arc<Engine<Self, Client>>, delta: Duration) { todo!() }
+/// }
+///
+/// let app = MyApp {};
 ///
 /// // 60 ticks per second
 /// let side = Client::builder()
 ///     .tick_rate(60)
-///     .build()?;
+///     .build();
 ///
 /// let engine = Engine::builder()
 ///     .app(app)
 ///     .side(side)
+///     .networking_driver(GnsSubsystem::get())
 ///     .build();
-/// #
-/// # Ok::<(), ClientBuildError>(())
 /// ```
 pub struct Client {
     application_name: String,
     tick_rate: usize,
-    net: Arc<ClientNetworking>,
 }
 
 impl Client {
@@ -79,12 +75,6 @@ impl Client {
     #[inline]
     pub fn application_name(&self) -> &str {
         &self.application_name
-    }
-
-    /// Reference to the client's [ClientNetworking] instance.
-    #[inline]
-    pub fn net(&self) -> &Arc<ClientNetworking> {
-        &self.net
     }
 }
 
@@ -115,77 +105,21 @@ impl Side for Client {
     }
 }
 
-/// Errors that can occur while building a [Client].
-#[derive(Debug)]
-pub enum ClientBuildError {
-    /// There was an error while initializing the [ClientNetworking] instance.
-    Networking(NetworkingBuildError),
-}
-
-impl Display for ClientBuildError {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Networking(err) => Display::fmt(err, f),
-        }
-    }
-}
-
-impl Error for ClientBuildError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Networking(err) => Some(err),
-        }
-    }
-}
-
-impl From<NetworkingBuildError> for ClientBuildError {
-    #[inline]
-    fn from(value: NetworkingBuildError) -> Self {
-        Self::Networking(value)
-    }
-}
-
 /// Builder pattern for [Client].
 ///
 /// # Examples
 /// ```
-/// use std::sync::Arc;
-/// # use std::time::Duration;
-/// use async_trait::async_trait;
 /// use gtether::client::Client;
-/// # use gtether::client::ClientBuildError;
-/// use gtether::{Application, Engine};
-/// #
-/// # struct MyApp {}
-///
-/// #[async_trait(?Send)]
-/// impl Application<Client> for MyApp {
-///     // Implement relevant functions...
-/// #     async fn init(&self, engine: &Arc<Engine<Self, Client>>) {}
-/// #     fn tick(&self, engine: &Arc<Engine<Self, Client>>, delta: Duration) {}
-/// }
-///
-/// let app = MyApp {};
 ///
 /// // 60 ticks per second
 /// let side = Client::builder()
 ///     .application_name("MyApplication")
 ///     .tick_rate(60)
-///     .build()?;
-///
-/// let engine = Engine::builder()
-///     .app(app)
-///     .side(side)
 ///     .build();
-/// #
-/// # Ok::<(), ClientBuildError>(())
 /// ```
 pub struct ClientBuilder {
     application_name: Option<String>,
     tick_rate: Option<usize>,
-    networking: Option<Arc<ClientNetworking>>,
 }
 
 impl ClientBuilder {
@@ -197,7 +131,6 @@ impl ClientBuilder {
         Self {
             application_name: None,
             tick_rate: None,
-            networking: None,
         }
     }
 
@@ -223,34 +156,17 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the networking stack for client-side networking.
-    ///
-    /// Default is [ClosedClientFactory], which effectively represents no networking.
-    #[inline]
-    pub fn networking(mut self, networking: Arc<ClientNetworking>) -> Self {
-        self.networking = Some(networking);
-        self
-    }
-
     /// Build a new [Client].
-    pub fn build(self) -> Result<Client, ClientBuildError> {
+    pub fn build(self) -> Client {
         let application_name = self.application_name
             .unwrap_or("client".to_owned());
         let tick_rate = self.tick_rate
             .unwrap_or(60);
-        let net = self.networking
-            .map(Ok)
-            .unwrap_or_else(|| {
-                ClientNetworking::builder()
-                    .raw_factory(ClosedClientFactory::new())
-                    .build()
-            })?;
 
-        Ok(Client {
+        Client {
             application_name,
             tick_rate,
-            net,
-        })
+        }
     }
 
     /// Enable a GUI.

@@ -9,21 +9,22 @@
 //!
 //! To get started with a client-side GUI, see [ClientGui], or for a starting example:
 //! ```no_run
-//! # use std::sync::Arc;
-//! # use std::time::Duration;
+//! use std::sync::Arc;
+//! use std::time::Duration;
 //! use async_trait::async_trait;
-//! # use gtether::client::ClientBuildError;
 //! use gtether::client::Client;
 //! use gtether::client::gui::ClientGui;
 //! use gtether::{Application, Engine};
+//! use gtether::net::driver::NoNetDriver;
 //!
 //! struct StartingGuiApp {}
 //!
 //! #[async_trait(?Send)]
 //! impl Application<ClientGui> for StartingGuiApp {
-//!     // Implement relevant functions...
-//! #     async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {}
-//! #     fn tick(&self, engine: &Arc<Engine<Self, ClientGui>>, delta: Duration) {}
+//!     type NetworkingDriver = NoNetDriver;
+//!
+//!     async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) { todo!() }
+//!     fn tick(&self, engine: &Arc<Engine<Self, ClientGui>>, delta: Duration) { todo!() }
 //! }
 //!
 //! let app = StartingGuiApp {};
@@ -33,15 +34,14 @@
 //!     // 60 ticks per second
 //!     .tick_rate(60)
 //!     .enable_gui()
-//!     .build()?;
+//!     .build();
 //!
 //! Engine::builder()
 //!     .app(app)
 //!     .side(side)
+//!     .networking_driver(NoNetDriver::new())
 //!     .build()
 //!     .start();
-//! #
-//! # Ok::<(), ClientBuildError>(())
 //! ```
 
 use std::sync::Arc;
@@ -59,9 +59,8 @@ use winit::window::WindowId;
 use window::WindowManager;
 
 use crate::{Application, EngineStage, EngineState, Side};
-use crate::client::{Client, ClientBuildError, ClientBuilder};
+use crate::client::{Client, ClientBuilder};
 use crate::client::gui::window::{CreateWindowInfo, WindowHandle};
-use crate::net::client::ClientNetworking;
 use crate::render::Instance;
 
 pub mod window;
@@ -208,12 +207,6 @@ impl ClientGui {
     pub fn application_name(&self) -> &str {
         &self.inner.application_name
     }
-
-    /// Reference to the client's [ClientNetworking] instance.
-    #[inline]
-    pub fn net(&self) -> &Arc<ClientNetworking> {
-        &self.inner.net
-    }
 }
 
 impl Side for ClientGui {
@@ -276,37 +269,12 @@ impl Side for ClientGui {
 ///
 /// # Examples
 /// ```no_run
-/// # use std::sync::Arc;
-/// # use std::time::Duration;
-/// # use async_trait::async_trait;
-/// # use gtether::client::ClientBuildError;
 /// use gtether::client::Client;
-/// # use gtether::client::gui::ClientGui;
-/// use gtether::Engine;
-/// # use gtether::Application;
-/// #
-/// # struct MyApp {}
-/// #
-/// # #[async_trait(?Send)]
-/// # impl Application<ClientGui> for MyApp {
-/// #     // Implement relevant functions...
-/// #     async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {}
-/// #     fn tick(&self, engine: &Arc<Engine<Self, ClientGui>>, delta: Duration) {}
-/// # }
-/// #
-/// # let app = MyApp {};
 ///
 /// let side = Client::builder()
 ///     .application_name("StartingApplication")
 ///     .enable_gui()
-///     .build()?;
-///
-/// let engine = Engine::builder()
-///     .app(app)
-///     .side(side)
 ///     .build();
-/// #
-/// # Ok::<(), ClientBuildError>(())
 /// ```
 pub struct ClientGuiBuilder {
     client_builder: ClientBuilder,
@@ -337,11 +305,11 @@ impl ClientGuiBuilder {
 
     /// Build a new [ClientGui].
     #[inline]
-    pub fn build(self) -> Result<ClientGui, ClientBuildError> {
-        let client = self.client_builder.build()?;
-        Ok(ClientGui::new(
+    pub fn build(self) -> ClientGui {
+        let client = self.client_builder.build();
+        ClientGui::new(
             client,
             self.render_extensions,
-        ))
+        )
     }
 }

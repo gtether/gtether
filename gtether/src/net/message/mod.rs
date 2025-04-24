@@ -22,17 +22,9 @@
 //!
 //! # Handling messages
 //!
-//! Depending on whether the message is being handled from the client-side or the server-side, there
-//! are two different handlers:
-//!  * [ClientMessageHandler](client::ClientMessageHandler)
-//!  * [ServerMessageHandler](server::ServerMessageHandler)
-//!
-//! See individual documentation for more details, but the gist is that the server handler has an
-//! extra parameter for [Connections](super::server::Connection).
-//!
-//! Regardless of the specific handler, it can be registered with its matching networking stack via:
-//!  * [ClientNetworking::insert_msg_handler()](super::client::ClientNetworking::insert_msg_handler)
-//!  * [ServerNetworking::insert_msg_handler()](super::server::ServerNetworking::insert_msg_handler)
+//! Messages are handled on receipt by user-implemented [MessageHandlers](MessageHandler). These
+//! handlers are registered with the [Networking](super::Networking) stack via
+//! [Networking::insert_msg_handler()](super::Networking::insert_msg_handler).
 //!
 //! When handling a message, the handler may execute on the networking stack's own thread, so care
 //! should be taken to avoid expensive computation directly in the handler. Instead, such
@@ -44,69 +36,50 @@ use flagset::{flags, FlagSet};
 use parking_lot::{Condvar, Mutex};
 use std::convert::Infallible;
 use std::error::Error;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::Debug;
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
-pub mod client;
+use crate::net::{Connection, NetworkingError};
+
 pub(super) mod dispatch;
 pub mod queue;
-pub mod server;
 
 #[cfg(feature = "derive")]
 pub use gtether_derive::MessageBody;
 
 /// Error that can occur when encoding messages.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("Could not serialize message data; {details}")]
 pub struct MessageEncodeError {
-    /// Details why the message could not be encoded.
     details: String,
-    /// Optional source error.
+    #[source]
     source: Box<dyn Error + Send + Sync>,
 }
 
-impl Display for MessageEncodeError {
+impl From<MessageEncodeError> for NetworkingError {
     #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Could not serialize message data; {}", self.details)
-    }
-}
-
-impl Error for MessageEncodeError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.deref())
+    fn from(value: MessageEncodeError) -> Self {
+        Self::MalformedMessage(Box::new(value))
     }
 }
 
 /// Error that can occur when decoding messages.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("Could not deserialize message data; {details}")]
 pub struct MessageDecodeError {
-    /// Details why the message could not be decoded.
     details: String,
-    /// Optional source error.
+    #[source]
     source: Option<Box<dyn Error + Send + Sync>>,
 }
 
-impl Display for MessageDecodeError {
+impl From<MessageDecodeError> for NetworkingError {
     #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Could not deserialize message data; {}", self.details)
-    }
-}
-
-impl Error for MessageDecodeError {
-    #[inline]
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        if let Some(source) = &self.source {
-            Some(source.deref())
-        } else {
-            None
-        }
+    fn from(value: MessageDecodeError) -> Self {
+        Self::MalformedMessage(Box::new(value))
     }
 }
 
@@ -536,49 +509,103 @@ impl<M: MessageRecv> Future for MessageReplyFuture<M> {
 
 
 /// Errors that can occur when dispatching messages.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MessageDispatchError {
-    /// A message could not be parsed from the raw byte data.
-    DecodeError(MessageDecodeError),
-
-    /// There was no handler registered with the given `key`.
+    #[error(transparent)]
+    DecodeError(#[from] MessageDecodeError),
+    #[error("No handler was identified for key: '{key}'")]
     NoHandler {
         /// `key` that is missing a handler.
         key: String,
     },
-
-    /// The message handler failed to dispatch the message.
-    DispatchFailed(Box<dyn Error + Send + Sync>),
+    #[error("Could not dispatch message: {0}")]
+    DispatchFailed(#[source] Box<dyn Error + Send + Sync>),
 }
 
-impl Display for MessageDispatchError {
+/// Interface for handling received messages.
+///
+/// Handles a single [Message], and optionally returns an error. The [Connection] that the message
+/// was sent from is also given, to distinguish which connection it came from in networking stacks
+/// that have multiple connections.
+///
+/// Message handlers may be executed from networking [driver](super::driver::NetDriver) internal
+/// threads. Because of this, any work done in the handler should be light, as it has the potential
+/// to block further networking processing. If heavy work needs to be done, it should be delegated
+/// to a separate thread. For example, a [MessageQueue](queue::MessageQueue) can be used to put all
+/// messages in a queue, where they can be polled and processed from another thread.
+pub trait MessageHandler<M, E: Error>: Send + Sync + 'static
+where
+    M: MessageBody,
+    E: Error,
+{
+    /// Process and handle a [Message].
+    ///
+    /// The [Connection] represents which connection sent the message.
+    fn handle(
+        &self,
+        connection: Connection,
+        msg: Message<M>,
+    ) -> Result<(), E>;
+
+    /// Whether this handler is still valid.
+    ///
+    /// If it is not valid, it will be removed and no longer used to handle messages. This is
+    /// primarily used with e.g. handlers implemented for weak references. Note that MessageHandler
+    /// is automatically implemented for any `Weak<H: MessageHandler>`, where this method will
+    /// return `false` if the weak reference is no longer valid.
     #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DecodeError(error) =>
-                Display::fmt(error, f),
-            Self::NoHandler { key } =>
-                write!(f, "No handler was identified for key: '{key}'"),
-            Self::DispatchFailed(err) =>
-                write!(f, "Could not dispatch message: {err}"),
-        }
+    fn is_valid(&self) -> bool { true }
+}
+
+impl<M, E, F> MessageHandler<M, E> for F
+where
+    M: MessageBody,
+    E: Error,
+    F: (Fn(Connection, Message<M>) -> Result<(), E>) + Send + Sync + 'static,
+{
+    #[inline]
+    fn handle(
+        &self,
+        connection: Connection,
+        msg: Message<M>,
+    ) -> Result<(), E> {
+        self(connection, msg)
     }
 }
 
-impl Error for MessageDispatchError {
+impl<M, E, H> MessageHandler<M, E> for Arc<H>
+where
+    M: MessageBody,
+    E: Error,
+    H: MessageHandler<M, E>,
+{
     #[inline]
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::DecodeError(error) => error.source(),
-            Self::DispatchFailed(err) => Some(err.deref()),
-            _ => None,
-        }
+    fn handle(&self, connection: Connection, msg: Message<M>) -> Result<(), E> {
+        (**self).handle(connection, msg)
     }
 }
 
-impl From<MessageDecodeError> for MessageDispatchError {
+impl<M, E, H> MessageHandler<M, E> for Weak<H>
+where
+    M: MessageBody,
+    E: Error,
+    H: MessageHandler<M, E>,
+{
     #[inline]
-    fn from(value: MessageDecodeError) -> Self {
-        Self::DecodeError(value)
+    fn handle(&self, connection: Connection, msg: Message<M>) -> Result<(), E> {
+        if let Some(handler) = self.upgrade() {
+            handler.handle(connection, msg)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn is_valid(&self) -> bool {
+        if let Some(handler) = self.upgrade() {
+            handler.is_valid()
+        } else {
+            false
+        }
     }
 }
