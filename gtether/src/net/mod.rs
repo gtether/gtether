@@ -66,7 +66,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::event::{EventBus, EventBusRegistry, EventCancellable};
 use crate::net::driver::{
@@ -465,6 +465,8 @@ impl<D: NetDriver> Networking<D> {
     }
 
     /// Retrieve detailed [ConnectionInfo] for a particular [Connection].
+    ///
+    /// If there is no [Connection] or it has been closed, yields `None`.
     #[inline]
     pub fn connection_info(&self, connection: &Connection) -> Option<ConnectionInfo> {
         self.api.connection_infos.read().get(connection).cloned()
@@ -485,7 +487,7 @@ impl<D: NetDriver> Networking<D> {
 
     /// Convenience wrapper for a sync version of [Self::close()].
     #[inline]
-    pub fn close_sync(&self) {
+    pub fn close_blocking(&self) {
         future::block_on(self.close());
     }
 }
@@ -493,13 +495,14 @@ impl<D: NetDriver> Networking<D> {
 impl<D: NetDriver> Drop for Networking<D> {
     #[inline]
     fn drop(&mut self) {
-        self.close_sync();
+        self.close_blocking();
     }
 }
 
 // TODO: does this need to be configurable?
 const CONNECT_BUFFER_SIZE: usize = 64;
 
+#[derive(Debug)]
 struct ConnectBuffer {
     connection: Connection,
     buffer: Mutex<ArrayVec<(MessageHeader, Box<[u8]>), CONNECT_BUFFER_SIZE>>,
@@ -585,7 +588,26 @@ impl Drop for ConnectBuffer {
 /// There is a limit to how many messages can be held by the context. Currently, that limit is `64`,
 /// but is subject to change. Any messages that arrive after that buffer is full will trigger a
 /// [MessageDispatchError], and will likely be dropped.
-pub struct ClientConnectContext(#[allow(unused)] Arc<ConnectBuffer>);
+#[derive(Debug)]
+pub struct ClientConnectContext{
+    connection: Connection,
+    #[allow(unused)]
+    buffer: Arc<ConnectBuffer>,
+}
+
+impl ClientConnectContext {
+    /// The [Connection] ID for this context.
+    #[inline]
+    pub fn connection(&self) -> Connection {
+        self.connection
+    }
+
+    /// Consume this context and yield the [Connection] ID for it.
+    #[inline]
+    pub fn into_connection(self) -> Connection {
+        self.connection
+    }
+}
 
 impl<D: NetDriverConnect> Networking<D> {
     /// Attempt to connect to the remote `socket_addr`.
@@ -606,12 +628,15 @@ impl<D: NetDriverConnect> Networking<D> {
         socket_addr: SocketAddr,
     ) -> Result<ClientConnectContext, NetworkingError> {
         if let Some(connection) = self.api.try_init_connect(socket_addr.ip()) {
-            let connect_buffer = Arc::new(ConnectBuffer::new(
+            let buffer = Arc::new(ConnectBuffer::new(
                 connection,
                 self.api.msg_dispatch.clone(),
             ));
-            self.api.msg_dispatch.insert_intercept_handler(&connect_buffer);
-            let connect_ctx = ClientConnectContext(connect_buffer);
+            self.api.msg_dispatch.insert_intercept_handler(&buffer);
+            let connect_ctx = ClientConnectContext{
+                connection,
+                buffer,
+            };
             self.driver.connect(connection, socket_addr).await?;
             Ok(connect_ctx)
         } else {
@@ -674,6 +699,7 @@ impl<D: NetDriverSend> Networking<D> {
         M: MessageSend,
     {
         let mut msg = msg.into();
+        trace!(msg_key = %msg.header().key(), "Sending message");
         msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()?;
         self.driver.send(bytes, M::flags())
@@ -699,6 +725,7 @@ impl<D: NetDriverSend> Networking<D> {
         M::Reply: MessageRecv + Send + 'static,
     {
         let mut msg = msg.into();
+        trace!(msg_key = %msg.header().key(), "Sending repliable message");
         msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()?;
         let fut = self.api.msg_dispatch.register_reply(&msg);
@@ -730,6 +757,7 @@ impl<D: NetDriverSendTo> Networking<D> {
         M: MessageSend,
     {
         let mut msg = msg.into();
+        trace!(to = %connection, msg_key = %msg.header().key(), "Sending message to");
         msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()?;
         self.driver.send_to(connection, bytes, M::flags())
@@ -760,6 +788,7 @@ impl<D: NetDriverSendTo> Networking<D> {
         M::Reply: MessageRecv + Send + 'static,
     {
         let mut msg = msg.into();
+        trace!(to = %connection, msg_key = %msg.header().key(), "Sending repliable message to");
         msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()?;
         let fut = self.api.msg_dispatch.register_reply(&msg);
@@ -788,8 +817,302 @@ impl<D: NetDriverBroadcast> Networking<D> {
         M: MessageSend,
     {
         let mut msg = msg.into();
+        trace!(msg_key = %msg.header().key(), "Broadcasting message");
         msg.set_msg_num(self.api.msg_dispatch.gen_msg_num());
         let bytes = msg.encode()?;
         self.driver.broadcast(bytes, M::flags())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Weak;
+    use async_trait::async_trait;
+    use flagset::FlagSet;
+
+    use crate::net::message::MessageFlags;
+    use crate::net::driver::tests::{
+        ClientServerStackFactory,
+        test_net_driver_client_server_core,
+        test_net_driver_client_server_send,
+        test_net_driver_client_server_send_to,
+        test_net_driver_client_server_broadcast,
+    };
+
+    use super::*;
+
+    struct TestClient {
+        weak: Weak<Self>,
+        subsystem: Arc<TestSubsystem>,
+        api: Arc<NetworkingApi>,
+        server: RwLock<(Connection, Weak<TestServer>)>,
+    }
+
+    impl TestClient {
+        fn new(subsystem: Arc<TestSubsystem>, api: Arc<NetworkingApi>) -> Arc<Self> {
+            Arc::new_cyclic(|weak| Self {
+                weak: weak.clone(),
+                subsystem,
+                api,
+                server: RwLock::new((Connection::INVALID, Weak::new()))
+            })
+        }
+    }
+
+    #[async_trait]
+    impl NetDriver for TestClient {
+        async fn close(&self) {
+            let mut lock = self.server.write();
+            let (serverside_connection, ref server) = *lock;
+            if let Some(server) = server.upgrade() {
+                if let Some(clients) = &mut *server.clients.write() {
+                    if let Some((clientside_connection, _)) = clients.remove(&serverside_connection) {
+                        self.api.disconnect(clientside_connection, DisconnectReason::ClosedLocally);
+                    }
+                }
+                server.api.disconnect(serverside_connection, DisconnectReason::ClosedByPeer);
+            }
+            *lock = (Connection::INVALID, Weak::new());
+        }
+    }
+
+    #[async_trait]
+    impl NetDriverConnect for TestClient {
+        async fn connect(&self, connection: Connection, socket_addr: SocketAddr) -> Result<(), NetworkingError> {
+            self.close().await;
+            let client = self.weak.upgrade().unwrap();
+            self.subsystem.connect(connection, socket_addr, &client)
+        }
+    }
+
+    impl NetDriverSend for TestClient {
+        fn send(&self, msg: Vec<u8>, _flags: FlagSet<MessageFlags>) -> Result<(), NetworkingError> {
+            let lock = self.server.read();
+            let (connection, ref server) = *lock;
+            if let Some(server) = server.upgrade() {
+                server.api.dispatch_message(connection, &msg)
+                    .expect("Message should dispatch");
+                Ok(())
+            } else {
+                Err(NetworkingError::Closed)
+            }
+        }
+    }
+
+    struct TestServer {
+        weak: Weak<Self>,
+        id: u64,
+        subsystem: Arc<TestSubsystem>,
+        api: Arc<NetworkingApi>,
+        clients: RwLock<Option<HashMap<Connection, (Connection, Weak<TestClient>)>>>,
+    }
+
+    impl TestServer {
+        fn new(id: u64, subsystem: Arc<TestSubsystem>, api: Arc<NetworkingApi>) -> Arc<Self> {
+            Arc::new_cyclic(|weak| Self {
+                weak: weak.clone(),
+                id,
+                subsystem,
+                api,
+                clients: RwLock::new(None),
+            })
+        }
+
+        fn add_client(
+            &self,
+            clientside_connection: Connection,
+            client: &Arc<TestClient>,
+        ) -> Result<(), NetworkingError> {
+            let ip = Ipv4Addr::LOCALHOST.into();
+            if let Some(clients) = &mut *self.clients.write() {
+                if let Some(serverside_connection) = self.api.try_init_connect(ip) {
+                    clients.insert(
+                        serverside_connection,
+                        (clientside_connection, Arc::downgrade(&client)),
+                    );
+                    *client.server.write() = (serverside_connection, self.weak.clone());
+                    Ok(())
+                } else {
+                    Err(NetworkingError::Cancelled)
+                }
+            } else {
+                Err(NetworkingError::Closed)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NetDriver for TestServer {
+        async fn close(&self) {
+            let mut clients = self.clients.write();
+            self.subsystem.close_server(self);
+            if let Some(clients) = &mut *clients {
+                clients.drain().for_each(|(serverside_connection, (clientside_connection, client))| {
+                    if let Some(client) = client.upgrade() {
+                        *client.server.write() = (Connection::INVALID, Weak::new());
+                        client.api.disconnect(clientside_connection, DisconnectReason::ClosedByPeer);
+                    }
+                    self.api.disconnect(serverside_connection, DisconnectReason::ClosedLocally);
+                })
+            }
+            *clients = None;
+        }
+    }
+
+    #[async_trait]
+    impl NetDriverListen for TestServer {
+        async fn listen(&self, socket_addr: SocketAddr) -> Result<(), NetworkingError> {
+            self.close().await;
+            let server = self.weak.upgrade().unwrap();
+            self.subsystem.listen(socket_addr, server)?;
+            *self.clients.write() = Some(HashMap::new());
+            Ok(())
+        }
+    }
+
+    impl NetDriverSendTo for TestServer {
+        fn send_to(&self, connection: Connection, msg: Vec<u8>, _flags: FlagSet<MessageFlags>) -> Result<(), NetworkingError> {
+            if let Some(clients) = &*self.clients.read() {
+                if let Some((connection, client)) = clients.get(&connection) {
+                    if let Some(client) = client.upgrade() {
+                        client.api.dispatch_message(*connection, &msg)
+                            .expect("Message should dispatch");
+                        Ok(())
+                    } else {
+                        Err(NetworkingError::Closed)
+                    }
+                } else {
+                    Err(NetworkingError::InvalidConnection(connection))
+                }
+            } else {
+                Err(NetworkingError::Closed)
+            }
+        }
+    }
+
+    impl NetDriverBroadcast for TestServer {
+        fn broadcast(&self, msg: Vec<u8>, _flags: FlagSet<MessageFlags>) -> Result<(), NetworkingError> {
+            if let Some(clients) = &*self.clients.read() {
+                for (connection, client) in clients.values() {
+                    if let Some(client) = client.upgrade() {
+                        client.api.dispatch_message(*connection, &msg)
+                            .expect("Message should dispatch");
+                    }
+                }
+                Ok(())
+            } else {
+                Err(NetworkingError::Closed)
+            }
+        }
+    }
+
+    struct TestSubsystem {
+        next_server_id: AtomicU64,
+        servers: RwLock<HashMap<SocketAddr, Arc<TestServer>>>,
+    }
+
+    impl TestSubsystem {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                next_server_id: AtomicU64::new(1),
+                servers: RwLock::new(HashMap::new()),
+            })
+        }
+
+        fn connect(
+            &self,
+            connection: Connection,
+            socket_addr: SocketAddr,
+            client: &Arc<TestClient>,
+        ) -> Result<(), NetworkingError> {
+            let servers = self.servers.read();
+            if let Some(server) = servers.get(&socket_addr) {
+                server.add_client(connection, client)?;
+                Ok(())
+            } else {
+                Err(NetworkingError::InvalidAddress(socket_addr))
+            }
+        }
+
+        fn listen(&self, socket_addr: SocketAddr, server: Arc<TestServer>) -> Result<(), NetworkingError> {
+            let mut servers = self.servers.write();
+            if servers.contains_key(&socket_addr) {
+                Err(NetworkingError::InvalidAddress(socket_addr))
+            } else {
+                servers.insert(socket_addr, server);
+                Ok(())
+            }
+        }
+
+        fn close_server(&self, server: &TestServer) {
+            let mut servers = self.servers.write();
+            servers.retain(|_, entry| {
+                entry.id != server.id
+            });
+        }
+    }
+
+    impl NetDriverFactory<TestClient> for Arc<TestSubsystem> {
+        #[inline]
+        fn create(&self, api: Arc<NetworkingApi>) -> Arc<TestClient> {
+            TestClient::new(self.clone(), api)
+        }
+    }
+
+    impl NetDriverFactory<TestServer> for Arc<TestSubsystem> {
+        #[inline]
+        fn create(&self, api: Arc<NetworkingApi>) -> Arc<TestServer> {
+            let id = self.next_server_id.fetch_add(1, Ordering::SeqCst);
+            TestServer::new(id, self.clone(), api)
+        }
+    }
+    
+    struct TestStackFactory {
+        subsystem: Arc<TestSubsystem>,
+    }
+
+    impl Default for TestStackFactory {
+        #[inline]
+        fn default() -> Self {
+            Self {
+                subsystem: TestSubsystem::new(),
+            }
+        }
+    }
+
+    impl ClientServerStackFactory for TestStackFactory {
+        type ClientDriver = TestClient;
+        type ClientDriverFactory = Arc<TestSubsystem>;
+        type ServerDriver = TestServer;
+        type ServerDriverFactory = Arc<TestSubsystem>;
+
+        #[inline]
+        fn client_factory(&self) -> Arc<TestSubsystem> {
+            self.subsystem.clone()
+        }
+
+        #[inline]
+        fn server_factory(&self) -> Arc<TestSubsystem> {
+            self.subsystem.clone()
+        }
+    }
+
+    test_net_driver_client_server_core! {
+        name: networking,
+        stack_factory: TestStackFactory,
+    }
+    test_net_driver_client_server_send! {
+        name: networking,
+        stack_factory: TestStackFactory,
+    }
+    test_net_driver_client_server_send_to! {
+        name: networking,
+        stack_factory: TestStackFactory,
+    }
+    test_net_driver_client_server_broadcast! {
+        name: networking,
+        stack_factory: TestStackFactory,
     }
 }

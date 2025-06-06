@@ -27,18 +27,20 @@
 //! let server_factory: Box<dyn NetDriverFactory<GnsServerDriver>> = Box::new(GnsSubsystem::get());
 //! ```
 
+use std::fmt::{Display, Formatter};
 use async_trait::async_trait;
 use bimap::BiHashMap;
 use educe::Educe;
 use flagset::FlagSet;
 use gns::sys::{k_nSteamNetworkingSend_Reliable, ESteamNetworkingConnectionState as NetConnectState, ESteamNetworkingSocketsDebugOutputType};
 use gns::{GnsConnection, GnsGlobal, GnsSocket, GnsUtils, IsClient, IsServer};
-use image::EncodableLayout;
 use itertools::Either;
 use ouroboros::self_referencing;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -66,10 +68,27 @@ enum ClientMessage {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GnsClientId(NonZeroU64);
+
+impl Display for GnsClientId {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "client-{}", self.0)
+    }
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
 struct GnsClient<'gu> {
+    #[educe(Debug(method(std::fmt::Display::fmt)))]
+    id: GnsClientId,
+    #[educe(Debug(ignore))]
     api: Arc<NetworkingApi>,
     api_connection: Connection,
+    #[educe(Debug(ignore))]
     socket: Option<GnsSocket<'gu, 'gu, IsClient>>,
+    #[educe(Debug(ignore))]
     msg_recv: ump::Server<ClientMessage, (), NetworkingError>,
 }
 
@@ -77,6 +96,7 @@ impl<'gu> GnsClient<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
+        id: GnsClientId,
         api: Arc<NetworkingApi>,
         api_connection: Connection,
         socket_addr: SocketAddr,
@@ -89,6 +109,7 @@ impl<'gu> GnsClient<'gu> {
         let (msg_recv, msg_send) = ump::channel();
 
         let client = Self {
+            id,
             api,
             api_connection,
             socket: Some(socket),
@@ -103,6 +124,7 @@ impl<'gu> GnsClient<'gu> {
     fn close(&mut self) {
         // Take and drop the socket
         if let Some(socket) = self.socket.take() {
+            debug!(client = ?self, "Closing");
             socket.poll_callbacks();
             self.api.disconnect(self.api_connection, DisconnectReason::ClosedLocally);
         }
@@ -138,9 +160,20 @@ impl<'gu> GnsClient<'gu> {
 
         socket.poll_callbacks();
 
+        socket.poll_messages::<100>(|message| {
+            match self.api.dispatch_message(self.api_connection, &mut message.payload()) {
+                Ok(_) => {},
+                Err(error) => {
+                    warn!(?error, "Failed to dispatch message");
+                }
+            }
+        });
+
         let mut quit = false;
         socket.poll_event::<100>(|event| {
-            match (event.old_state(), event.info().state()) {
+            let (previous, current) = (event.old_state(), event.info().state());
+            debug!(?previous, ?current, "Connection changing state");
+            match (previous, current) {
                 (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
                     // Got disconnected or lost the connection
                     self.api.disconnect(self.api_connection, DisconnectReason::ClosedByPeer);
@@ -155,26 +188,19 @@ impl<'gu> GnsClient<'gu> {
                     return;
                 }
 
-                (previous, current) => {
-                    debug!(?previous, ?current, "Connection changing state");
-                }
+                _ => {}
             }
         });
-
-        socket.poll_messages::<100>(|message| {
-            match self.api.dispatch_message(self.api_connection, &mut message.payload()) {
-                Ok(_) => {},
-                Err(error) => {
-                    warn!(?error, "Failed to dispatch message");
-                }
-            }
-        });
+        if quit {
+            self.socket.take();
+            return false;
+        }
 
         let msgs_to_send = msgs_to_send.into_iter()
             .map(|(msg, flags)| socket.utils().allocate_message(
                 socket.connection(),
                 msg_send_flags_to_gns(flags),
-                msg.as_bytes(),
+                &msg,
             ))
             .collect::<Vec<_>>();
         if !msgs_to_send.is_empty() {
@@ -187,7 +213,7 @@ impl<'gu> GnsClient<'gu> {
             }
         }
 
-        !quit
+        true
     }
 }
 
@@ -210,12 +236,29 @@ enum ServerMessage {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GnsServerId(NonZeroU64);
+
+impl Display for GnsServerId {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server-{}", self.0)
+    }
+}
+
 type ClientsMap = BiHashMap<GnsConnection, Connection, ahash::RandomState, ahash::RandomState>;
 
+#[derive(Educe)]
+#[educe(Debug)]
 struct GnsServer<'gu> {
+    #[educe(Debug(method(std::fmt::Display::fmt)))]
+    id: GnsServerId,
+    #[educe(Debug(ignore))]
     api: Arc<NetworkingApi>,
+    #[educe(Debug(ignore))]
     socket: Option<GnsSocket<'gu, 'gu, IsServer>>,
     clients: Arc<RwLock<ClientsMap>>,
+    #[educe(Debug(ignore))]
     msg_recv: ump::Server<ServerMessage, (), NetworkingError>,
 }
 
@@ -223,6 +266,7 @@ impl<'gu> GnsServer<'gu> {
     fn new(
         gns_global: &'gu GnsGlobal,
         gns_utils: &'gu GnsUtils,
+        id: GnsServerId,
         api: Arc<NetworkingApi>,
         socket_addr: SocketAddr,
     ) -> Result<(Self, GnsServerHandle), NetworkingError> {
@@ -239,6 +283,7 @@ impl<'gu> GnsServer<'gu> {
         )));
 
         let server = Self {
+            id,
             api,
             socket: Some(socket),
             clients: clients.clone(),
@@ -256,6 +301,7 @@ impl<'gu> GnsServer<'gu> {
     fn close(&mut self) {
         // Take and drop the socket
         if let Some(socket) = self.socket.take() {
+            debug!(server = ?self, "Closing");
             let mut clients = self.clients.write();
             clients.retain(|connection, api_connection| {
                 socket.close_connection(*connection, 0, "", false);
@@ -302,63 +348,12 @@ impl<'gu> GnsServer<'gu> {
             None => return false,
         };
 
+        debug!(server = ?self, "Polling callbacks");
         socket.poll_callbacks();
 
-        socket.poll_event::<100>(|event| {
-            match (event.old_state(), event.info().state()) {
-                // A client is connecting
-                (
-                    NetConnectState::k_ESteamNetworkingConnectionState_None,
-                    NetConnectState::k_ESteamNetworkingConnectionState_Connecting,
-                ) => {
-                    let connection = event.connection();
-                    let remote_addr = event.info().remote_address();
-                    match socket.accept(connection) {
-                        Ok(_) => {
-                            if let Some(api_connection) = self.api.try_init_connect(remote_addr) {
-                                info!(?remote_addr, ?api_connection, "Client connected");
-                                let mut clients = self.clients.write();
-                                clients.insert(connection, api_connection);
-                            } else {
-                                info!(?remote_addr, "Client connection cancelled");
-                            }
-                        },
-                        Err(_) => {
-                            warn!(?remote_addr, "Failed to accept client");
-                        },
-                    }
-                }
+        let mut clients = self.clients.upgradable_read();
 
-                (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
-                    let connection = event.connection();
-                    let remote_addr = event.info().remote_address();
-                    info!(?remote_addr, "Client disconnected");
-                    let mut clients = self.clients.write();
-                    let (_, api_connection) = clients.remove_by_left(&connection).unwrap();
-                    socket.close_connection(connection, 0, "", false);
-                    self.api.disconnect(api_connection, DisconnectReason::ClosedByPeer);
-                }
-
-                (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
-                    let connection = event.connection();
-                    let remote_addr = event.info().remote_address();
-                    info!(?remote_addr, "Client disconnected unexpectedly");
-                    let mut clients = self.clients.write();
-                    let (_, api_connection) = clients.remove_by_left(&connection).unwrap();
-                    socket.close_connection(connection, 0, "", false);
-                    self.api.disconnect(api_connection, DisconnectReason::Unexpected);
-                }
-
-                // A client state is changing
-                (previous, current) => {
-                    let remote_addr = event.info().remote_address();
-                    debug!(?remote_addr, ?previous, ?current, "Client connection changing state");
-                }
-            }
-        });
-
-        let clients = self.clients.read();
-
+        debug!(server = ?self, "Polling messages");
         socket.poll_messages::<100>(|message| {
             let connection = message.connection();
             if let Some(api_connection) = clients.get_by_left(&connection) {
@@ -373,13 +368,70 @@ impl<'gu> GnsServer<'gu> {
             }
         });
 
+        debug!(server = ?self, "Polling events");
+        socket.poll_event::<100>(|event| {
+            match (event.old_state(), event.info().state()) {
+                // A client is connecting
+                (
+                    NetConnectState::k_ESteamNetworkingConnectionState_None,
+                    NetConnectState::k_ESteamNetworkingConnectionState_Connecting,
+                ) => {
+                    let connection = event.connection();
+                    let remote_addr = event.info().remote_address();
+                    match socket.accept(connection) {
+                        Ok(_) => {
+                            if let Some(api_connection) = self.api.try_init_connect(remote_addr) {
+                                info!(?remote_addr, ?api_connection, "Client connected");
+                                clients.with_upgraded(|clients| {
+                                    clients.insert(connection, api_connection);
+                                });
+                            } else {
+                                info!(?remote_addr, "Client connection cancelled");
+                            }
+                        },
+                        Err(_) => {
+                            warn!(?remote_addr, "Failed to accept client");
+                        },
+                    }
+                }
+
+                (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
+                    let connection = event.connection();
+                    let remote_addr = event.info().remote_address();
+                    info!(?remote_addr, "Client disconnected");
+                    let (_, api_connection) = clients.with_upgraded(|clients| {
+                        clients.remove_by_left(&connection).unwrap()
+                    });
+                    socket.close_connection(connection, 0, "", false);
+                    self.api.disconnect(api_connection, DisconnectReason::ClosedByPeer);
+                }
+
+                (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
+                    let connection = event.connection();
+                    let remote_addr = event.info().remote_address();
+                    info!(?remote_addr, "Client disconnected unexpectedly");
+                    let (_, api_connection) = clients.with_upgraded(|clients| {
+                        clients.remove_by_left(&connection).unwrap()
+                    });
+                    socket.close_connection(connection, 0, "", false);
+                    self.api.disconnect(api_connection, DisconnectReason::Unexpected);
+                }
+
+                // A client state is changing
+                (previous, current) => {
+                    let remote_addr = event.info().remote_address();
+                    debug!(?remote_addr, ?previous, ?current, "Client connection changing state");
+                }
+            }
+        });
+
         let msgs_to_send = msgs_to_send.into_iter()
             .filter_map(|(connection, msg, flags)| {
                 if let Some(gns_connection) = clients.get_by_right(&connection) {
                     Some(socket.utils().allocate_message(
                         *gns_connection,
                         msg_send_flags_to_gns(flags),
-                        msg.as_bytes(),
+                        &msg,
                     ))
                 } else {
                     debug!(?connection, "Dropping message for untracked connection");
@@ -393,7 +445,7 @@ impl<'gu> GnsServer<'gu> {
                         .map(move |gns_connection| socket.utils().allocate_message(
                             *gns_connection,
                             flags,
-                            msg.as_bytes(),
+                            &msg,
                         ))
                 })
                 .flatten())
@@ -409,12 +461,13 @@ impl<'gu> GnsServer<'gu> {
         }
 
         for api_connection in connections_to_close {
-            let mut clients = self.clients.write();
-            if let Some((connection, _)) = clients.remove_by_right(&api_connection) {
-                info!(?api_connection, "Closing connection");
-                socket.close_connection(connection, 0, "", false);
-                self.api.disconnect(api_connection, DisconnectReason::ClosedLocally);
-            }
+            clients.with_upgraded(|clients| {
+                if let Some((connection, _)) = clients.remove_by_right(&api_connection) {
+                    info!(?api_connection, server = ?self, "Closing connection");
+                    socket.close_connection(connection, 0, "", false);
+                    self.api.disconnect(api_connection, DisconnectReason::ClosedLocally);
+                }
+            })
         }
 
         true
@@ -452,9 +505,11 @@ struct CreateServerReq {
 struct SubsystemData {
     gns_global: GnsGlobal,
     gns_utils: GnsUtils,
+    next_client_id: AtomicU64,
     #[borrows(gns_global, gns_utils)]
     #[not_covariant]
     clients: Vec<GnsClient<'this>>,
+    next_server_id: AtomicU64,
     #[borrows(gns_global, gns_utils)]
     #[not_covariant]
     servers: Vec<GnsServer<'this>>,
@@ -483,6 +538,7 @@ impl GnsSubsystem {
                 match GnsClient::new(
                     data.gns_global,
                     data.gns_utils,
+                    GnsClientId(data.next_client_id.fetch_add(1, Ordering::SeqCst).try_into().unwrap()),
                     req.api,
                     req.connection,
                     req.socket_addr,
@@ -500,6 +556,7 @@ impl GnsSubsystem {
                 match GnsServer::new(
                     data.gns_global,
                     data.gns_utils,
+                    GnsServerId(data.next_server_id.fetch_add(1, Ordering::SeqCst).try_into().unwrap()),
                     req.api,
                     req.socket_addr,
                 ) {
@@ -550,7 +607,9 @@ impl GnsSubsystem {
                 Ok::<_, ()>(SubsystemDataBuilder {
                     gns_global,
                     gns_utils,
+                    next_client_id: AtomicU64::new(1),
                     clients_builder: move |_, _| Vec::new(),
+                    next_server_id: AtomicU64::new(1),
                     servers_builder: move |_, _| Vec::new(),
                     msg_create_client_recv,
                     msg_create_server_recv,
@@ -775,5 +834,64 @@ impl NetDriverFactory<GnsServerDriver> for Arc<GnsSubsystem> {
             api,
             handle: smol::lock::RwLock::new(None),
         })
+    }
+}
+
+// TODO: These tests can't be ran due to issues with multiple local GNS client sockets
+//   See: https://github.com/hussein-aitlahcen/gns-rs/issues/12
+//   Some of them could theoretically be ran in sequence, as long as none of them are ran in
+//   parallel to each other.
+#[cfg(test)]
+#[cfg(any())] // disabled
+mod tests {
+    use crate::net::driver::tests::{
+        ClientServerStackFactory,
+        test_net_driver_client_server_core,
+        test_net_driver_client_server_send,
+        test_net_driver_client_server_send_to,
+        test_net_driver_client_server_broadcast,
+    };
+
+    use super::*;
+
+    #[derive(Default)]
+    struct GnsStackFactory;
+
+    impl ClientServerStackFactory for GnsStackFactory {
+        type ClientDriver = GnsClientDriver;
+        type ClientDriverFactory = Arc<GnsSubsystem>;
+        type ServerDriver = GnsServerDriver;
+        type ServerDriverFactory = Arc<GnsSubsystem>;
+
+        #[inline]
+        fn client_factory(&self) -> Self::ClientDriverFactory {
+            GnsSubsystem::get()
+        }
+
+        #[inline]
+        fn server_factory(&self) -> Self::ServerDriverFactory {
+            GnsSubsystem::get()
+        }
+    }
+    
+    test_net_driver_client_server_core! {
+        name: gns,
+        stack_factory: GnsStackFactory,
+        timeout: 2.0,
+    }
+    test_net_driver_client_server_send! {
+        name: gns,
+        stack_factory: GnsStackFactory,
+        timeout: 2.0,
+    }
+    test_net_driver_client_server_send_to! {
+        name: gns,
+        stack_factory: GnsStackFactory,
+        timeout: 2.0,
+    }
+    test_net_driver_client_server_broadcast! {
+        name: gns,
+        stack_factory: GnsStackFactory,
+        timeout: 2.0,
     }
 }

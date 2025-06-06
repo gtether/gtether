@@ -197,7 +197,7 @@ impl ReversiClient {
         net: &Arc<Networking<GnsClientDriver>>,
     ) {
         self.clear_board_view();
-        net.close_sync();
+        net.close_blocking();
         self.server.shutdown();
     }
 }

@@ -188,7 +188,7 @@ impl MessageDispatch {
         msg_header: MessageHeader,
         msg_body: &[u8],
     ) -> Result<(), MessageDispatchError> {
-        debug!(?msg_header, "Dispatching message");
+        debug!(?msg_header, from=%connection, "Dispatching message");
 
         {
             let mut intercept_handlers = self.intercept_handlers.lock();

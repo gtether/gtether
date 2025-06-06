@@ -111,6 +111,16 @@ pub trait EventHandler<T>: Send + Sync + 'static {
     fn handle_event(&self, event: &mut Event<T>);
 }
 
+impl<T, F> EventHandler<T> for F
+where
+    F: Fn(&mut Event<T>) + Send + Sync + 'static,
+{
+    #[inline]
+    fn handle_event(&self, event: &mut Event<T>) {
+        (*self)(event)
+    }
+}
+
 /// Event handler subscribed to specific [Events][evt].
 ///
 /// An EventSubscriber is triggered when any [Events][evt] that it is listening for are fired. An

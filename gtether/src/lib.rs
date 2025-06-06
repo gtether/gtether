@@ -2,6 +2,10 @@
 extern crate assert_matches;
 extern crate nalgebra_glm as glm;
 
+// Fixes derive macro in tests
+#[cfg(test)]
+extern crate self as gtether;
+
 use std::any::Any;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
