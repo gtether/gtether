@@ -1097,8 +1097,8 @@ impl TextLayout {
     /// If a key that can be represented as text is pressed, will add the text to the layout.
     /// Otherwise, will attempt to move the cursor and/or modify layout text appropriately.
     #[cfg(feature = "gui")]
-    pub fn handle_input_event(&mut self, event: &crate::client::gui::input::InputDelegateEvent) {
-        use crate::client::gui::input::{ElementState, InputDelegateEvent, LogicalKey};
+    pub fn handle_input_event(&mut self, event: &crate::gui::input::InputDelegateEvent) {
+        use crate::gui::input::{ElementState, InputDelegateEvent, LogicalKey};
         use winit::keyboard::NamedKey;
 
         match event {

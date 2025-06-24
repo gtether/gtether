@@ -20,6 +20,7 @@ use vulkano::sync::GpuFuture;
 use vulkano::{Validated, VulkanError, VulkanLibrary};
 use vulkano::image::AllocateImageError;
 
+use crate::app::driver::AppDriver;
 use crate::event::{EventBus, EventBusRegistry, EventCancellable};
 use crate::render::render_pass::{EngineRenderPass, NoOpEngineRenderPass};
 use crate::render::swapchain::EngineSwapchain;
@@ -165,13 +166,18 @@ impl Deref for Instance {
     }
 }
 
+/// Trait describing an [AppDriver] that provides a Vulkan [render instance](Instance).
+pub trait AppDriverGraphicsVulkan: AppDriver {
+    fn render_instance(&self) -> Arc<Instance>;
+}
+
 /// Collection of Vulkano structs that together represent a rendering device.
 ///
 /// Wraps both a Vulkano [Device] and the [PhysicalDevice] associated with it, in addition to
 /// several standard allocators to be used with operations involving the device.
 ///
 /// Generally, an EngineDevice is 1:1 with a given render target, and not used across multiple
-/// render targets. For example, [windows](crate::gui::window) have an EngineDevice associated with
+/// render targets. For example, [windows](crate::gui::window::winit) have an EngineDevice associated with
 /// them.
 #[derive(Debug)]
 pub struct EngineDevice {
@@ -431,7 +437,7 @@ impl Renderer {
     ///
     /// Configured with a default [RendererConfig].
     ///
-    /// Note that the engine's [windowing](crate::gui::window) system will create its own Renderers,
+    /// Note that the engine's [windowing](crate::gui::window::winit) system will create its own Renderers,
     /// so it is not needed to create your own for standard window rendering.
     #[inline]
     pub fn new(

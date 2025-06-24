@@ -25,7 +25,7 @@ chrono = "0.4"
 crossbeam = "0.8"
 educe = "0.6"
 flagset = "0.4"
-gns = { git = "https://github.com/debroejm/gns-rs.git", branch = "cmake" }
+gns = { git = "https://github.com/debroejm/gns-rs.git", branch = "cmake-build-typo-fix" }
 image = "0.25"
 itertools = "0.14"
 nalgebra-glm = { version = "0.19.0", features = ["convert-bytemuck"]}

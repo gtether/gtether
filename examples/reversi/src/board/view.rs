@@ -1,5 +1,5 @@
 use bitcode::{Decode, Encode};
-use gtether::client::gui::input::{ElementState, InputDelegate, InputDelegateEvent, InputDelegateJoinHandle, MouseButton};
+use gtether::gui::input::{ElementState, InputDelegate, InputDelegateEvent, InputDelegateJoinHandle, MouseButton};
 use gtether::event::{Event, EventHandler};
 use gtether::net::gns::GnsClientDriver;
 use gtether::net::message::MessageHandler;

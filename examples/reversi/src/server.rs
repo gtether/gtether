@@ -1,21 +1,21 @@
-use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::net::{Ipv4Addr, SocketAddr};
 use async_trait::async_trait;
 use bitcode::{Decode, Encode};
 use educe::Educe;
+use gtether::app::driver::MinimalAppDriver;
+use gtether::app::Application;
+use gtether::event::{Event, EventHandler};
 use gtether::net::gns::{GnsServerDriver, GnsSubsystem};
 use gtether::net::message::MessageHandler;
 use gtether::net::message::{Message, MessageBody};
-use gtether::server::Server;
-use gtether::{Application, Engine, EngineBuilder, EngineJoinHandle};
-use parking_lot::{Mutex, RwLock};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-use tracing::{debug, info};
-use gtether::event::{Event, EventHandler};
 use gtether::net::{Connection, Networking, NetworkingDisconnectEvent, NetworkingError};
+use gtether::{Engine, EngineBuilder, EngineJoinHandle};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use tracing::{debug, info};
 
 use crate::board::controller::BoardController;
 use crate::board::BoardState;
@@ -270,13 +270,15 @@ impl EventHandler<NetworkingDisconnectEvent> for PlayerManager {
 }
 
 pub struct ReversiServer {
+    listen_addr: SocketAddr,
     board_controller: OnceLock<Arc<BoardController>>,
     player_manager: OnceLock<Arc<PlayerManager>>,
 }
 
 impl ReversiServer {
-    pub fn new() -> Self {
+    pub fn new(listen_addr: SocketAddr) -> Self {
         Self {
+            listen_addr,
             board_controller: OnceLock::new(),
             player_manager: OnceLock::new(),
         }
@@ -284,15 +286,15 @@ impl ReversiServer {
 }
 
 #[async_trait(?Send)]
-impl Application<Server> for ReversiServer {
+impl Application for ReversiServer {
+    type ApplicationDriver = MinimalAppDriver;
     type NetworkingDriver = GnsServerDriver;
 
-    async fn init(&self, engine: &Arc<Engine<Self, Server>>) {
+    async fn init(&self, engine: &Arc<Engine<Self>>) {
         // TODO: Add error propagation from init()?
-        engine.net().listen(SocketAddr::new(
-            Ipv4Addr::LOCALHOST.into(),
-            REVERSI_PORT,
-        )).await.expect("socket should be bindable");
+        info!(addr = ?self.listen_addr, "Binding to listen socket");
+        engine.net().listen(self.listen_addr).await
+            .expect("socket should be bindable");
 
         let board_state = BoardState::new(
             glm::vec2(8, 8),
@@ -326,7 +328,7 @@ impl Application<Server> for ReversiServer {
             .expect("'player_manager' should not be set before initialization");
     }
 
-    fn tick(&self, _engine: &Arc<Engine<Self, Server>>, _delta: Duration) {
+    async fn terminate(&self, _engine: &Arc<Engine<Self>>) {
         /* noop */
     }
 }
@@ -363,7 +365,7 @@ impl From<NetworkingError> for ServerStartError {
 }
 
 pub struct ReversiServerManager {
-    inner: Mutex<Option<EngineJoinHandle<ReversiServer, Server>>>,
+    inner: Mutex<Option<EngineJoinHandle<ReversiServer>>>,
 }
 
 impl ReversiServerManager {
@@ -374,7 +376,7 @@ impl ReversiServerManager {
         }
     }
 
-    fn shutdown_impl(inner: &mut Option<EngineJoinHandle<ReversiServer, Server>>) {
+    fn shutdown_impl(inner: &mut Option<EngineJoinHandle<ReversiServer>>) {
         if let Some(server) = inner.take() {
             info!("Stopping server...");
             server.stop().unwrap();
@@ -389,15 +391,14 @@ impl ReversiServerManager {
     }
 
     fn start_impl(
-        inner: &mut Option<EngineJoinHandle<ReversiServer, Server>>,
+        inner: &mut Option<EngineJoinHandle<ReversiServer>>,
+        listen_addr: SocketAddr,
     ) -> Result<(), ServerStartError> {
         info!("Starting server...");
-        let app = ReversiServer::new();
-        let side = Server::builder()
-            .build();
+        let app = ReversiServer::new(listen_addr);
         let join_handle = EngineBuilder::new()
             .app(app)
-            .side(side)
+            .app_driver(MinimalAppDriver::new())
             .networking_driver(GnsSubsystem::get())
             .spawn();
         *inner = Some(join_handle);
@@ -406,20 +407,20 @@ impl ReversiServerManager {
     }
 
     #[allow(unused)]
-    pub fn start(&self) -> Result<Arc<Engine<ReversiServer, Server>>, ServerStartError> {
+    pub fn start(&self, listen_addr: SocketAddr) -> Result<Arc<Engine<ReversiServer>>, ServerStartError> {
         let mut inner = self.inner.lock();
         if inner.is_none() {
-            Self::start_impl(&mut inner)?;
+            Self::start_impl(&mut inner, listen_addr)?;
         } else {
             debug!("Server is already running");
         }
         Ok(inner.as_ref().unwrap().engine())
     }
 
-    pub fn restart(&self) -> Result<Arc<Engine<ReversiServer, Server>>, ServerStartError> {
+    pub fn restart(&self, listen_addr: SocketAddr) -> Result<Arc<Engine<ReversiServer>>, ServerStartError> {
         let mut inner = self.inner.lock();
         Self::shutdown_impl(&mut inner);
-        Self::start_impl(&mut inner)?;
+        Self::start_impl(&mut inner, listen_addr)?;
         Ok(inner.as_ref().unwrap().engine())
     }
 }

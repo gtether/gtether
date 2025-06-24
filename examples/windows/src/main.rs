@@ -1,11 +1,10 @@
 extern crate nalgebra_glm as glm;
 
-use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use async_trait::async_trait;
 use glm::identity;
 use parking_lot::Mutex;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -13,21 +12,22 @@ use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
 
+use gtether::app::Application;
+use gtether::gui::input::{InputDelegateEvent, InputStateLayer, KeyCode};
+use gtether::gui::window::winit::{CreateWindowInfo, WindowAttributes, WinitDriver};
 use gtether::console::command::{Command, CommandError, CommandRegistry, CommandTree, ParamCountCheck};
 use gtether::console::gui::ConsoleGui;
 use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
 use gtether::console::{Console, ConsoleStdinReader};
-use gtether::client::gui::input::{InputDelegate, InputDelegateEvent, InputStateLayer, KeyCode};
-use gtether::client::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
+use gtether::net::driver::NoNetDriver;
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::{Uniform, UniformSet};
 use gtether::resource::manager::{LoadPriority, ResourceManager};
 use gtether::resource::source::constant::ConstantResourceSource;
-use gtether::{Application, Engine, EngineBuilder};
-use gtether::client::Client;
-use gtether::client::gui::ClientGui;
-use gtether::net::driver::NoNetDriver;
+use gtether::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
+use gtether::{Engine, EngineBuilder};
+
 use crate::render::ambient::{AmbientLight, AmbientRendererBootstrap};
 use crate::render::cube::CubeRendererBootstrap;
 use crate::render::directional::{DirectionalRendererBootstrap, PointLight};
@@ -209,11 +209,7 @@ impl Camera {
 
 struct WindowsApp {
     console: Arc<Console>,
-    window: OnceLock<WindowHandle>,
-    mn: OnceLock<Arc<Uniform<MN>>>,
-    vp: OnceLock<Arc<Uniform<VP>>>,
-    camera: Mutex<Camera>,
-    input: OnceLock<InputDelegate>,
+    tick_loop_handle: Mutex<Option<TickLoopHandle>>,
 }
 
 impl WindowsApp {
@@ -226,20 +222,17 @@ impl WindowsApp {
 
         Self {
             console,
-            window: OnceLock::new(),
-            mn: OnceLock::new(),
-            vp: OnceLock::new(),
-            camera: Mutex::new(Camera::default()),
-            input: OnceLock::new(),
+            tick_loop_handle: Mutex::new(None),
         }
     }
 }
 
 #[async_trait(?Send)]
-impl Application<ClientGui> for WindowsApp {
+impl Application for WindowsApp {
+    type ApplicationDriver = WinitDriver;
     type NetworkingDriver = NoNetDriver;
 
-    async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {
+    async fn init(&self, engine: &Arc<Engine<Self>>) {
         let mut cmd_registry = self.console.registry();
 
         let mut model = identity();
@@ -248,12 +241,12 @@ impl Application<ClientGui> for WindowsApp {
         model = glm::rotate_normalized_axis(&model, 1.0, &glm::vec3(1.0, 0.0, 0.0));
         model = glm::rotate_normalized_axis(&model, 1.0, &glm::vec3(0.0, 0.0, 1.0));
 
-        let window = engine.side().create_window(CreateWindowInfo {
+        let window = engine.window_manager().create_window(CreateWindowInfo {
             attributes: WindowAttributes::default()
                 .with_title("Windowing Test"),
             ..Default::default()
-        }).wait_async().await.unwrap();
-        //window.set_cursor_visible(false);
+        }).await;
+        window.set_cursor_visible(false);
 
         let renderer = window.renderer();
 
@@ -319,11 +312,13 @@ impl Application<ClientGui> for WindowsApp {
             .build().unwrap();
         window.renderer().set_render_pass(render_pass);
 
+        let mut camera = Camera::default();
+
         let mn = cube_renderer.mn().clone();
         *mn.write() = MN::new(model);
         let vp = cube_renderer.vp().clone();
         *vp.write() = VP {
-            view: self.camera.lock().view(),
+            view: camera.view(),
             projection: identity(),
         };
 
@@ -355,86 +350,94 @@ impl Application<ClientGui> for WindowsApp {
             log: self.console.log().clone(),
         })).unwrap();
 
-        self.input.set(window.input_state().create_delegate()).unwrap();
-        self.window.set(window).unwrap();
-        self.mn.set(mn).unwrap();
-        self.vp.set(vp).unwrap();
+        let input = window.input_state().create_delegate();
+
+        let engine = engine.clone();
+        let mut tick_loop_handle = self.tick_loop_handle.lock();
+        // Drop/stop any existing tick loop
+        tick_loop_handle.take();
+        *tick_loop_handle = Some(TickLoopBuilder::new()
+            .name("main-loop")
+            .tick_rate(60)
+            .init(|| Ok::<(), ()>(()))
+            .tick(move |_, delta| {
+                {
+                    let mut mn = mn.write();
+                    *mn = MN::new(glm::rotate_normalized_axis(
+                        &mn.model,
+                        delta.as_secs_f32(),
+                        &glm::vec3(0.0, 0.0, 1.0),
+                    ));
+                }
+
+                let speed = 5.0;
+                let rotate_speed = 0.001;
+                let distance = delta.as_secs_f32() * speed;
+
+                let mut changed = false;
+                let mut orient = camera.orient();
+                let right = camera.right();
+
+                for event in input.events() {
+                    match event {
+                        InputDelegateEvent::MouseMotion(motion) => {
+                            let mut rotate_matrix = identity();
+                            // Avoid miniscule calculations
+                            if motion.y.abs() > 0.01 {
+                                rotate_matrix = glm::rotate(&rotate_matrix, (motion.y as f32) * rotate_speed, &right);
+                                changed = true;
+                            }
+                            if motion.x.abs() > 0.01 {
+                                rotate_matrix = glm::rotate(&rotate_matrix, (-motion.x as f32) * rotate_speed, &camera.up);
+                                changed = true;
+                            }
+
+                            if changed {
+                                let wide_orient = glm::vec4(orient.x, orient.y, orient.z, 1.0);
+                                orient = glm::vec4_to_vec3(&(rotate_matrix * wide_orient));
+                                camera.orient = orient;
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+
+                if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap_or(false) {
+                    camera.pos += orient * distance;
+                    changed = true;
+                }
+                if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap_or(false) {
+                    camera.pos += orient * -distance;
+                    changed = true;
+                }
+                if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap_or(false) {
+                    camera.pos += right * distance;
+                    changed = true;
+                }
+                if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap_or(false) {
+                    camera.pos += right * -distance;
+                    changed = true;
+                }
+
+                if changed {
+                    {
+                        let mut vp = vp.write();
+                        vp.view = camera.view();
+                    }
+                }
+
+                if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap_or(false) {
+                    engine.stop().unwrap();
+                }
+
+                true
+            })
+            .spawn().unwrap());
     }
 
-    fn tick(&self, engine: &Arc<Engine<Self, ClientGui>>, delta: Duration) {
-        let window = self.window.get().unwrap();
-
-        let mn = self.mn.get().unwrap();
-        {
-            let mut mn = mn.write();
-            *mn = MN::new(glm::rotate_normalized_axis(
-                &mn.model,
-                delta.as_secs_f32(),
-                &glm::vec3(0.0, 0.0, 1.0),
-            ));
-        }
-
-        let speed = 5.0;
-        let rotate_speed = 0.001;
-        let distance = delta.as_secs_f32() * speed;
-
-        let mut changed = false;
-        let mut camera = self.camera.lock();
-        let mut orient = camera.orient();
-        let right = camera.right();
-
-        for event in self.input.get().unwrap().events() {
-            match event {
-                InputDelegateEvent::MouseMotion(motion) => {
-                    let mut rotate_matrix = identity();
-                    // Avoid miniscule calculations
-                    if motion.y.abs() > 0.01 {
-                        rotate_matrix = glm::rotate(&rotate_matrix, (motion.y as f32) * rotate_speed, &right);
-                        changed = true;
-                    }
-                    if motion.x.abs() > 0.01 {
-                        rotate_matrix = glm::rotate(&rotate_matrix, (-motion.x as f32) * rotate_speed, &camera.up);
-                        changed = true;
-                    }
-
-                    if changed {
-                        let wide_orient = glm::vec4(orient.x, orient.y, orient.z, 1.0);
-                        orient = glm::vec4_to_vec3(&(rotate_matrix * wide_orient));
-                        camera.orient = orient;
-                    }
-                },
-                _ => {},
-            }
-        }
-
-        if window.input_state().is_key_pressed(KeyCode::KeyW, None).unwrap_or(false) {
-            camera.pos += orient * distance;
-            changed = true;
-        }
-        if window.input_state().is_key_pressed(KeyCode::KeyS, None).unwrap_or(false) {
-            camera.pos += orient * -distance;
-            changed = true;
-        }
-        if window.input_state().is_key_pressed(KeyCode::KeyD, None).unwrap_or(false) {
-            camera.pos += right * distance;
-            changed = true;
-        }
-        if window.input_state().is_key_pressed(KeyCode::KeyA, None).unwrap_or(false) {
-            camera.pos += right * -distance;
-            changed = true;
-        }
-
-        if changed {
-            let vp = self.vp.get().unwrap();
-            {
-                let mut vp = vp.write();
-                vp.view = camera.view();
-            }
-        }
-
-        if window.input_state().is_key_pressed(KeyCode::Escape, None).unwrap_or(false) {
-            engine.stop().unwrap();
-        }
+    async fn terminate(&self, _engine: &Arc<Engine<Self>>) {
+        // Stop/drop any running tick loop
+        self.tick_loop_handle.lock().take();
     }
 }
 
@@ -455,9 +458,8 @@ fn main() {
 
     EngineBuilder::new()
         .app(app)
-        .side(Client::builder()
+        .app_driver(WinitDriver::builder()
             .application_name("gTether Example - windows")
-            .enable_gui()
             .build())
         .resources(resources)
         .networking_driver(NoNetDriver::new())

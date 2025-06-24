@@ -2,7 +2,7 @@
 
 extern crate nalgebra_glm as glm;
 
-use gtether::client::Client;
+use gtether::gui::window::winit::WinitDriver;
 use gtether::console::log::ConsoleLogLayer;
 use gtether::net::gns::GnsSubsystem;
 use gtether::resource::manager::ResourceManager;
@@ -46,9 +46,8 @@ fn main() {
 
     EngineBuilder::new()
         .app(app)
-        .side(Client::builder()
+        .app_driver(WinitDriver::builder()
             .application_name("gTether Example - reversi")
-            .enable_gui()
             .build())
         .resources(resources)
         .networking_driver(GnsSubsystem::get())

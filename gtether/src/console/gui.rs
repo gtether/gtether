@@ -23,8 +23,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use crate::console::log::ConsoleLogRecord;
 use crate::console::Console;
 use crate::event::{Event, EventHandler};
-use crate::client::gui::input::{InputDelegateEvent, InputDelegateLock};
-use crate::client::gui::window::WindowHandle;
+use crate::gui::input::{InputDelegateEvent, InputDelegateLock};
+use crate::gui::window::winit::WindowHandle;
 use crate::render::font::compositor::FontCompositor;
 use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
@@ -173,7 +173,7 @@ impl Default for ConsoleGuiBackground {
 /// # use std::sync::Arc;
 /// # use gtether::console::Console;
 /// use gtether::console::gui::ConsoleGui;
-/// # use gtether::client::gui::window::WindowHandle;
+/// # use gtether::gui::window::winit::WindowHandle;
 /// # use gtether::render::font::Font;
 /// # use gtether::render::render_pass::EngineRenderSubpassBuilder;
 /// # use gtether::resource::Resource;
@@ -198,7 +198,7 @@ impl Default for ConsoleGuiBackground {
 /// # use std::sync::Arc;
 /// # use gtether::console::Console;
 /// use gtether::console::gui::ConsoleGui;
-/// # use gtether::client::gui::window::WindowHandle;
+/// # use gtether::gui::window::winit::WindowHandle;
 /// # use gtether::render::font::Font;
 /// # use gtether::resource::Resource;
 /// #

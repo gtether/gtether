@@ -2,175 +2,39 @@
 extern crate assert_matches;
 extern crate nalgebra_glm as glm;
 
-// Fixes derive macro in tests
 #[cfg(test)]
+// Fixes derive macro in tests
 extern crate self as gtether;
 
+use educe::Educe;
+use gui::window::{AppDriverWindowManager, WindowManager};
+use parking_lot::RwLock;
 use std::any::Any;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
-use async_trait::async_trait;
-use parking_lot::RwLock;
-use net::driver::NetDriverFactory;
+use tracing::debug;
 
-use crate::net::driver::NetDriver;
+use crate::app::driver::AppDriver;
+use crate::app::Application;
+use crate::event::{EventBus, EventBusRegistry};
+use crate::net::driver::NetDriverFactory;
 use crate::net::Networking;
+use crate::render::{AppDriverGraphicsVulkan, Instance};
 use crate::resource::manager::ResourceManager;
 
-pub mod client;
+pub mod app;
 pub mod console;
 pub mod event;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod net;
 #[cfg(feature = "graphics")]
 pub mod render;
 pub mod resource;
-pub mod server;
 pub mod util;
-
-/// User provided application.
-///
-/// The Application is the main entry point for user-defined logic in the [Engine]. It is
-/// implemented by the user, and consists of a series of callbacks that the engine executes at
-/// defined points in its lifecycle.
-///
-/// An Application is also typed with a [Side], in order to be able to work with references to the
-/// [Engine] itself. Note that this means that Application can be implemented for the same type
-/// multiple times with different Sides, if desired.
-///
-/// # Examples
-///
-/// ```
-/// use std::sync::{Arc, OnceLock};
-/// use std::time::Duration;
-/// use async_trait::async_trait;
-/// use gtether::{Application, Engine};
-/// use gtether::client::Client;
-/// use gtether::net::driver::NoNetDriver;
-///
-/// struct BasicApp {
-///     value_a: u32,
-///     value_b: OnceLock<u32>,
-/// }
-///
-/// #[async_trait(?Send)]
-/// impl Application<Client> for BasicApp {
-///     type NetworkingDriver = NoNetDriver;
-///
-///     async fn init(&self, _engine: &Arc<Engine<Self, Client>>) {
-///         self.value_b.set(9001).unwrap();
-///     }
-///
-///     fn tick(&self, engine: &Arc<Engine<Self, Client>>, delta: Duration) {
-///         // Do something with value_a and value_b...
-///     }
-/// }
-/// ```
-#[async_trait(?Send)]
-pub trait Application<S>: Sized + Send + Sync
-where
-    S: Side,
-{
-    /// [NetDriver] type that will be used to handle networking for this application.
-    ///
-    /// If networking is not required, [NoNetDriver](net::driver::NoNetDriver) is an appropriate
-    /// type to use.
-    type NetworkingDriver: NetDriver;
-
-    /// Initialize this Application.
-    ///
-    /// This will be called once when the [Engine] is [initializing](EngineStage::Init). It may be
-    /// called again if the engine re-initializes e.g. after being suspended. Applications are
-    /// expected to handle this accordingly if they expect the possibility of suspension.
-    ///
-    /// This method is asynchronous, and certain [Side] implementations may run additional logic
-    /// asynchronously during this method. For example, [ClientGui](client::gui::ClientGui) runs
-    /// window creation logic asynchronously, so that initializing logic can request window
-    /// creations with deadlocking.
-    async fn init(&self, engine: &Arc<Engine<Self, S>>);
-
-    /// Execute a single main loop tick for this Application.
-    ///
-    /// Different [Side] implementations can run the main loop in different ways, but they should
-    /// always execute this once per "tick" of their main loop. The `delta` duration can be used
-    /// to calculate delta-based interactions, such as how far something should have moved if
-    /// travelling at a given speed.
-    fn tick(&self, engine: &Arc<Engine<Self, S>>, delta: Duration);
-}
-
-/// Application sided interface.
-///
-/// A Side represents how an [Application] is driven by the [Engine]. For example, a client Side
-/// may contain GUI logic and drive the Application through a window-based event loop, while a
-/// server Side may use a simpler and more direct main loop, or have different logic for handling
-/// many client connections.
-///
-/// The engine provides several useful Side implementations, including the following:
-///  * [Client](client::Client) - Basic main loop, no GUI.
-///  * [ClientGui](client::gui::ClientGui) - Window-based event loop and input handling.
-///
-/// # Implementation
-///
-/// If the engine provided implementations don't fit your use-case, you can also implement your own.
-/// Certain patterns should be followed when implementing your own Side.
-///
-/// ## Application lifecycle
-///
-/// Any implementation of [Side] should adhere to following lifecycle constraints:
-///  * [Application::init()] should be executed once per engine [initialization](EngineStage::Init).
-///  * [Application::tick()] should be executed on a regular basis while the engine is
-///    [running](EngineStage::Running). The exact frequency is left up to the Side implementation.
-///
-/// The implementation is also responsible for transitioning engine [stages](EngineStage) as
-/// appropriate.
-///
-/// ## Basic example
-///
-/// An extremely simplified example can be found as follows:
-/// ```
-/// use std::time::Instant;
-/// use smol::future;
-/// use gtether::{Application, EngineStage, EngineState, Side};
-///
-/// struct BasicSide {}
-///
-/// impl Side for BasicSide {
-///     fn start<A: Application<Self>>(&self, mut engine_state: EngineState<A, Self>) {
-///         {
-///             // Initialization
-///             let engine = engine_state.engine();
-///             future::block_on(engine.app().init(&engine));
-///             engine_state.set_stage(EngineStage::Running).unwrap();
-///         }
-///
-///         let mut last_tick = Instant::now();
-///         loop {
-///             // Execute main loop ticks
-///             // A more complex example may wish to target a certain amount of ticks per second
-///             let tick_start = Instant::now();
-///             let engine = engine_state.engine();
-///             engine.app().tick(&engine, tick_start - last_tick);
-///             last_tick = tick_start;
-///
-///             // Check for exit
-///             if engine_state.stage() == EngineStage::Stopping {
-///                 engine_state.set_stage(EngineStage::Stopped).unwrap();
-///                 break;
-///             }
-///         }
-///     }
-/// }
-/// ```
-pub trait Side: Sized + Send + Sync {
-    /// Start the [Engine].
-    ///
-    /// Begins executing the [Engine] lifecycle, as determined by this Side. Generally, that
-    /// involves [initializing](EngineStage::Init) the engine, followed by
-    /// [running](EngineStage::Running) some sort of main loop until the engine is stopped.
-    fn start<A: Application<Self>>(&self, engine_state: EngineState<A, Self>);
-}
 
 /// Error indicating the [Engine] tried to transition to an invalid [stage](EngineStage).
 ///
@@ -216,6 +80,11 @@ impl Error for InvalidEngineStageTransition {}
 ///     I[Init] --> R[Running]
 ///     R --> Sg[Stopping]
 ///     Sg --> S[Stopped]
+///     R --> Ssg[Suspending]
+///     Ssg --> Ss[Suspended]
+///     Ss --> Rg[Resuming]
+///     Rg --> R
+///     Ss --> Sg
 /// ```
 ///
 /// Stages are idempotent, and can always be transitioned to themselves; this should for all intents
@@ -223,6 +92,12 @@ impl Error for InvalidEngineStageTransition {}
 ///
 /// If a user attempts to transition the engine into an invalid stage, an
 /// [InvalidEngineStageTransition] error will be generated.
+///
+/// # Suspension
+///
+/// Some platforms and/or [AppDrivers](AppDriver) support the concept of suspending the application.
+/// The details of this may vary from platform to platform, but in general any rendering or heavy
+/// workloads should be halted while the application is suspended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineStage {
     /// The [Engine] is currently initializing.
@@ -232,10 +107,26 @@ pub enum EngineStage {
     Init,
 
     /// The [Engine] is currently running.
-    ///
-    /// While running, the engine should periodically call [Application::tick()] in order to advance
-    /// application state.
     Running,
+
+    /// The [Engine] is currently resuming from being suspended.
+    ///
+    /// This is where rendering/etc should be reinitialized via [Application::resume()], and after
+    /// resuming is completed, the [Engine] will be [Running](EngineStage::Running).
+    Resuming,
+
+    /// The [Engine] is currently suspending.
+    ///
+    /// This is where rendering/etc should be shutdown via [Application::suspend()]. After
+    /// suspending is completed, the [Engine] will be [Suspended](EngineStage::Suspended) until it
+    /// is resumed.
+    Suspending,
+
+    /// The [Engine] is currently suspended.
+    ///
+    /// No active rendering or other processing intensive tasks should be running during this stage,
+    /// but some light background tasks may be running.
+    Suspended,
 
     /// The [Engine] has been told to stop, and is currently stopping.
     ///
@@ -269,83 +160,110 @@ impl EngineStage {
         }
         match (self, next) {
             (Self::Init, Self::Running) => Ok(()),
-            (Self::Running, Self::Stopping) => Ok(()),
+            (Self::Running, Self::Suspending) => Ok(()),
+            (Self::Suspending, Self::Suspended) => Ok(()),
+            (Self::Suspended, Self::Resuming) => Ok(()),
+            (Self::Resuming, Self::Running) => Ok(()),
+            (Self::Running | Self::Suspended, Self::Stopping) => Ok(()),
             (Self::Stopping, Self::Stopped) => Ok(()),
             _ => Err(InvalidEngineStageTransition { current: *self, next })
         }
     }
 }
 
-#[derive(Debug, Default)]
+/// The [EngineStage] has changed.
+///
+/// This event is fired as the [Engine] is changing [stages](EngineStage), immediately after the
+/// stage change has been completed.
+#[derive(Debug)]
+pub struct EngineStageChangedEvent {
+    previous: EngineStage,
+    current: EngineStage,
+}
+
+impl EngineStageChangedEvent {
+    /// The [EngineStage] that was previously set.
+    #[inline]
+    pub fn previous(&self) -> EngineStage { self.previous }
+
+    /// The new [EngineStage] that was just transitioned to.
+    #[inline]
+    pub fn current(&self) -> EngineStage { self.current }
+}
+
+#[derive(Educe)]
+#[educe(Debug)]
 struct EngineStateInner {
     stage: EngineStage,
+    #[educe(Debug(ignore))]
+    event_bus: Arc<EventBus>,
+}
+
+impl EngineStateInner {
+    fn new(event_bus: Arc<EventBus>) -> Self {
+        Self {
+            stage: EngineStage::default(),
+            event_bus,
+        }
+    }
+
+    fn transition_stage(&mut self, stage: EngineStage) -> Result<(), InvalidEngineStageTransition> {
+        if stage != self.stage {
+            self.stage.validate_transition(stage)?;
+            let previous = self.stage;
+            debug!(?previous, current = ?stage, "Engine transitioning stage");
+            self.stage = stage;
+            self.event_bus.fire(EngineStageChangedEvent {
+                previous,
+                current: stage,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Mutable [Engine] state.
 ///
 /// An instance of EngineState can be used to mutate the engine's internal state. Generally, these
-/// instances cannot be created by the user, and are only given to [Side] implementations. Any
-/// mutation to engine state is expected to come from [Side] implementations _only_.
-pub struct EngineState<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
-    engine: Arc<Engine<A, S>>,
+/// instances cannot be created by the user, and are only given to [AppDriver] implementations. Any
+/// mutation to engine state is expected to come from [AppDriver] implementations _only_.
+pub struct EngineState<A: Application> {
+    engine: Arc<Engine<A>>,
 }
 
-impl<A, S> EngineState<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
-    /// Get a reference to the [Engine] this EngineState represents.
-    #[inline]
-    pub fn engine(&self) -> &Arc<Engine<A, S>> {
-        &self.engine
-    }
-
-    /// Get the current [EngineStage].
-    ///
-    /// This is effectively a shortcut for `self.engine().stage()`.
-    #[inline]
-    pub fn stage(&self) -> EngineStage {
-        self.engine.stage()
-    }
-
+impl<A: Application> EngineState<A> {
     /// Attempt to transition this [engine's](Engine) [stage](EngineStage).
     ///
     /// Will validate the given `stage` using [EngineStage::validate_transition()].
     pub fn set_stage(&self, stage: EngineStage) -> Result<(), InvalidEngineStageTransition> {
-        let mut state = self.engine.state.write();
-        state.stage.validate_transition(stage)?;
-        state.stage = stage;
-        Ok(())
+        self.engine.state.write().transition_stage(stage)
+    }
+}
+
+impl<A: Application> Deref for EngineState<A> {
+    type Target = Arc<Engine<A>>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.engine
     }
 }
 
 /// Represents an instance of the gTether Engine.
 ///
 /// All engine usage stems from this structure, and it is required to construct one first.
-pub struct Engine<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
+pub struct Engine<A: Application> {
     app: A,
-    side: S,
+    app_driver: A::ApplicationDriver,
     state: Arc<RwLock<EngineStateInner>>,
+    event_bus: Arc<EventBus>,
     resources: Arc<ResourceManager>,
     networking: Arc<Networking<A::NetworkingDriver>>,
 }
 
-impl<A, S> Engine<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
+impl<A: Application> Engine<A> {
     #[inline]
-    pub fn builder() -> EngineBuilder<A, S> {
+    pub fn builder() -> EngineBuilder<A> {
         EngineBuilder::new()
     }
 
@@ -353,11 +271,13 @@ where
     pub fn app(&self) -> &A { &self.app }
 
     #[inline]
-    pub fn side(&self) -> &S { &self.side }
-
-    #[inline]
     pub fn stage(&self) -> EngineStage {
         self.state.read().stage
+    }
+
+    #[inline]
+    pub fn event_bus(&self) -> &EventBusRegistry {
+        self.event_bus.registry()
     }
 
     /// The engine's main [ResourceManager].
@@ -375,7 +295,9 @@ where
             engine: self.clone(),
         };
 
-        self.side.start(engine_state);
+        // TODO: Need to ensure this isn't called multiple times
+
+        self.app_driver.run_main_loop(engine_state);
     }
 
     pub fn stop(&self) -> Result<(), InvalidEngineStageTransition> {
@@ -385,10 +307,34 @@ where
             Ok(())
         } else {
             // Attempt to begin stopping
-            state.stage.validate_transition(EngineStage::Stopping)?;
-            state.stage = EngineStage::Stopping;
-            Ok(())
+            state.transition_stage(EngineStage::Stopping)
         }
+    }
+}
+
+#[cfg(feature = "graphics")]
+impl<A> Engine<A>
+where
+    A: Application,
+    A::ApplicationDriver: AppDriverGraphicsVulkan,
+{
+    /// The Vulkan [render instance](Instance).
+    #[inline]
+    pub fn render_instance(&self) -> Arc<Instance> {
+        self.app_driver.render_instance()
+    }
+}
+
+#[cfg(feature = "gui")]
+impl<A> Engine<A>
+where
+    A: Application,
+    A::ApplicationDriver: AppDriverWindowManager,
+{
+    /// A reference to the [WindowManager].
+    #[inline]
+    pub fn window_manager(&self) -> &dyn WindowManager {
+        self.app_driver.window_manager()
     }
 }
 
@@ -433,20 +379,12 @@ impl Error for EngineJoinHandleError {}
 ///
 /// This handle can be used to manage an [Engine] instance that is running in a separate thread. It
 /// provides methods to stop the running [Engine], as well as join a stopped [Engine] thread.
-pub struct EngineJoinHandle<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
+pub struct EngineJoinHandle<A: Application> {
     join_handle: JoinHandle<()>,
-    engine: Arc<Engine<A, S>>,
+    engine: Arc<Engine<A>>,
 }
 
-impl<A, S> EngineJoinHandle<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
+impl<A: Application> EngineJoinHandle<A> {
     /// Join the [Engine] thread.
     ///
     /// Does not stop the [Engine] beforehand, so this will block until the [Engine] has been
@@ -467,7 +405,7 @@ where
 
     /// Get a reference to the [Engine].
     #[inline]
-    pub fn engine(&self) -> Arc<Engine<A, S>> {
+    pub fn engine(&self) -> Arc<Engine<A>> {
         self.engine.clone()
     }
 }
@@ -477,50 +415,40 @@ where
 /// # Examples
 ///
 /// ```
-/// # use std::sync::Arc;
-/// # use std::time::Duration;
 /// use async_trait::async_trait;
-/// use gtether::{Application, Engine};
-/// use gtether::client::Client;
+/// use gtether::app::Application;
+/// use gtether::Engine;
+/// use gtether::app::driver::MinimalAppDriver;
 /// use gtether::net::driver::NoNetDriver;
 ///
 /// struct MyApp {}
 ///
 /// #[async_trait(?Send)]
-/// impl Application<Client> for MyApp {
-///    type NetworkingDriver = NoNetDriver;
+/// impl Application for MyApp {
+///     type ApplicationDriver = MinimalAppDriver;
+///     type NetworkingDriver = NoNetDriver;
 ///     // Implement relevant functions...
-/// #    async fn init(&self, engine: &Arc<Engine<Self, Client>>) {}
-/// #    fn tick(&self, engine: &Arc<Engine<Self, Client>>, delta: Duration) {}
 /// }
 ///
 /// let app = MyApp {};
 /// let engine = Engine::builder()
 ///     .app(app)
-///     .side(Client::builder().build())
+///     .app_driver(MinimalAppDriver::new())
 ///     .networking_driver(NoNetDriver::new())
 ///     .build();
 /// ```
-pub struct EngineBuilder<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
+pub struct EngineBuilder<A: Application> {
     app: Option<A>,
-    side: Option<S>,
+    app_driver: Option<A::ApplicationDriver>,
     resources: Option<Arc<ResourceManager>>,
     networking: Option<Arc<Networking<A::NetworkingDriver>>>,
 }
 
-impl<A, S> EngineBuilder<A, S>
-where
-    S: Side,
-    A: Application<S>,
-{
+impl<A: Application> EngineBuilder<A> {
     pub fn new() -> Self {
         Self {
             app: None,
-            side: None,
+            app_driver: None,
             resources: None,
             networking: None,
         }
@@ -531,8 +459,8 @@ where
         self
     }
 
-    pub fn side(mut self, side: S) -> Self {
-        self.side = Some(side);
+    pub fn app_driver(mut self, app_driver: A::ApplicationDriver) -> Self {
+        self.app_driver = Some(app_driver);
         self
     }
 
@@ -556,12 +484,12 @@ where
         self
     }
 
-    pub fn build(self) -> Arc<Engine<A, S>> {
+    pub fn build(self) -> Arc<Engine<A>> {
         let app = self.app
             .expect(".app() is required");
 
-        let side = self.side
-            .expect(".side() is required");
+        let app_driver = self.app_driver
+            .expect(".app_driver() is required");
 
         let resources = self.resources
             .unwrap_or_else(|| ResourceManager::builder().build());
@@ -569,26 +497,27 @@ where
         let networking = self.networking
             .expect(".networking_driver() is required");
 
+        let event_bus = Arc::new(EventBus::builder()
+            .event_type::<EngineStageChangedEvent>()
+            .build());
+
+        let state = Arc::new(RwLock::new(EngineStateInner::new(event_bus.clone())));
+
         Arc::new(Engine {
             app,
-            side,
-            state: Arc::new(RwLock::new(EngineStateInner::default())),
+            app_driver,
+            state,
+            event_bus,
             resources,
             networking,
         })
     }
-}
 
-impl<A, S> EngineBuilder<A, S>
-where
-    S: Side + 'static,
-    A: Application<S> + 'static,
-{
     /// Start the [Engine] in a separate thread.
     ///
     /// Spawn a separate thread, and start the [Engine] in it. This will yield an [EngineJoinHandle]
     /// to manage the new [Engine] thread.
-    pub fn spawn(self) -> EngineJoinHandle<A, S> {
+    pub fn spawn(self) -> EngineJoinHandle<A> {
         let engine = self.build();
         let engine_thread = engine.clone();
 

@@ -1,34 +1,33 @@
 use async_trait::async_trait;
 use educe::Educe;
-use gtether::client::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
-use gtether::client::gui::ClientGui;
+use gtether::app::Application;
+use gtether::gui::window::winit::{CreateWindowInfo, WindowAttributes, WindowHandle, WinitDriver};
 use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
 use gtether::console::gui::ConsoleGui;
 use gtether::console::log::ConsoleLog;
 use gtether::console::Console;
 use gtether::event::Event;
+use gtether::net::gns::GnsClientDriver;
+use gtether::net::{Networking, NetworkingError};
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::font::Font;
 use gtether::render::model::obj::ModelObjLoader;
 use gtether::render::model::{Model, ModelVertexNormal};
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::Uniform;
+use gtether::render::RendererStaleEvent;
 use gtether::resource::manager::LoadPriority;
 use gtether::resource::Resource;
-use gtether::{Application, Engine};
+use gtether::Engine;
 use parking_lot::{Mutex, RwLock};
 use parry3d::na::Point3;
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use tracing::info;
 use vulkano::format::Format;
 use vulkano::image::SampleCount;
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
-use gtether::net::{Networking, NetworkingError};
-use gtether::net::gns::GnsClientDriver;
-use gtether::render::RendererStaleEvent;
 
 use crate::board::view::BoardView;
 use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight, MN, VP};
@@ -167,6 +166,7 @@ impl ReversiClient {
         let window = self.window.get().unwrap();
         let render_data = self.render_data.get().unwrap();
 
+        info!(addr = ?socket_addr, "Connecting to server");
         let _connect_ctx = net.connect_sync(socket_addr)?;
 
         let msg = PlayerConnect::new(&*self.preferred_name.read(), None);
@@ -203,17 +203,18 @@ impl ReversiClient {
 }
 
 #[async_trait(?Send)]
-impl Application<ClientGui> for ReversiClient {
+impl Application for ReversiClient {
+    type ApplicationDriver = WinitDriver;
     type NetworkingDriver = GnsClientDriver;
 
-    async fn init(&self, engine: &Arc<Engine<Self, ClientGui>>) {
+    async fn init(&self, engine: &Arc<Engine<Self>>) {
         let mut cmd_registry = self.console.registry();
 
-        let window = engine.side().create_window(CreateWindowInfo {
+        let window = engine.window_manager().create_window(CreateWindowInfo {
             attributes: WindowAttributes::default()
                 .with_title("Reversi"),
             ..Default::default()
-        }).wait_async().await.unwrap();
+        }).await;
 
         let console_font = engine.resources().get_or_load(
             "console_font",
@@ -300,30 +301,48 @@ impl Application<ClientGui> for ReversiClient {
 
         self.clear_board_view();
     }
+}
 
-    fn tick(&self, _engine: &Arc<Engine<Self, ClientGui>>, _delta: Duration) {
-        /* noop */
+fn parse_socket_addr(input: impl AsRef<str>) -> Result<SocketAddr, CommandError> {
+    let input = input.as_ref();
+    if let Ok(addr) = input.parse::<SocketAddr>() {
+        return Ok(addr);
     }
+    if let Ok(ip) = input.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, REVERSI_PORT));
+    }
+    if let Ok(port) = input.parse::<u16>() {
+        return Ok(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port));
+    }
+    Err(CommandError::InvalidParameter(input.to_string()))
 }
 
 #[derive(Educe)]
 #[educe(Debug)]
 struct HostCommand {
     #[educe(Debug(ignore))]
-    client: Arc<Engine<ReversiClient, ClientGui>>,
+    client: Arc<Engine<ReversiClient>>,
 }
 
 impl Command for HostCommand {
     fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
-        ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
+        ParamCountCheck::OneOf(vec![
+            ParamCountCheck::Equal(0),
+            ParamCountCheck::Equal(1),
+        ]).check(parameters.len() as u32)?;
 
         let server = &self.client.app().server;
 
-        server.restart()
+        let socket_addr = match parameters.len() {
+            1 => parse_socket_addr(&parameters[0])?,
+            _ => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), REVERSI_PORT),
+        };
+
+        server.restart(socket_addr)
             .map_err(|err| CommandError::CommandFailure(Box::new(err)))?;
 
         self.client.app().connect(
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), REVERSI_PORT),
+            socket_addr,
             self.client.net(),
         ).map_err(|err| CommandError::CommandFailure(Box::new(err)))
     }
@@ -333,7 +352,7 @@ impl Command for HostCommand {
 #[educe(Debug)]
 struct ConnectCommand {
     #[educe(Debug(ignore))]
-    client: Arc<Engine<ReversiClient, ClientGui>>,
+    client: Arc<Engine<ReversiClient>>,
 }
 
 impl Command for ConnectCommand {
@@ -346,8 +365,7 @@ impl Command for ConnectCommand {
         let server = &self.client.app().server;
 
         let socket_addr = match parameters.len() {
-            1 => parameters[0].parse()
-                .map_err(|_| CommandError::InvalidParameter(parameters[0].clone()))?,
+            1 => parse_socket_addr(&parameters[0])?,
             _ => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), REVERSI_PORT),
         };
 
@@ -364,7 +382,7 @@ impl Command for ConnectCommand {
 #[educe(Debug)]
 struct CloseCommand {
     #[educe(Debug(ignore))]
-    client: Arc<Engine<ReversiClient, ClientGui>>,
+    client: Arc<Engine<ReversiClient>>,
 }
 
 impl Command for CloseCommand {
@@ -379,7 +397,7 @@ impl Command for CloseCommand {
 #[educe(Debug)]
 struct NameCommand {
     #[educe(Debug(ignore))]
-    client: Arc<Engine<ReversiClient, ClientGui>>,
+    client: Arc<Engine<ReversiClient>>,
 }
 
 impl Command for NameCommand {
