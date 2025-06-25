@@ -33,9 +33,8 @@ use bimap::BiHashMap;
 use educe::Educe;
 use flagset::FlagSet;
 use gns::sys::{k_nSteamNetworkingSend_Reliable, ESteamNetworkingConnectionState as NetConnectState, ESteamNetworkingSocketsDebugOutputType};
-use gns::{GnsConnection, GnsGlobal, GnsSocket, GnsUtils, IsClient, IsServer};
+use gns::{GnsConnection, GnsGlobal, GnsSocket, IsClient, IsServer};
 use itertools::Either;
-use ouroboros::self_referencing;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -78,31 +77,34 @@ impl Display for GnsClientId {
     }
 }
 
+struct GnsClientState {
+    socket: GnsSocket<IsClient>,
+    msg_recv: ump::Server<ClientMessage, (), NetworkingError>,
+}
+
 #[derive(Educe)]
 #[educe(Debug)]
-struct GnsClient<'gu> {
+struct GnsClient {
     #[educe(Debug(method(std::fmt::Display::fmt)))]
     id: GnsClientId,
     #[educe(Debug(ignore))]
     api: Arc<NetworkingApi>,
     api_connection: Connection,
     #[educe(Debug(ignore))]
-    socket: Option<GnsSocket<'gu, 'gu, IsClient>>,
+    gns_global: Arc<GnsGlobal>,
     #[educe(Debug(ignore))]
-    msg_recv: ump::Server<ClientMessage, (), NetworkingError>,
+    state: Option<GnsClientState>,
 }
 
-impl<'gu> GnsClient<'gu> {
+impl GnsClient {
     fn new(
-        gns_global: &'gu GnsGlobal,
-        gns_utils: &'gu GnsUtils,
+        gns_global: Arc<GnsGlobal>,
         id: GnsClientId,
         api: Arc<NetworkingApi>,
         api_connection: Connection,
         socket_addr: SocketAddr,
     ) -> Result<(Self, GnsClientHandle), NetworkingError> {
-        let socket = GnsSocket::new(gns_global, gns_utils)
-            .ok_or(NetworkingError::internal_error("Failed to create socket"))?
+        let socket = GnsSocket::new(gns_global.clone())
             .connect(socket_addr.ip(), socket_addr.port())
             .map_err(|_| NetworkingError::InvalidAddress(socket_addr))?;
 
@@ -112,8 +114,11 @@ impl<'gu> GnsClient<'gu> {
             id,
             api,
             api_connection,
-            socket: Some(socket),
-            msg_recv,
+            gns_global,
+            state: Some(GnsClientState {
+                socket,
+                msg_recv,
+            }),
         };
 
         let client_handle = GnsClientHandle(msg_send);
@@ -121,46 +126,48 @@ impl<'gu> GnsClient<'gu> {
         Ok((client, client_handle))
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, reason: DisconnectReason) {
         // Take and drop the socket
-        if let Some(socket) = self.socket.take() {
+        if let Some(state) = self.state.take() {
             debug!(client = ?self, "Closing");
-            socket.poll_callbacks();
-            self.api.disconnect(self.api_connection, DisconnectReason::ClosedLocally);
+            // Explicitly drop the state before notifying the API, so we can ensure no more msgs
+            //  send attempts are made after the API registers that we're closed
+            drop(state);
+            self.api.disconnect(self.api_connection, reason);
         }
     }
 
     fn tick(&mut self) -> bool {
         let mut msgs_to_send = Vec::new();
 
-        while let Some((msg, reply_ctx)) = match self.msg_recv.try_pop() {
+        let state = match self.state.as_ref() {
+            Some(state) => state,
+            None => return false,
+        };
+
+        while let Some((msg, reply_ctx)) = match state.msg_recv.try_pop() {
             Ok(val) => val,
             Err(_) => {
                 // Handle is dropped, so socket should close
-                self.close();
+                self.close(DisconnectReason::ClosedLocally);
                 return false;
             }
         } {
             match msg {
                 ClientMessage::Send { msg, flags } => {
                     msgs_to_send.push((msg, flags));
+                    // A reply isn't expected, but send one anyway for hygiene's sake
+                    reply_ctx.reply(()).unwrap();
                 },
                 ClientMessage::Close => {
-                    self.close();
+                    self.close(DisconnectReason::ClosedLocally);
                     reply_ctx.reply(()).unwrap();
                     return false;
                 },
             }
         }
 
-        let socket = match self.socket.as_ref() {
-            Some(socket) => socket,
-            None => return false,
-        };
-
-        socket.poll_callbacks();
-
-        socket.poll_messages::<100>(|message| {
+        state.socket.poll_messages::<100>(|message| {
             match self.api.dispatch_message(self.api_connection, &mut message.payload()) {
                 Ok(_) => {},
                 Err(error) => {
@@ -169,42 +176,40 @@ impl<'gu> GnsClient<'gu> {
             }
         });
 
-        let mut quit = false;
-        socket.poll_event::<100>(|event| {
+        let mut quit_reason = None;
+        state.socket.poll_event::<100>(|event| {
             let (previous, current) = (event.old_state(), event.info().state());
             debug!(?previous, ?current, "Connection changing state");
             match (previous, current) {
                 (_, NetConnectState::k_ESteamNetworkingConnectionState_ClosedByPeer) => {
                     // Got disconnected or lost the connection
-                    self.api.disconnect(self.api_connection, DisconnectReason::ClosedByPeer);
-                    quit = true;
+                    quit_reason = Some(DisconnectReason::ClosedByPeer);
                     return;
                 }
 
                 (_, NetConnectState::k_ESteamNetworkingConnectionState_ProblemDetectedLocally) => {
                     // Lost the connection
-                    self.api.disconnect(self.api_connection, DisconnectReason::Unexpected);
-                    quit = true;
+                    quit_reason = Some(DisconnectReason::Unexpected);
                     return;
                 }
 
                 _ => {}
             }
         });
-        if quit {
-            self.socket.take();
+        if let Some(quit_reason) = quit_reason {
+            self.close(quit_reason);
             return false;
         }
 
         let msgs_to_send = msgs_to_send.into_iter()
-            .map(|(msg, flags)| socket.utils().allocate_message(
-                socket.connection(),
+            .map(|(msg, flags)| self.gns_global.utils().allocate_message(
+                state.socket.connection(),
                 msg_send_flags_to_gns(flags),
                 &msg,
             ))
             .collect::<Vec<_>>();
         if !msgs_to_send.is_empty() {
-            for msg in socket.send_messages(msgs_to_send) {
+            for msg in state.socket.send_messages(msgs_to_send) {
                 match msg {
                     Either::Left(_) => {},
                     Either::Right(error) =>
@@ -250,28 +255,28 @@ type ClientsMap = BiHashMap<GnsConnection, Connection, ahash::RandomState, ahash
 
 #[derive(Educe)]
 #[educe(Debug)]
-struct GnsServer<'gu> {
+struct GnsServer {
     #[educe(Debug(method(std::fmt::Display::fmt)))]
     id: GnsServerId,
     #[educe(Debug(ignore))]
     api: Arc<NetworkingApi>,
     #[educe(Debug(ignore))]
-    socket: Option<GnsSocket<'gu, 'gu, IsServer>>,
+    gns_global: Arc<GnsGlobal>,
+    #[educe(Debug(ignore))]
+    socket: Option<GnsSocket<IsServer>>,
     clients: Arc<RwLock<ClientsMap>>,
     #[educe(Debug(ignore))]
     msg_recv: ump::Server<ServerMessage, (), NetworkingError>,
 }
 
-impl<'gu> GnsServer<'gu> {
+impl GnsServer {
     fn new(
-        gns_global: &'gu GnsGlobal,
-        gns_utils: &'gu GnsUtils,
+        gns_global: Arc<GnsGlobal>,
         id: GnsServerId,
         api: Arc<NetworkingApi>,
         socket_addr: SocketAddr,
     ) -> Result<(Self, GnsServerHandle), NetworkingError> {
-        let socket = GnsSocket::new(gns_global, gns_utils)
-            .ok_or(NetworkingError::internal_error("Failed to create socket"))?
+        let socket = GnsSocket::new(gns_global.clone())
             .listen(socket_addr.ip(), socket_addr.port())
             .map_err(|_| NetworkingError::InvalidAddress(socket_addr))?;
 
@@ -285,6 +290,7 @@ impl<'gu> GnsServer<'gu> {
         let server = Self {
             id,
             api,
+            gns_global,
             socket: Some(socket),
             clients: clients.clone(),
             msg_recv,
@@ -308,7 +314,6 @@ impl<'gu> GnsServer<'gu> {
                 self.api.disconnect(*api_connection, DisconnectReason::ClosedLocally);
                 false
             });
-            socket.poll_callbacks();
         }
     }
 
@@ -348,12 +353,8 @@ impl<'gu> GnsServer<'gu> {
             None => return false,
         };
 
-        debug!(server = ?self, "Polling callbacks");
-        socket.poll_callbacks();
-
         let mut clients = self.clients.upgradable_read();
 
-        debug!(server = ?self, "Polling messages");
         socket.poll_messages::<100>(|message| {
             let connection = message.connection();
             if let Some(api_connection) = clients.get_by_left(&connection) {
@@ -368,7 +369,6 @@ impl<'gu> GnsServer<'gu> {
             }
         });
 
-        debug!(server = ?self, "Polling events");
         socket.poll_event::<100>(|event| {
             match (event.old_state(), event.info().state()) {
                 // A client is connecting
@@ -428,7 +428,7 @@ impl<'gu> GnsServer<'gu> {
         let msgs_to_send = msgs_to_send.into_iter()
             .filter_map(|(connection, msg, flags)| {
                 if let Some(gns_connection) = clients.get_by_right(&connection) {
-                    Some(socket.utils().allocate_message(
+                    Some(self.gns_global.utils().allocate_message(
                         *gns_connection,
                         msg_send_flags_to_gns(flags),
                         &msg,
@@ -441,8 +441,9 @@ impl<'gu> GnsServer<'gu> {
             .chain(msgs_to_broadcast.into_iter()
                 .map(|(msg, flags)| {
                     let flags = msg_send_flags_to_gns(flags);
+                    let gns_global = self.gns_global.clone();
                     clients.left_values()
-                        .map(move |gns_connection| socket.utils().allocate_message(
+                        .map(move |gns_connection| gns_global.utils().allocate_message(
                             *gns_connection,
                             flags,
                             &msg,
@@ -501,19 +502,13 @@ struct CreateServerReq {
     api: Arc<NetworkingApi>,
 }
 
-#[self_referencing]
 struct SubsystemData {
-    gns_global: GnsGlobal,
-    gns_utils: GnsUtils,
+    gns_global: Arc<GnsGlobal>,
     next_client_id: AtomicU64,
-    #[borrows(gns_global, gns_utils)]
-    #[not_covariant]
-    clients: Vec<GnsClient<'this>>,
-    next_server_id: AtomicU64,
-    #[borrows(gns_global, gns_utils)]
-    #[not_covariant]
-    servers: Vec<GnsServer<'this>>,
+    clients: Vec<GnsClient>,
     msg_create_client_recv: ump::Server<CreateClientReq, GnsClientHandle, NetworkingError>,
+    next_server_id: AtomicU64,
+    servers: Vec<GnsServer>,
     msg_create_server_recv: ump::Server<CreateServerReq, GnsServerHandle, NetworkingError>,
 }
 
@@ -532,45 +527,44 @@ pub struct GnsSubsystem {
 
 impl GnsSubsystem {
     fn tick(data: &mut SubsystemData, _delta: Duration) -> bool {
-        data.with_mut(|data| {
-            while let Some((req, reply_ctx))
-                    = data.msg_create_client_recv.try_pop().unwrap_or(None) {
-                match GnsClient::new(
-                    data.gns_global,
-                    data.gns_utils,
-                    GnsClientId(data.next_client_id.fetch_add(1, Ordering::SeqCst).try_into().unwrap()),
-                    req.api,
-                    req.connection,
-                    req.socket_addr,
-                ) {
-                    Ok((client, client_handle)) => {
-                        data.clients.push(client);
-                        reply_ctx.reply(client_handle).unwrap();
-                    },
-                    Err(err) => reply_ctx.fail(err).unwrap(),
-                }
+        while let Some((req, reply_ctx))
+                = data.msg_create_client_recv.try_pop().unwrap_or(None) {
+            match GnsClient::new(
+                data.gns_global.clone(),
+                GnsClientId(data.next_client_id.fetch_add(1, Ordering::SeqCst).try_into().unwrap()),
+                req.api,
+                req.connection,
+                req.socket_addr,
+            ) {
+                Ok((client, client_handle)) => {
+                    data.clients.push(client);
+                    reply_ctx.reply(client_handle).unwrap();
+                },
+                Err(err) => reply_ctx.fail(err).unwrap(),
             }
+        }
 
-            while let Some((req, reply_ctx))
-                    = data.msg_create_server_recv.try_pop().unwrap_or(None) {
-                match GnsServer::new(
-                    data.gns_global,
-                    data.gns_utils,
-                    GnsServerId(data.next_server_id.fetch_add(1, Ordering::SeqCst).try_into().unwrap()),
-                    req.api,
-                    req.socket_addr,
-                ) {
-                    Ok((server, server_handle)) => {
-                        data.servers.push(server);
-                        reply_ctx.reply(server_handle).unwrap();
-                    },
-                    Err(err) => reply_ctx.fail(err).unwrap(),
-                }
+        while let Some((req, reply_ctx))
+                = data.msg_create_server_recv.try_pop().unwrap_or(None) {
+            match GnsServer::new(
+                data.gns_global.clone(),
+                GnsServerId(data.next_server_id.fetch_add(1, Ordering::SeqCst).try_into().unwrap()),
+                req.api,
+                req.socket_addr,
+            ) {
+                Ok((server, server_handle)) => {
+                    data.servers.push(server);
+                    reply_ctx.reply(server_handle).unwrap();
+                },
+                Err(err) => reply_ctx.fail(err).unwrap(),
             }
+        }
 
-            data.clients.retain_mut(|client| client.tick());
-            data.servers.retain_mut(|server| server.tick());
-        });
+        data.gns_global.poll_callbacks();
+
+        data.clients.retain_mut(|client| client.tick());
+        data.servers.retain_mut(|server| server.tick());
+
         true
     }
 
@@ -582,9 +576,8 @@ impl GnsSubsystem {
             .name("gns-subsystem")
             .init(move || {
                 let gns_global = GnsGlobal::get().unwrap();
-                let gns_utils = GnsUtils::new().unwrap();
 
-                gns_utils.enable_debug_output(
+                gns_global.utils().enable_debug_output(
                     ESteamNetworkingSocketsDebugOutputType::k_ESteamNetworkingSocketsDebugOutputType_Debug,
                     |ty, msg| {
                         match ty {
@@ -604,16 +597,15 @@ impl GnsSubsystem {
                     }
                 );
 
-                Ok::<_, ()>(SubsystemDataBuilder {
+                Ok::<_, ()>(SubsystemData {
                     gns_global,
-                    gns_utils,
                     next_client_id: AtomicU64::new(1),
-                    clients_builder: move |_, _| Vec::new(),
-                    next_server_id: AtomicU64::new(1),
-                    servers_builder: move |_, _| Vec::new(),
+                    clients: Vec::new(),
                     msg_create_client_recv,
+                    next_server_id: AtomicU64::new(1),
+                    servers: Vec::new(),
                     msg_create_server_recv,
-                }.build())
+                })
             })
             .tick(Self::tick)
             .spawn()
@@ -842,7 +834,6 @@ impl NetDriverFactory<GnsServerDriver> for Arc<GnsSubsystem> {
 //   Some of them could theoretically be ran in sequence, as long as none of them are ran in
 //   parallel to each other.
 #[cfg(test)]
-#[cfg(any())] // disabled
 mod tests {
     use crate::net::driver::tests::{
         ClientServerStackFactory,

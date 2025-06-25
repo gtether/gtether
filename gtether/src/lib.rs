@@ -7,7 +7,6 @@ extern crate nalgebra_glm as glm;
 extern crate self as gtether;
 
 use educe::Educe;
-use gui::window::{AppDriverWindowManager, WindowManager};
 use parking_lot::RwLock;
 use std::any::Any;
 use std::error::Error;
@@ -22,7 +21,6 @@ use crate::app::Application;
 use crate::event::{EventBus, EventBusRegistry};
 use crate::net::driver::NetDriverFactory;
 use crate::net::Networking;
-use crate::render::{AppDriverGraphicsVulkan, Instance};
 use crate::resource::manager::ResourceManager;
 
 pub mod app;
@@ -316,11 +314,12 @@ impl<A: Application> Engine<A> {
 impl<A> Engine<A>
 where
     A: Application,
-    A::ApplicationDriver: AppDriverGraphicsVulkan,
+    A::ApplicationDriver: render::AppDriverGraphicsVulkan,
 {
-    /// The Vulkan [render instance](Instance).
+    /// The Vulkan [render instance](render::Instance).
     #[inline]
-    pub fn render_instance(&self) -> Arc<Instance> {
+    pub fn render_instance(&self) -> Arc<render::Instance> {
+        use render::AppDriverGraphicsVulkan;
         self.app_driver.render_instance()
     }
 }
@@ -329,11 +328,12 @@ where
 impl<A> Engine<A>
 where
     A: Application,
-    A::ApplicationDriver: AppDriverWindowManager,
+    A::ApplicationDriver: gui::window::AppDriverWindowManager,
 {
-    /// A reference to the [WindowManager].
+    /// A reference to the [WindowManager](gui::window::WindowManager).
     #[inline]
-    pub fn window_manager(&self) -> &dyn WindowManager {
+    pub fn window_manager(&self) -> &dyn gui::window::WindowManager {
+        use gui::window::AppDriverWindowManager;
         self.app_driver.window_manager()
     }
 }

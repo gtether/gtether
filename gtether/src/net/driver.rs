@@ -243,7 +243,7 @@ pub mod tests {
     use smol::future::FutureExt;
     use std::convert::Infallible;
     use std::fmt;
-    use std::fmt::{Display, Formatter};
+    use std::fmt::{Debug, Display, Formatter};
     use std::future::Future;
     use std::net::Ipv4Addr;
     use std::pin::Pin;
@@ -252,7 +252,7 @@ pub mod tests {
     use std::time::{Duration, Instant};
     use tracing::debug;
 
-    use crate::event::Event;
+    use crate::event::{Event, EventHandler};
     use crate::net::message::{Message, MessageBody};
     use crate::net::{Networking, NetworkingConnectEvent, NetworkingDisconnectEvent};
 
@@ -551,6 +551,8 @@ pub mod tests {
     struct NetworkingClosedFuture<D: NetDriver> {
         net: Arc<Networking<D>>,
         connection: Connection,
+        #[allow(unused)]
+        event_handler: Arc<dyn EventHandler<NetworkingDisconnectEvent>>,
         waker: Arc<Mutex<Waker>>,
     }
 
@@ -615,12 +617,15 @@ pub mod tests {
         pub async fn wait_for_connection_closed(&self, connection: Connection) {
             let waker = Arc::new(Mutex::new(Waker::noop().clone()));
             let event_waker = waker.clone();
-            self.net().event_bus().register_once(move |_event: &mut Event<NetworkingDisconnectEvent>| {
+            let event_handler = Arc::new(move |_: &mut Event<NetworkingDisconnectEvent>| {
                 event_waker.lock().wake_by_ref();
-            }).expect("NetworkingDisconnectEvent type should be valid");
+            });
+            self.net().event_bus().register(&event_handler)
+                .expect("NetworkingDisconnectEvent type should be valid");
             NetworkingClosedFuture {
                 net: self.net.clone(),
                 connection,
+                event_handler: event_handler as _,
                 waker,
             }.await;
         }
@@ -1034,11 +1039,19 @@ pub mod tests {
     /// Struct representing an actively connected [NetTest] and it's [Connection].
     /// 
     /// The internal [NetTest] is held by reference, meaning this struct is cheaply cloneable.
-    #[derive(Educe)]
-    #[educe(Debug)]
     pub struct TestConnection<'a, D: NetDriver> {
         pub net: &'a NetTest<D>,
         pub connection: Connection,
+    }
+
+    impl<'a, D: NetDriver> Debug for TestConnection<'a, D> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TestConnection")
+                .field("net", &self.net)
+                .field("connection", &self.connection)
+                .field("closed", &self.net.net.connection_info(&self.connection).is_none())
+                .finish()
+        }
     }
 
     impl<'a, D: NetDriver> Clone for TestConnection<'a, D> {
