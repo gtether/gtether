@@ -21,6 +21,7 @@ default = ["derive"]
 
 [dependencies]
 ab_glyph = { workspace = true, optional = true }
+aquamarine = { workspace = true }
 ahash = { workspace = true }
 arrayvec = { workspace = true }
 async-trait = { workspace = true }
@@ -55,5 +56,4 @@ ump = { workspace = true }
 winit = { workspace = true, optional = true }
 
 [dev-dependencies]
-aquamarine = { workspace = true }
 assert_matches = "1.5"
