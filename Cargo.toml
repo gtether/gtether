@@ -29,7 +29,6 @@ gns = { git = "https://github.com/hussein-aitlahcen/gns-rs.git" }
 image = "0.25"
 itertools = "0.14"
 nalgebra-glm = { version = "0.19.0", features = ["convert-bytemuck"]}
-ouroboros = "0.18"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 parry3d = "0.18"
 regex = "1.11"
