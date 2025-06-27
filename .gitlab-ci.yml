@@ -45,7 +45,9 @@ test-gtether:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET: $TARGET
+          - TARGET:
+            - x86_64-unknown-linux-gnu
+            - x86_64-pc-windows-msvc
   script:
     - cargo +nightly test --package gtether --all-features --release -- --format=json -Z unstable-options --report-time | junitify --out test-results
   cache:
@@ -105,7 +107,9 @@ release-example-windows:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET: $TARGET
+          - TARGET:
+            - x86_64-unknown-linux-gnu
+            - x86_64-pc-windows-msvc
   script:
     - cargo build --package windows --release --target $TARGET
   cache:
@@ -143,7 +147,9 @@ release-example-reversi:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET: $TARGET
+          - TARGET:
+            - x86_64-unknown-linux-gnu
+            - x86_64-pc-windows-msvc
   script:
     - cargo build --package reversi --release --target $TARGET
   cache:
