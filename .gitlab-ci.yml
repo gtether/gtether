@@ -18,8 +18,10 @@ build-gtether:
   parallel:
     matrix:
       - TARGET:
-          - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-gnu
+        - x86_64-unknown-linux-gnu
+        - x86_64-pc-windows-msvc
+  tags:
+    - $TARGET
   script:
     - cargo build --package gtether --all-features --release --target $TARGET
   cache:
@@ -32,15 +34,22 @@ test-gtether:
   extends:
     - .build-jobs
   stage: test
+  tags:
+    - $TARGET
+  parallel:
+    matrix:
+      - TARGET:
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
   needs:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET: x86_64-unknown-linux-gnu
+          - TARGET: $TARGET
   script:
     - cargo +nightly test --package gtether --all-features --release -- --format=json -Z unstable-options --report-time | junitify --out test-results
   cache:
-    key: "${CI_COMMIT_REF_NAME}-x86_64-unknown-linux-gnu"
+    key: "${CI_COMMIT_REF_NAME}-${TARGET}"
     policy: pull
     paths:
       - "target/"
@@ -58,6 +67,8 @@ release-gtether-docs:
       parallel:
         matrix:
           - TARGET: x86_64-unknown-linux-gnu
+  tags:
+    - x86_64-unknown-linux-gnu
   script:
     - cargo doc --package gtether --no-deps --all-features --release
   cache:
@@ -78,23 +89,23 @@ release-example-windows:
     matrix:
       - TARGET:
           - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+  tags:
+    - $TARGET
   rules:
     - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != 'merge_request_event'
       when: never
     - if: $TARGET == "x86_64-unknown-linux-gnu"
       variables:
         BIN_NAME: windows
-    - if: $TARGET == "x86_64-pc-windows-gnu"
+    - if: $TARGET == "x86_64-pc-windows-msvc"
       variables:
         BIN_NAME: windows.exe
   needs:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET:
-              - x86_64-unknown-linux-gnu
-              - x86_64-pc-windows-gnu
+          - TARGET: $TARGET
   script:
     - cargo build --package windows --release --target $TARGET
   cache:
@@ -116,23 +127,23 @@ release-example-reversi:
     matrix:
       - TARGET:
           - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+  tags:
+    - $TARGET
   rules:
     - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != 'merge_request_event'
       when: never
     - if: $TARGET == "x86_64-unknown-linux-gnu"
       variables:
         BIN_NAME: reversi
-    - if: $TARGET == "x86_64-pc-windows-gnu"
+    - if: $TARGET == "x86_64-pc-windows-msvc"
       variables:
         BIN_NAME: reversi.exe
   needs:
     - job: build-gtether
       parallel:
         matrix:
-          - TARGET:
-              - x86_64-unknown-linux-gnu
-              - x86_64-pc-windows-gnu
+          - TARGET: $TARGET
   script:
     - cargo build --package reversi --release --target $TARGET
   cache:
