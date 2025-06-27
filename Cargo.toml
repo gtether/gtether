@@ -25,7 +25,7 @@ chrono = "0.4"
 crossbeam = "0.8"
 educe = "0.6"
 flagset = "0.4"
-gns = { git = "https://github.com/hussein-aitlahcen/gns-rs.git", branch = "auto-link-deps" }
+gns = { git = "https://github.com/hussein-aitlahcen/gns-rs.git" }
 image = "0.25"
 itertools = "0.14"
 nalgebra-glm = { version = "0.19.0", features = ["convert-bytemuck"]}
