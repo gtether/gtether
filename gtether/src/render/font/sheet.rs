@@ -27,14 +27,14 @@ use vulkano::pipeline::{Pipeline, PipelineBindPoint, PipelineLayout, PipelineSha
 use vulkano::render_pass::Subpass;
 use vulkano::sync::GpuFuture;
 use vulkano::{DeviceSize, Validated};
-
+use crate::event::Event;
 use crate::render::font::compositor::FontRenderer;
 use crate::render::font::layout::PositionedChar;
 use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
 use crate::render::image::ImageSampler;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
-use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererEventType, VulkanoError};
+use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererPostEvent, VulkanoError};
 use crate::render::descriptor_set::EngineDescriptorSet;
 use crate::resource::manager::ResourceLoadResult;
 use crate::resource::{Resource, ResourceLoadError, ResourceMut, SubResourceLoader};
@@ -282,9 +282,9 @@ impl SubResourceLoader<FontSheet, dyn Font> for FontSheetLoader {
 
     async fn update(&self, resource: ResourceMut<FontSheet>, parent: &dyn Font) -> Result<(), ResourceLoadError> {
         let new_value = self.load(parent).await?;
-        self.renderer.event_bus().register_once(RendererEventType::PostRender, move |_| {
+        self.renderer.event_bus().register_once(move |_event: &mut Event<RendererPostEvent>| {
             resource.replace(new_value);
-        }).wait().await
+        }).unwrap().await
             .map_err(ResourceLoadError::from_error)
     }
 }

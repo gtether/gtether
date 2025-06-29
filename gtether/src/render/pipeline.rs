@@ -19,7 +19,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::GraphicsPipeline;
 
 use crate::event::{Event, EventHandler};
-use crate::render::{EngineDevice, RenderTarget, Renderer, RendererEventData, RendererEventType};
+use crate::render::{EngineDevice, RenderTarget, Renderer, RendererStaleEvent};
 
 /// Helper trait for retrieving a Vulkano [GraphicsPipeline].
 pub trait VKGraphicsPipelineSource: Send + Sync {
@@ -187,7 +187,7 @@ impl EngineGraphicsPipeline {
             viewport_type,
             inner: Mutex::new(EngineGraphicsPipelineState::default()),
         });
-        renderer.event_bus().register(RendererEventType::Stale, graphics.clone());
+        renderer.event_bus().register(graphics.clone()).unwrap();
         graphics
     }
 }
@@ -219,10 +219,8 @@ impl VKGraphicsPipelineSource for EngineGraphicsPipeline {
     }
 }
 
-impl EventHandler<RendererEventType, RendererEventData> for EngineGraphicsPipeline {
-    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
-        assert_eq!(event.event_type(), &RendererEventType::Stale,
-                   "GraphicsPipelineCell can only handle 'Stale' Renderer events");
+impl EventHandler<RendererStaleEvent> for EngineGraphicsPipeline {
+    fn handle_event(&self, _event: &mut Event<RendererStaleEvent>) {
         self.inner.lock().pipeline = None;
     }
 }

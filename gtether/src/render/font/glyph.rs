@@ -10,10 +10,10 @@ use smol::io::AsyncReadExt;
 use tracing::warn;
 
 pub use ab_glyph::InvalidFont;
-
+use crate::event::Event;
 use crate::render::font::sheet::FontSheetMap;
 use crate::render::font::{CharImgData, Font};
-use crate::render::{Renderer, RendererEventType};
+use crate::render::{Renderer, RendererPostEvent};
 use crate::render::font::size::{FontSizer, ScaledFontSize};
 use crate::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 use crate::resource::manager::ResourceManager;
@@ -259,13 +259,11 @@ impl ResourceLoader<dyn Font> for GlyphFontLoader {
         id: ResourcePath,
         resource: ResourceMut<dyn Font>,
         data: ResourceReadData,
-    )
-                    -> Result<(), ResourceLoadError>
-    {
+    ) -> Result<(), ResourceLoadError> {
         let new_value = self.load(manager, id, data).await?;
-        self.renderer.event_bus().register_once(RendererEventType::PostRender, move |_| {
+        self.renderer.event_bus().register_once(move |_event: &mut Event<RendererPostEvent>| {
             resource.replace(new_value);
-        }).wait().await
+        }).unwrap().await
             .map_err(ResourceLoadError::from_error)
     }
 }

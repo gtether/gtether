@@ -3,7 +3,7 @@
 //! This module contains the framework for creating, driving, and hooking into
 //! [event-driven buses][eb]. These event buses follow a publish-subscribe pattern, where a
 //! particular code site may [publish][ebf] an event, which is then propagated to all
-//! [subscribers][es] of that [event type][et].
+//! [subscribers][es] registered to events of that type.
 //!
 //! These event buses are primarily synchronous, in that any subscribed event handlers are triggered
 //! inline on the same thread that fires the event.
@@ -11,67 +11,43 @@
 //! [eb]: EventBus
 //! [ebf]: EventBus::fire
 //! [es]: EventSubscriber
-//! [et]: EventType
-
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use smol::prelude::*;
+use std::any::{Any, TypeId};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
-use std::hash::Hash;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
-/// User-defined type for [events][evt].
-///
-/// EventTypes should be simply defined, and using an enum to represent one is common.
-///
-/// # Examples
-/// ```
-/// use gtether::event::EventType;
-///
-/// #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-/// pub enum MyEventType {
-///     Type1,
-///     Type2,
-/// }
-///
-/// impl EventType for MyEventType {}
-/// ```
-///
-/// [evt]: Event
-pub trait EventType: Clone + Debug + Hash + Eq + 'static {
-    fn is_cancellable(&self) -> bool { false }
-}
+/// Marker trait for [events][Event] that are cancellable.
+pub trait EventCancellable {}
 
 /// Instance of an event that has been published.
 ///
 /// Each instance of Event represents a single event that has been fired/published, and will be
-/// handled by possibly many [subscribers][es]. This struct effectively represents a pairing of
-/// [EventType] and user-derived data.
+/// handled by possibly many [subscribers][es].
 ///
 /// [es]: EventSubscriber
-pub struct Event<T: EventType, D> {
-    event_type: T,
-    event_data: D,
+pub struct Event<T> {
+    inner: T,
     cancelled: bool,
 }
 
-impl<T: EventType, D> Event<T, D> {
-    fn new(event_type: T, event_data: D) -> Self {
+impl<T> Event<T> {
+    fn new(inner: T) -> Self {
         Self {
-            event_type,
-            event_data,
+            inner,
             cancelled: false,
         }
     }
 
-    /// [EventType] associated with this Event.
-    #[inline]
-    pub fn event_type(&self) -> &T { &self.event_type }
-
     /// User-derived data associated with this Event.
     #[inline]
-    pub fn event_data(&mut self) -> &mut D { &mut self.event_data }
+    pub fn data(&mut self) -> &mut T { &mut self.inner }
 
     /// Consume this event and yield the data it contains.
     ///
@@ -80,10 +56,10 @@ impl<T: EventType, D> Event<T, D> {
     ///
     /// # Examples
     /// ```
-    /// # use gtether::event::{EventBus, EventType};
+    /// # use gtether::event::EventBus;
     /// #
-    /// # fn wrapper<T: EventType>(event_type: T, input_data: u32, event_bus: EventBus<T, u32>) {
-    /// let event = event_bus.fire(event_type, input_data);
+    /// # fn wrapper<T>(input_data: T, event_bus: EventBus) where for<'a> T: 'a {
+    /// let event = event_bus.fire(input_data);
     /// let output_data = event.into_data();
     /// // Do something with 'output_data'...
     /// # }
@@ -91,85 +67,68 @@ impl<T: EventType, D> Event<T, D> {
     ///
     /// [es]: EventSubscriber
     #[inline]
-    pub fn into_data(self) -> D { self.event_data }
+    pub fn into_data(self) -> T { self.inner }
+}
 
+impl<T> Event<T>
+where
+    T: EventCancellable
+{
     /// Cancel this Event.
-    ///
-    /// Not every event is cancellable. An event is considered cancellable if it's associated
-    /// [EventType::is_cancellable()] returns true.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the associated [EventType] is not cancellable. See [Self::try_cancel()] for a
-    /// version of this method that does not panic.
     pub fn cancel(&mut self) {
-        if self.event_type.is_cancellable() {
-            self.cancelled = true;
-        } else {
-            panic!("Event type is not cancellable: {:?}", &self.event_type)
-        }
-    }
-
-    /// Attempt to cancel this Event.
-    ///
-    /// Not every event is cancellable. An event is considered cancellable if it's associated
-    /// [EventType::is_cancellable()] returns true.
-    ///
-    /// # Errors
-    ///
-    /// Errors if the associated [EventType] is not cancellable.
-    pub fn try_cancel(&mut self) -> Result<(), ()> {
-        if self.event_type.is_cancellable() {
-            self.cancelled = true;
-            Ok(())
-        } else {
-            Err(())
-        }
+        self.cancelled = true;
     }
 
     /// Whether this Event has been cancelled.
-    ///
-    /// Returns true if the event has been cancelled, false otherwise. If the associated [EventType]
-    /// is not cancellable, will always return false.
     #[inline]
-    pub fn is_cancelled(&self) -> bool { self.cancelled }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
 }
 
-impl<T: EventType, D> Deref for Event<T, D> {
-    type Target = D;
+impl<T> Deref for Event<T> {
+    type Target = T;
 
     #[inline]
-    fn deref(&self) -> &Self::Target { &self.event_data }
+    fn deref(&self) -> &Self::Target { &self.inner }
 }
 
-impl<T: EventType, D> DerefMut for Event<T, D> {
+impl<T> DerefMut for Event<T> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.event_data }
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
 }
 
-pub type SubscriberFn<T, D> = Arc<dyn Fn(&mut Event<T, D>) + Send + Sync + 'static>;
-pub type SubscriberFnOnce<T, D> = Box<dyn FnOnce(&mut Event<T, D>) + Send>;
+pub type SubscriberFn<T> = Arc<dyn Fn(&mut Event<T>) + Send + Sync + 'static>;
+pub type SubscriberFnOnce<T> = Box<dyn FnOnce(&mut Event<T>) + Send>;
 
 /// User-defined event handler.
 ///
 /// This trait can be used to make a complex struct-based event handler. If a simple function event
 /// handler is desired, a function that aligns with [SubscriberFn] can be used instead. See
 /// [EventSubscriber] for more.
-pub trait EventHandler<T: EventType, D>: Send + Sync + 'static {
+pub trait EventHandler<T>: Send + Sync + 'static {
     /// Handle a particular [Event] that has been fired.
-    fn handle_event(&self, event: &mut Event<T, D>);
+    fn handle_event(&self, event: &mut Event<T>);
+}
+
+impl<T, F> EventHandler<T> for F
+where
+    F: Fn(&mut Event<T>) + Send + Sync + 'static,
+{
+    #[inline]
+    fn handle_event(&self, event: &mut Event<T>) {
+        (*self)(event)
+    }
 }
 
 /// Event handler subscribed to specific [Events][evt].
 ///
-/// An EventSubscriber is triggered when any of the [Events][evt] that it is listening for are fired.
-/// Any given EventSubscriber can be re-used for multiple [EventTypes][et]. An EventSubscriber can
-/// be created using several different methods, depending on the use case.
+/// An EventSubscriber is triggered when any [Events][evt] that it is listening for are fired. An
+/// EventSubscriber is tied to a particular event type. An EventSubscriber can be created using
+/// several different methods, depending on the use case.
 ///
 /// If you have a simple event handler, you can create an EventSubscriber from a closure that
-/// matches [SubscriberFn]. These closures are wrapped in Arc, so they can still be re-used and/or
-/// used for multiple [EventTypes][et], but they are generally used in a "subscribe-and-forget"
-/// manner.
+/// matches [SubscriberFn].
 ///
 /// For more complex cases, a struct-based event handler that implements [EventHandler] can be used.
 /// Struct-based handlers can be turned into two different types of EventSubscribers:
@@ -177,84 +136,99 @@ pub trait EventHandler<T: EventType, D>: Send + Sync + 'static {
 ///  * A Ref EventSubscriber. This is created by giving either an Arc or Weak smart pointer to a
 ///    [register function][reg]. The [EventBus] does not own these handlers, and only maintains a
 ///    weak reference, allowing them to be dropped externally.
-///  * An Owned EventSubscriber. The [EventBus] will own this handler, and is responsible for its
-///    lifecycle. Due to limitations will broad-scale trait implementation for From<>, this cannot
-///    be auto-converted into when [registering][reg], and so will need to be manually created as
-///    such:
-///     ```
-///     # use std::sync::Arc;
-///     # use gtether::event::{EventType, EventHandler};
-///     use gtether::event::EventSubscriber;
-///
-///     # fn wrapper<T: EventType, D, H: EventHandler<T, D>>(handler: Arc<H>) {
-///     let subscriber = EventSubscriber::Owned(handler);
-///     # }
-///     ```
+///  * An Owned EventSubscriber. This is created by directly giving an [EventHandler] to a
+///    [register function][reg].
 ///
 /// [evt]: Event
-/// [et]: EventType
 /// [reg]: EventBusRegistry::register
-pub enum EventSubscriber<T: EventType, D> {
-    Owned(Arc<dyn EventHandler<T, D>>),
-    Ref(Weak<dyn EventHandler<T, D>>),
-    Fn(SubscriberFn<T, D>),
+pub enum EventSubscriber<T> {
+    Owned(Box<dyn EventHandler<T>>),
+    Ref(Weak<dyn EventHandler<T>>),
+    Fn(SubscriberFn<T>),
 }
 
-impl<T, D, H> From<Arc<H>> for EventSubscriber<T, D>
+impl<T> EventSubscriber<T> {
+    #[inline]
+    pub fn owned<H: EventHandler<T>>(handler: H) -> Self {
+        Self::Owned(Box::new(handler))
+    }
+}
+
+impl<T, H> From<Arc<H>> for EventSubscriber<T>
 where
-    T: EventType,
-    H: EventHandler<T, D>,
+    H: EventHandler<T>,
 {
     #[inline]
-    fn from(value: Arc<H>) -> Self { Self::Ref(Arc::downgrade(&value) as Weak<dyn EventHandler<T, D>>) }
+    fn from(value: Arc<H>) -> Self {
+        Self::Ref(Arc::downgrade(&value) as Weak<dyn EventHandler<T>>)
+    }
 }
 
-impl<T, D, H> From<&Arc<H>> for EventSubscriber<T, D>
+impl<T, H> From<&Arc<H>> for EventSubscriber<T>
 where
-    T: EventType,
-    H: EventHandler<T, D>,
+    H: EventHandler<T>,
 {
     #[inline]
-    fn from(value: &Arc<H>) -> Self { Self::Ref(Arc::downgrade(value) as Weak<dyn EventHandler<T, D>>) }
+    fn from(value: &Arc<H>) -> Self {
+        Self::Ref(Arc::downgrade(value) as Weak<dyn EventHandler<T>>)
+    }
 }
 
-impl<T, D, H> From<Weak<H>> for EventSubscriber<T, D>
+impl<T, H> From<Weak<H>> for EventSubscriber<T>
 where
-    T: EventType,
-    H: EventHandler<T, D>,
+    H: EventHandler<T>,
 {
     #[inline]
-    fn from(value: Weak<H>) -> Self { Self::Ref(value) }
+    fn from(value: Weak<H>) -> Self {
+        Self::Ref(value)
+    }
 }
 
-impl<T, D, F> From<F> for EventSubscriber<T, D>
+impl<T, F> From<F> for EventSubscriber<T>
 where
-    T: EventType,
-    F: Fn(&mut Event<T, D>) + Send + Sync + 'static,
+    F: Fn(&mut Event<T>) + Send + Sync + 'static,
 {
     #[inline]
-    fn from(value: F) -> Self { Self::Fn(Arc::new(value)) }
+    fn from(value: F) -> Self {
+        Self::Fn(Arc::new(value))
+    }
 }
 
-impl<T: EventType, D> Clone for EventSubscriber<T, D> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Owned(handler) => Self::Owned(handler.clone()),
-            Self::Ref(handler) => Self::Ref(handler.clone()),
-            Self::Fn(handler) => Self::Fn(handler.clone()),
+impl<T> From<EventSubscriber<T>> for SubscriberEntry
+where
+    for<'a> T: 'a,
+{
+    fn from(value: EventSubscriber<T>) -> Self {
+        match value {
+            EventSubscriber::Owned(handler) => Self::Owned(Box::new(handler)),
+            EventSubscriber::Ref(handler) => Self::Ref(Box::new(handler)),
+            EventSubscriber::Fn(handler) => Self::Fn(Box::new(handler)),
         }
     }
 }
 
-impl<T: EventType, D: 'static> EventSubscriber<T, D> {
-    fn handle_event(&self, event: &mut Event<T, D>) -> bool {
+enum SubscriberEntry {
+    Owned(Box<dyn Any + Send + Sync + 'static>),
+    Ref(Box<dyn Any + Send + Sync + 'static>),
+    Fn(Box<dyn Any + Send + Sync + 'static>),
+}
+
+impl SubscriberEntry {
+    fn handle_event<T>(&self, event: &mut Event<T>) -> bool
+    where
+        for<'a> T: 'a,
+    {
         match self {
             Self::Owned(handler) => {
-                handler.handle_event(event);
+                handler.downcast_ref::<Box<dyn EventHandler<T>>>()
+                    .unwrap()
+                    .handle_event(event);
                 true
             },
             Self::Ref(handler) => {
-                if let Some(handler) = handler.upgrade() {
+                let weak = handler.downcast_ref::<Weak<dyn EventHandler<T>>>()
+                    .unwrap();
+                if let Some(handler) = weak.upgrade() {
                     handler.handle_event(event);
                     true
                 } else {
@@ -262,6 +236,8 @@ impl<T: EventType, D: 'static> EventSubscriber<T, D> {
                 }
             },
             Self::Fn(handler) => {
+                let handler = handler.downcast_ref::<SubscriberFn<T>>()
+                    .unwrap();
                 handler(event);
                 true
             },
@@ -286,13 +262,51 @@ impl Display for SubscriberOnceError {
 
 impl Error for SubscriberOnceError {}
 
+impl From<ump::Error<()>> for SubscriberOnceError {
+    #[inline]
+    fn from(value: ump::Error<()>) -> Self {
+        match value {
+            ump::Error::ServerDisappeared | ump::Error::ClientsDisappeared | ump::Error::NoReply =>
+                Self::Dropped,
+            ump::Error::App(e) => panic!("Unexpected App error: {e:?}"),
+        }
+    }
+}
+
+enum SubscriberOnceFutureState {
+    Init(Result<ump::WaitReply<(), ()>, SubscriberOnceError>),
+    Awaiting(Pin<Box<dyn Future<Output = Result<(), ump::Error<()>>> + Send>>),
+    Uninit,
+}
+
+impl SubscriberOnceFutureState {
+    fn poll(self, cx: &mut Context<'_>) -> (SubscriberOnceFutureState, Poll<Result<(), SubscriberOnceError>>) {
+        match self {
+            Self::Init(result) => {
+                match result {
+                    Ok(wait_reply) =>
+                        Self::Awaiting(Box::pin(wait_reply.wait_async())).poll(cx),
+                    Err(err) =>
+                        (Self::Uninit, Poll::Ready(Err(err))),
+                }
+            },
+            Self::Awaiting(mut fut) => {
+                match fut.poll(cx) {
+                    Poll::Ready(result) =>
+                        (Self::Uninit, Poll::Ready(result.map_err(Into::into))),
+                    Poll::Pending => (Self::Awaiting(fut), Poll::Pending),
+                }
+            },
+            Self::Uninit => unreachable!("Found uninit state"),
+        }
+    }
+}
+
 /// Handle for a queued [SubscriberFnOnce].
 ///
-/// Can be waited on either [synchronously][sync] or [asynchronously][async].
-///
-/// [sync]: SubscriberOnceFuture::wait_blocking
-/// [async]: SubscriberOnceFuture::wait
-pub struct SubscriberOnceFuture(Result<ump::WaitReply<(), ()>, ump::Error<()>>);
+/// Can be waited on either synchronously using [SubscriberOnceFuture::wait()] or asynchronously
+/// with `.await` syntax.
+pub struct SubscriberOnceFuture(SubscriberOnceFutureState);
 
 impl SubscriberOnceFuture {
     fn map_ump_error(error: ump::Error<()>) -> SubscriberOnceError {
@@ -303,25 +317,19 @@ impl SubscriberOnceFuture {
         }
     }
 
-    /// Asynchronously wait for a [SubscriberFnOnce] to complete.
-    ///
-    /// # Examples
-    /// ```
-    /// # use gtether::event::{EventBus, EventType, SubscriberOnceError};
-    /// use gtether::event::Event;
-    ///
-    /// # async fn wrapper<T: EventType, D: 'static>(event_type: T, event_bus: EventBus<T, D>) -> Result<(), SubscriberOnceError> {
-    /// let fut = event_bus.registry().register_once(event_type, |event: &mut Event<T, D>| {
-    ///     // Some one-time action
-    /// });
-    /// fut.wait().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    pub async fn wait(self) -> Result<(), SubscriberOnceError> {
-        self.0.map_err(Self::map_ump_error)?
-            .wait_async().await.map_err(Self::map_ump_error)
+    fn new(wait_reply: Result<ump::WaitReply<(), ()>, ump::Error<()>>) -> Self {
+        Self(SubscriberOnceFutureState::Init(wait_reply.map_err(Self::map_ump_error)))
+    }
+
+    fn with_state<R>(
+        &mut self,
+        f: impl FnOnce(SubscriberOnceFutureState) -> (SubscriberOnceFutureState, R),
+    ) -> R {
+        let mut state = SubscriberOnceFutureState::Uninit;
+        std::mem::swap(&mut self.0, &mut state);
+        let (mut state, result) = f(state);
+        std::mem::swap(&mut self.0, &mut state);
+        result
     }
 
     /// Synchronously wait for a [SubscriberFnOnce] to complete.
@@ -331,76 +339,91 @@ impl SubscriberOnceFuture {
     ///
     /// # Examples
     /// ```
-    /// # use gtether::event::{EventBus, EventType, SubscriberOnceError};
+    /// # use gtether::event::{EventBus, SubscriberOnceError};
     /// use gtether::event::Event;
     ///
-    /// # fn wrapper<T: EventType, D: 'static>(event_type: T, event_bus: EventBus<T, D>) -> Result<(), SubscriberOnceError> {
-    /// let fut = event_bus.registry().register_once(event_type, |event: &mut Event<T, D>| {
+    /// # fn wrapper<T>(event_bus: EventBus) -> Result<(), SubscriberOnceError> where for<'a> T: 'a {
+    /// let fut = event_bus.registry().register_once(|event: &mut Event<T>| {
     ///     // Some one-time action
-    /// });
-    /// fut.wait_blocking()?;
+    /// }).unwrap(); // We're sure we're registering the right type here
+    /// fut.wait()?;
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    pub fn wait_blocking(self) -> Result<(), SubscriberOnceError> {
-        self.0.map_err(Self::map_ump_error)?
-            .wait().map_err(Self::map_ump_error)
-    }
-}
-
-struct SubscriberOncePipe<T: EventType, D> {
-    client: ump::Client<SubscriberFnOnce<T, D>, (), ()>,
-    server: ump::Server<SubscriberFnOnce<T, D>, (), ()>,
-}
-
-impl<T: EventType, D> Default for SubscriberOncePipe<T, D> {
-    #[inline]
-    fn default() -> Self {
-        let (server, client) = ump::channel();
-        Self {
-            client,
-            server,
+    pub fn wait(self) -> Result<(), SubscriberOnceError> {
+        match self.0 {
+            SubscriberOnceFutureState::Init(wait_reply) =>
+                wait_reply?.wait().map_err(Self::map_ump_error),
+            SubscriberOnceFutureState::Awaiting(_) =>
+                panic!("Can't wait synchronously once async polling has started"),
+            SubscriberOnceFutureState::Uninit =>
+                unreachable!("Found uninit state"),
         }
     }
 }
 
-impl<T: EventType, D: 'static> SubscriberOncePipe<T, D> {
-    fn send(&self, subscriber: SubscriberFnOnce<T, D>) -> SubscriberOnceFuture {
-        SubscriberOnceFuture(self.client.req_async(subscriber))
+impl Future for SubscriberOnceFuture {
+    type Output = Result<(), SubscriberOnceError>;
+
+    #[inline]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.with_state(|state| state.poll(cx))
+    }
+}
+
+struct SubscriberOncePipe {
+    client: Box<dyn Any + Send + Sync>, // ump::Client<SubscriberFnOnce<T>, (), ()>,
+    server: Box<dyn Any + Send + Sync>, // ump::Server<SubscriberFnOnce<T>, (), ()>,
+}
+
+impl SubscriberOncePipe {
+    fn new<T>() -> Self
+    where
+        for<'a> T: 'a,
+    {
+        let (server, client) = ump::channel::<SubscriberFnOnce<T>, (), ()>();
+        Self {
+            client: Box::new(client),
+            server: Box::new(server),
+        }
     }
 
-    fn handle_event(&self, event: &mut Event<T, D>) {
-        while let Some((subscriber, ctx)) = self.server.try_pop().unwrap() {
+    fn send<T>(&self, subscriber: SubscriberFnOnce<T>) -> SubscriberOnceFuture
+    where
+        for<'a> T: 'a,
+    {
+        let client = self.client.downcast_ref::<ump::Client<SubscriberFnOnce<T>, (), ()>>()
+            .unwrap();
+        SubscriberOnceFuture::new(client.req_async(subscriber))
+    }
+
+    fn handle_event<T>(&self, event: &mut Event<T>)
+    where
+        for<'a> T: 'a,
+    {
+        let server = self.server.downcast_ref::<ump::Server<SubscriberFnOnce<T>, (), ()>>()
+            .unwrap();
+        while let Some((subscriber, ctx)) = server.try_pop().unwrap() {
             subscriber(event);
             ctx.reply(()).unwrap();
         }
     }
 }
 
-/// Helper type for passing parameters of [EventTypes][et].
-///
-/// Not meant to be used directly, but is used by several functions in this module to accept either
-/// a single or a collection of [EventTypes][et].
-///
-/// [et]: EventType
-#[derive(Default)]
-pub struct EventTypeList<T: EventType>(Vec<T>);
-
-impl<T: EventType> From<Vec<T>> for EventTypeList<T> {
-    #[inline]
-    fn from(value: Vec<T>) -> Self { Self(value) }
+#[derive(Debug)]
+pub struct InvalidTypeIdError {
+    type_id: TypeId,
 }
 
-impl<T: EventType, const N: usize> From<[T; N]> for EventTypeList<T> {
+impl Display for InvalidTypeIdError {
     #[inline]
-    fn from(value: [T; N]) -> Self { Self(value.into_iter().collect()) }
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TypeId '{:?}' is not valid for the EventBus", self.type_id)
+    }
 }
 
-impl<T: EventType> From<T> for EventTypeList<T> {
-    #[inline]
-    fn from(value: T) -> Self { Self(vec![value.into()]) }
-}
+impl Error for InvalidTypeIdError {}
 
 /// Registry for registering new [EventSubscribers][es] to.
 ///
@@ -412,64 +435,69 @@ impl<T: EventType> From<T> for EventTypeList<T> {
 ///
 /// [es]: EventSubscriber
 /// [evt]: Event
-pub struct EventBusRegistry<T: EventType, D> {
-    subscribers: RwLock<HashMap<T, Vec<EventSubscriber<T, D>>>>,
-    once_pipes: RwLock<HashMap<T, SubscriberOncePipe<T, D>>>,
+pub struct EventBusRegistry {
+    valid_type_ids: HashSet<TypeId>,
+    subscribers: RwLock<HashMap<TypeId, Vec<SubscriberEntry>>>,
+    once_pipes: RwLock<HashMap<TypeId, SubscriberOncePipe>>,
 }
 
-impl<T: EventType, D: 'static> EventBusRegistry<T, D> {
-
+impl EventBusRegistry {
     /// Register a new [EventSubscriber].
     ///
-    /// Multiple [EventTypes][et] can be specified, and the [EventSubscriber] will be cloned for
-    /// each [EventType][et].
-    ///
-    /// [et]: EventType
-    /// [evt]: Event
-    pub fn register(
+    /// The [EventSubscriber] will be registered under the [TypeId] of `T`.
+    pub fn register<T>(
         &self,
-        event_types: impl Into<EventTypeList<T>>,
-        subscriber: impl Into<EventSubscriber<T, D>>,
-    ) {
-        self.register_impl(
-            event_types.into().0,
-            subscriber.into(),
-        )
-    }
-
-    fn register_impl(&self, event_types: Vec<T>, subscriber: EventSubscriber<T, D>) {
-        let mut subscribers_map = self.subscribers.write();
-        for event_type in event_types {
-            subscribers_map.entry(event_type).or_default().push(subscriber.clone());
+        subscriber: impl Into<EventSubscriber<T>>,
+    ) -> Result<(), InvalidTypeIdError>
+    where
+        for<'a> T: 'a,
+    {
+        let type_id = TypeId::of::<T>();
+        if self.valid_type_ids.contains(&type_id) {
+            let subscriber = subscriber.into();
+            self.subscribers.write()
+                .entry(type_id)
+                .or_default()
+                .push(subscriber.into());
+            Ok(())
+        } else {
+            Err(InvalidTypeIdError { type_id })
         }
     }
 
     /// Register a one-off event handler.
+    ///
+    /// The one-off event handler will be registered under the [TypeId] of `T`.
     ///
     /// This one-off handler will receive exactly one [Event] (or none, if the [EventBus] is dropped
     /// before an event occurs). This method returns a [handle][sof] that can be used to wait until
     /// the expected event occurs.
     ///
     /// [sof]: SubscriberOnceFuture
-    pub fn register_once(
+    pub fn register_once<T>(
         &self,
-        event_type: impl Into<T>,
-        subscriber: impl FnOnce(&mut Event<T, D>) + Send + 'static,
-    ) -> SubscriberOnceFuture {
-        self.register_once_impl(event_type.into(), Box::new(subscriber))
-    }
-
-    fn register_once_impl(&self, event_type: T, subscriber: SubscriberFnOnce<T, D>) -> SubscriberOnceFuture {
-        let mut once_pipes_map = self.once_pipes.upgradable_read();
-        let once_pipe = if once_pipes_map.contains_key(&event_type) {
-            &once_pipes_map[&event_type]
+        subscriber_once: impl FnOnce(&mut Event<T>) + Send + 'static,
+    ) -> Result<SubscriberOnceFuture, InvalidTypeIdError>
+    where
+        for<'a> T: 'a,
+    {
+        let type_id = TypeId::of::<T>();
+        if self.valid_type_ids.contains(&type_id) {
+            let subscriber_once: SubscriberFnOnce<T> = Box::new(subscriber_once);
+            let mut once_pipes_map = self.once_pipes.upgradable_read();
+            let once_pipe = if once_pipes_map.contains_key(&type_id) {
+                &once_pipes_map[&type_id]
+            } else {
+                once_pipes_map.with_upgraded(|map| {
+                    map.entry(type_id.clone())
+                        .or_insert_with(SubscriberOncePipe::new::<T>);
+                });
+                &once_pipes_map[&type_id]
+            };
+            Ok(once_pipe.send(subscriber_once))
         } else {
-            once_pipes_map.with_upgraded(|map| {
-                map.entry(event_type.clone()).or_default();
-            });
-            &once_pipes_map[&event_type]
-        };
-        once_pipe.send(subscriber)
+            Err(InvalidTypeIdError { type_id })
+        }
     }
 }
 
@@ -501,33 +529,30 @@ impl<T: EventType, D: 'static> EventBusRegistry<T, D> {
 ///
 /// [evt]: Event
 /// [es]: EventSubscriber
-/// [etc]: EventType::is_cancellable
+/// [etc]: EventCancellable
 /// [ec]: Event::is_cancelled
-pub struct EventBus<T: EventType, D> {
-    registry: EventBusRegistry<T, D>,
+pub struct EventBus {
+    registry: EventBusRegistry,
 }
 
-impl<T: EventType, D> Default for EventBus<T, D> {
-    fn default() -> Self {
-        Self {
-            registry: EventBusRegistry {
-                subscribers: RwLock::new(HashMap::new()),
-                once_pipes: RwLock::new(HashMap::new()),
-            }
-        }
+impl EventBus {
+    /// Create an [EventBusBuilder].
+    ///
+    /// This is the recommended way to create an [EventBus].
+    #[inline]
+    pub fn builder() -> EventBusBuilder {
+        EventBusBuilder::new()
     }
-}
 
-impl<T: EventType, D: 'static> EventBus<T, D> {
     /// Reference to this EventBus's [EventBusRegistry].
     #[inline]
-    pub fn registry(&self) -> &EventBusRegistry<T, D> { &self.registry }
+    pub fn registry(&self) -> &EventBusRegistry { &self.registry }
 
     /// Fire/publish an [Event].
     ///
-    /// Given a particular [EventType] and user-derived event data, create an [Event] and send it
-    /// to any registered [EventSubscribers][es]. All standard [EventSubscribers][es] receive the
-    /// [Event] first, then any one-off handlers.
+    /// Given user-derived event data, create an [Event] and send it to any registered
+    /// [EventSubscribers][es] that match the event data's [TypeId]. All standard
+    /// [EventSubscribers][es] receive the [Event] first, then any one-off handlers.
     ///
     /// The [Event] will be returned after all handlers are done with it, which allows any relevant
     /// data generated from handlers to be [extracted from it][evid].
@@ -535,19 +560,22 @@ impl<T: EventType, D: 'static> EventBus<T, D> {
     /// See also: [struct-level documentation](Self)
     ///
     /// [es]: EventSubscriber
-    /// [evc]: EventType::is_cancellable
     /// [evid]: Event::into_data
-    pub fn fire(&self, event_type: T, event_data: D) -> Event<T, D> {
-        let mut event = Event::new(event_type.clone(), event_data);
+    pub fn fire<T>(&self, event_data: T) -> Event<T>
+    where
+        for<'a> T: 'a,
+    {
+        let type_id = TypeId::of::<T>();
+        let mut event = Event::new(event_data);
 
         let mut subscribers_map = self.registry.subscribers.write();
         let once_pipes_map = self.registry.once_pipes.read();
 
-        if let Some(subscribers) = subscribers_map.get_mut(&event_type) {
+        if let Some(subscribers) = subscribers_map.get_mut(&type_id) {
             subscribers.retain(|subscriber| subscriber.handle_event(&mut event));
         }
 
-        if let Some(once_pipe) = once_pipes_map.get(&event_type) {
+        if let Some(once_pipe) = once_pipes_map.get(&type_id) {
             once_pipe.handle_event(&mut event);
         }
 
@@ -555,13 +583,58 @@ impl<T: EventType, D: 'static> EventBus<T, D> {
     }
 }
 
+/// Builder pattern for [EventBus].
+///
+/// Usually created via [EventBus::builder()].
+pub struct EventBusBuilder {
+    valid_type_ids: HashSet<TypeId>,
+}
+
+impl EventBusBuilder {
+    /// Create a new builder.
+    ///
+    /// It is recommended to use [EventBus::builder()] instead.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            valid_type_ids: HashSet::new(),
+        }
+    }
+
+    /// Add a [TypeId] that the [EventBus] will be expected to fire.
+    ///
+    /// If any [TypeIds](TypeId) are added, only events of that type are expected to be fired and
+    /// handled, otherwise an [InvalidTypeIdError] will be yielded. If no TypeIds are added, any
+    /// events may be fired and handled.
+    #[inline]
+    pub fn event_type<T>(&mut self) -> &mut Self
+    where
+        for<'a> T: 'a,
+    {
+        self.valid_type_ids.insert(TypeId::of::<T>());
+        self
+    }
+
+    /// Build a new [EventBus].
+    #[inline]
+    pub fn build(&self) -> EventBus {
+        EventBus {
+            registry: EventBusRegistry {
+                valid_type_ids: self.valid_type_ids.clone(),
+                subscribers: RwLock::new(HashMap::new()),
+                once_pipes: RwLock::new(HashMap::new()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::time::Duration;
     use smol::future::FutureExt;
     use smol::{future, Timer};
+    use std::future::Future;
+    use std::time::Duration;
 
     async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -571,178 +644,173 @@ mod tests {
         fut.or(timeout_fn).await
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct StringEventType(String);
+    struct IncrementEvent(u32);
 
-    impl EventType for StringEventType {}
+    struct CancellableIncrementEvent(u32);
+    impl EventCancellable for CancellableIncrementEvent {}
 
-    impl From<&str> for StringEventType {
-        fn from(value: &str) -> Self { Self(value.to_owned()) }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct CancellableStringEventType(String);
-
-    impl EventType for CancellableStringEventType {
-        fn is_cancellable(&self) -> bool { true }
-    }
-
-    impl From<&str> for CancellableStringEventType {
-        fn from(value: &str) -> Self { Self(value.to_owned()) }
-    }
-
+    #[derive(Default)]
     struct IncrementHandler {}
-
-    impl<T: EventType> EventHandler<T, u32> for IncrementHandler {
-        fn handle_event(&self, event: &mut Event<T, u32>) {
-            *event.event_data() += 1;
+    impl EventHandler<IncrementEvent> for IncrementHandler {
+        fn handle_event(&self, event: &mut Event<IncrementEvent>) {
+            event.data().0 += 1;
         }
+    }
+
+    fn create_event_bus() -> EventBus {
+        EventBus::builder()
+            .event_type::<IncrementEvent>()
+            .event_type::<CancellableIncrementEvent>()
+            .build()
     }
 
     #[test]
     fn test_fire_event_no_subscriber() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
+        let event_bus = create_event_bus();
 
-        let mut result = event_bus.fire("no_event".into(), 0);
-        assert_eq!(*result.event_data(), 0);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 0);
 
         // Repeat should work
-        let mut result = event_bus.fire("no_event".into(), 0);
-        assert_eq!(*result.event_data(), 0);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 0);
     }
 
     #[test]
-    fn test_fire_event_one_subscriber() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
-        event_bus.registry().register(StringEventType::from("inc1"), |event: &mut Event<StringEventType, u32>| {
-            *event.event_data() += 1;
-        });
+    fn test_fire_event_single_subscriber() {
+        let event_bus = create_event_bus();
+        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
 
-        let mut result = event_bus.fire("inc1".into(), 0);
-        assert_eq!(*result.event_data(), 1);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 1);
 
         // Repeat should work
-        let mut result = event_bus.fire("inc1".into(), 0);
-        assert_eq!(*result.event_data(), 1);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 1);
     }
 
     #[test]
-    fn test_fire_event_three_subscriber() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
+    fn test_fire_event_multiple_subscribers() {
+        let event_bus = create_event_bus();
         for _ in 0..3 {
-            event_bus.registry().register(StringEventType::from("inc3"), |event: &mut Event<StringEventType, u32>| {
-                *event.event_data() += 1;
-            });
+            event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
         }
 
-        let mut result = event_bus.fire("inc3".into(), 0);
-        assert_eq!(*result.event_data(), 3);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 3);
 
         // Repeat should work
-        let mut result = event_bus.fire("inc3".into(), 0);
-        assert_eq!(*result.event_data(), 3);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 3);
     }
 
     #[test]
-    fn test_fire_event_three_types() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
-        event_bus.registry().register(
-            ["inc1".into(), "inc2".into(), "inc3".into()],
-            |event: &mut Event<StringEventType, u32>| {
-                *event.event_data() += 1;
-            },
-        );
+    fn test_fire_event_multiple_types() {
+        struct Inc1Event(u32);
+        struct Inc2Event(u32);
+        struct Inc4Event(u32);
 
-        for i in 1..4 {
-            let result = event_bus.fire(format!("inc{i}").as_str().into(), 0);
-            assert_eq!(result.into_data(), 1);
-        }
+        let event_bus = EventBus::builder()
+            .event_type::<Inc1Event>()
+            .event_type::<Inc2Event>()
+            .event_type::<Inc4Event>()
+            .build();
+
+        event_bus.registry().register(|event: &mut Event<Inc1Event>| { event.data().0 += 1; }).unwrap();
+        event_bus.registry().register(|event: &mut Event<Inc2Event>| { event.data().0 += 2; }).unwrap();
+        event_bus.registry().register(|event: &mut Event<Inc4Event>| { event.data().0 += 4; }).unwrap();
+
+        let result = event_bus.fire(Inc1Event(0));
+        assert_eq!(result.into_data().0, 1);
+
+        let result = event_bus.fire(Inc2Event(0));
+        assert_eq!(result.into_data().0, 2);
+
+        let result = event_bus.fire(Inc4Event(0));
+        assert_eq!(result.into_data().0, 4);
     }
 
     #[test]
     fn test_fire_event_once_subscriber() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
-        let once_fut = event_bus.registry().register_once(StringEventType::from("inc"), |event| {
-            *event.event_data() += 1;
-        });
+        let event_bus = create_event_bus();
+        let once_fut = event_bus.registry().register_once(|event: &mut Event<IncrementEvent>| {
+            event.data().0 += 1;
+        }).unwrap();
 
         // First should work
-        let mut result = event_bus.fire("inc".into(), 0);
-        assert_eq!(*result.event_data(), 1);
-        future::block_on(timeout(once_fut.wait(), Duration::from_secs(1)))
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 1);
+        future::block_on(timeout(once_fut, Duration::from_secs(1)))
             .expect("SubscriberOnce should not error");
 
         // Second should do nothing
-        let mut result = event_bus.fire("inc".into(), 0);
-        assert_eq!(*result.event_data(), 0);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 0);
     }
 
     #[test]
     fn test_fire_event_subscriber_and_once() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
-        event_bus.registry().register(StringEventType::from("inc"), |event: &mut Event<StringEventType, u32>| {
-            *event.event_data() += 1;
-        });
-        let once_fut = event_bus.registry().register_once(StringEventType::from("inc"), |event| {
-            *event.event_data() += 1;
-        });
+        let event_bus = create_event_bus();
+        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
+        let once_fut = event_bus.registry().register_once(|event: &mut Event<IncrementEvent>| {
+            event.data().0 += 1;
+        }).unwrap();
 
         // First should do both
-        let mut result = event_bus.fire("inc".into(), 0);
-        assert_eq!(*result.event_data(), 2);
-        future::block_on(timeout(once_fut.wait(), Duration::from_secs(1)))
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 2);
+        future::block_on(timeout(once_fut, Duration::from_secs(1)))
             .expect("SubscriberOnce should not error");
 
         // Second should do one
-        let mut result = event_bus.fire("inc".into(), 0);
-        assert_eq!(*result.event_data(), 1);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 1);
     }
 
     #[test]
     fn test_fire_event_cancelled() {
-        let event_bus = EventBus::<CancellableStringEventType, u32>::default();
-        event_bus.registry().register(CancellableStringEventType::from("event"), |event: &mut Event<CancellableStringEventType, u32>| {
-            *event.event_data() += 1;
-        });
-        event_bus.registry().register(CancellableStringEventType::from("event"), |event: &mut Event<CancellableStringEventType, u32>| {
-            *event.event_data() += 1;
+        let event_bus = create_event_bus();
+        event_bus.registry().register(|event: &mut Event<CancellableIncrementEvent>| {
+            event.data().0 += 1;
+        }).unwrap();
+        event_bus.registry().register(|event: &mut Event<CancellableIncrementEvent>| {
+            event.data().0 += 1;
             event.cancel();
-        });
-        event_bus.registry().register(CancellableStringEventType::from("event"), |event: &mut Event<CancellableStringEventType, u32>| {
-            *event.event_data() += 1;
-        });
+        }).unwrap();
+        event_bus.registry().register(|event: &mut Event<CancellableIncrementEvent>| {
+            event.data().0 += 1;
+        }).unwrap();
 
-        let result = event_bus.fire("event".into(), 0);
+        let result = event_bus.fire(CancellableIncrementEvent(0));
         assert!(result.is_cancelled());
-        assert_eq!(result.into_data(), 3);
+        assert_eq!(result.into_data().0, 3);
 
         // Repeat should work
-        let result = event_bus.fire("event".into(), 0);
+        let result = event_bus.fire(CancellableIncrementEvent(0));
         assert!(result.is_cancelled());
-        assert_eq!(result.into_data(), 3);
+        assert_eq!(result.into_data().0, 3);
     }
 
     #[test]
     fn test_fire_event_weak() {
-        let event_bus = EventBus::<StringEventType, u32>::default();
-        let handler1 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(StringEventType::from("event"), EventSubscriber::Owned(handler1));
-        let handler2 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(StringEventType::from("event"), handler2.clone());
-        let handler3 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(StringEventType::from("event"), handler3.clone());
-        let handler4 = Arc::new(IncrementHandler {});
-        event_bus.registry().register(StringEventType::from("event"), Arc::downgrade(&handler4));
+        let event_bus = create_event_bus();
+        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
+        let handler2 = Arc::new(IncrementHandler::default());
+        event_bus.registry().register(handler2.clone()).unwrap();
+        let handler3 = Arc::new(IncrementHandler::default());
+        event_bus.registry().register(Arc::downgrade(&handler3)).unwrap();
 
-        let result = event_bus.fire("event".into(), 0);
-        assert_eq!(result.into_data(), 4);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 3);
 
-        // Drop 1 strong and 1 weak
+        // Drop the direct weak ref
+        drop(handler3);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 2);
+
+        // Drop the indirect weak ref
         drop(handler2);
-        drop(handler4);
-
-        // Only the 1 weak should no longer be handling
-        let result = event_bus.fire("event".into(), 0);
-        assert_eq!(result.into_data(), 2);
+        let result = event_bus.fire(IncrementEvent(0));
+        assert_eq!(result.into_data().0, 1);
     }
 }

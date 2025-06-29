@@ -20,10 +20,10 @@ use vulkano::sync::GpuFuture;
 use vulkano::{Validated, VulkanError, VulkanLibrary};
 use vulkano::image::AllocateImageError;
 
-use crate::event::{EventBus, EventBusRegistry, EventType};
+use crate::app::driver::AppDriver;
+use crate::event::{EventBus, EventBusRegistry, EventCancellable};
 use crate::render::render_pass::{EngineRenderPass, NoOpEngineRenderPass};
 use crate::render::swapchain::EngineSwapchain;
-use crate::EngineMetadata;
 use crate::render::frame::FrameManager;
 
 pub mod attachment;
@@ -136,12 +136,12 @@ pub struct Instance {
 }
 
 impl Instance {
-    pub(crate) fn new(engine_metadata: &EngineMetadata, extensions: InstanceExtensions) -> Self {
+    pub(crate) fn new(application_name: Option<String>, extensions: InstanceExtensions) -> Self {
         let library = VulkanLibrary::new()
             .expect("Failed to load Vulkan library/DLL");
 
         let inner = VKInstance::new(library, InstanceCreateInfo {
-            application_name: engine_metadata.application_name.clone(),
+            application_name,
             engine_name: Some("gTether".to_owned()),
             // TODO: Engine version
             // engine_version: ,
@@ -166,13 +166,18 @@ impl Deref for Instance {
     }
 }
 
+/// Trait describing an [AppDriver] that provides a Vulkan [render instance](Instance).
+pub trait AppDriverGraphicsVulkan: AppDriver {
+    fn render_instance(&self) -> Arc<Instance>;
+}
+
 /// Collection of Vulkano structs that together represent a rendering device.
 ///
 /// Wraps both a Vulkano [Device] and the [PhysicalDevice] associated with it, in addition to
 /// several standard allocators to be used with operations involving the device.
 ///
 /// Generally, an EngineDevice is 1:1 with a given render target, and not used across multiple
-/// render targets. For example, [windows](crate::gui::window) have an EngineDevice associated with
+/// render targets. For example, [windows](crate::gui::window::winit) have an EngineDevice associated with
 /// them.
 #[derive(Debug)]
 pub struct EngineDevice {
@@ -317,51 +322,58 @@ pub trait RenderTargetExt: RenderTarget {
 
 impl<T: RenderTarget + ?Sized> RenderTargetExt for T {}
 
-/// [EventType] for [Renderer][r] [Events][evt].
+/// The [Renderer] is stale.
 ///
-/// See also: [RendererEventData].
-///
-/// [r]: Renderer
-/// [evt]: crate::event::Event
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RendererEventType {
-    /// The [Renderer] is stale.
-    ///
-    /// This event is fired when e.g. the [RenderTarget]'s size has changed, or anything else that
-    /// would invalidate the framebuffers. This is a good place to hook into for recreating Vulkan
-    /// pipelines / etc.
-    Stale,
-
-    /// The [Renderer] is about to render a frame.
-    ///
-    /// This event is cancellable, and cancelling it will stop the current frame from rendering.
-    PreRender,
-
-    /// The [Renderer] has just finished rendering a frame.
-    PostRender,
-}
-
-impl EventType for RendererEventType {
-    fn is_cancellable(&self) -> bool {
-        match self {
-            RendererEventType::PreRender => true,
-            _ => false,
-        }
-    }
-}
-
-/// Event data for [Renderer][r] [Events][evt].
-///
-/// See also: [RendererEventType].
-///
-/// [r]: Renderer
-/// [evt]: crate::event::Event
-pub struct RendererEventData {
+/// This event is fired when e.g. the [RenderTarget]'s size has changed, or anything else that
+/// would invalidate the framebuffers. This is a good place to hook into for recreating Vulkan
+/// pipelines / etc.
+#[derive(Debug)]
+pub struct RendererStaleEvent {
     target: Arc<dyn RenderTarget>,
     device: Arc<EngineDevice>,
 }
 
-impl RendererEventData {
+impl RendererStaleEvent {
+    #[inline]
+    pub fn target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+    #[inline]
+    pub fn device(&self) -> &Arc<EngineDevice> { &self.device }
+}
+
+
+
+/// The [Renderer] is about to render a frame.
+///
+/// This event is cancellable, and cancelling it will stop the current frame from rendering.
+#[derive(Debug)]
+pub struct RendererPreEvent {
+    target: Arc<dyn RenderTarget>,
+    device: Arc<EngineDevice>,
+}
+impl EventCancellable for RendererPreEvent {}
+
+impl RendererPreEvent {
+    #[inline]
+    pub fn target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+    #[inline]
+    pub fn device(&self) -> &Arc<EngineDevice> { &self.device }
+}
+
+/// The [Renderer] has just finished rendering a frame.
+#[derive(Debug)]
+pub struct RendererPostEvent {
+    target: Arc<dyn RenderTarget>,
+    device: Arc<EngineDevice>,
+}
+
+impl RendererPostEvent {
+    #[inline]
+    pub fn target(&self) -> &Arc<dyn RenderTarget> { &self.target }
+    #[inline]
+    pub fn device(&self) -> &Arc<EngineDevice> { &self.device }
+}
+
+/*impl RendererEventData {
     /// The [RenderTarget] the [Renderer] is using.
     #[inline]
     pub fn target(&self) -> &Arc<dyn RenderTarget> { &self.target }
@@ -369,7 +381,7 @@ impl RendererEventData {
     /// The [EngineDevice] the [Renderer] is using.
     #[inline]
     pub fn device(&self) -> &Arc<EngineDevice> { &self.device }
-}
+}*/
 
 /// [Renderer] configuration.
 ///
@@ -413,7 +425,7 @@ struct RendererState {
 pub struct Renderer {
     target: Arc<dyn RenderTarget>,
     device: Arc<EngineDevice>,
-    event_bus: Arc<EventBus<RendererEventType, RendererEventData>>,
+    event_bus: Arc<EventBus>,
     state: RwLock<RendererState>,
 }
 
@@ -425,7 +437,7 @@ impl Renderer {
     ///
     /// Configured with a default [RendererConfig].
     ///
-    /// Note that the engine's [windowing](crate::gui::window) system will create its own Renderers,
+    /// Note that the engine's [windowing](crate::gui::window::winit) system will create its own Renderers,
     /// so it is not needed to create your own for standard window rendering.
     #[inline]
     pub fn new(
@@ -503,7 +515,11 @@ impl Renderer {
             config.swapchain,
         )?;
 
-        let event_bus = Arc::new(EventBus::default());
+        let event_bus = Arc::new(EventBus::builder()
+            .event_type::<RendererStaleEvent>()
+            .event_type::<RendererPreEvent>()
+            .event_type::<RendererPostEvent>()
+            .build());
 
         Ok(Self {
             target,
@@ -529,11 +545,9 @@ impl Renderer {
         &self.device
     }
 
-    /// The [EventBusRegistry] for this Renderer's [events][re].
-    ///
-    /// [re]: RendererEventType
+    /// The [EventBusRegistry] for this Renderer's events.
     #[inline]
-    pub fn event_bus(&self) -> &EventBusRegistry<RendererEventType, RendererEventData> {
+    pub fn event_bus(&self) -> &EventBusRegistry {
         self.event_bus.registry()
     }
 
@@ -568,13 +582,6 @@ impl Renderer {
         state.stale = true;
     }
 
-    fn event_data(&self) -> RendererEventData {
-        RendererEventData {
-            target: self.target.clone(),
-            device: self.device.clone(),
-        }
-    }
-
     /// Render a frame.
     ///
     /// Handles the logic required for recreating stale resources, rendering to a free framebuffer,
@@ -592,11 +599,16 @@ impl Renderer {
                     .expect("Failed to recreate swapchain");
                 state.stale = false;
             });
-            self.event_bus.fire(RendererEventType::Stale, self.event_data());
+            self.event_bus.fire(RendererStaleEvent {
+                target: self.target.clone(),
+                device: self.device.clone(),
+            });
         }
 
-        let pre_render_event
-            = self.event_bus.fire(RendererEventType::PreRender, self.event_data());
+        let pre_render_event = self.event_bus.fire(RendererPreEvent {
+            target: self.target.clone(),
+            device: self.device.clone(),
+        });
         if pre_render_event.is_cancelled() {
             return
         }
@@ -640,7 +652,10 @@ impl Renderer {
             Err(e) => panic!("Failed to flush command: {e}"),
         };
 
-        self.event_bus.fire(RendererEventType::PostRender, self.event_data());
+        self.event_bus.fire(RendererPostEvent {
+            target: self.target.clone(),
+            device: self.device.clone(),
+        });
     }
 
     /// Mark this renderer as stale, requiring a recreation of some resources.

@@ -6,9 +6,11 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-trait = { workspace = true }
 bytemuck = { workspace = true }
 gtether = { workspace = true, features = ["gui"] }
 nalgebra-glm = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 vulkano = { workspace = true }

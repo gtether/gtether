@@ -228,11 +228,11 @@ enum ResourceFutureState<T: ?Sized + Send + Sync + 'static> {
     Immediate(ResourceLoadResult<T>),
     Delayed{
         cache: Weak<CacheEntry>,
-        load_fn: Box<dyn FnOnce() -> ResourceFuture<T>>,
+        load_fn: Box<dyn (FnOnce() -> ResourceFuture<T>) + Send + Sync>,
     },
     Awaiting{
-        future: Pin<Box<dyn Future<Output = CacheEntryGetResult<T>>>>,
-        load_fn: Box<dyn FnOnce() -> ResourceFuture<T>>,
+        future: Pin<Box<dyn Future<Output = CacheEntryGetResult<T>> + Send>>,
+        load_fn: Box<dyn (FnOnce() -> ResourceFuture<T>) + Send + Sync>,
     },
     Uninit,
 }

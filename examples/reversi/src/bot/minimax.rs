@@ -5,7 +5,8 @@ use std::cmp::{max, min};
 use std::sync::Arc;
 use glm::TVec2;
 
-use crate::board::{Board, BoardState};
+use crate::board::BoardState;
+use crate::board::controller::BoardController;
 use crate::bot::BotAlgorithm;
 
 #[derive(Debug)]
@@ -100,8 +101,8 @@ impl MinimaxAlgorithm {
 }
 
 impl BotAlgorithm for MinimaxAlgorithm {
-    fn find_best_play(&self, board: &Arc<Board>) -> Option<TVec2<usize>> {
-        let board_state = board.state();
+    fn find_best_play(&self, board: &Arc<BoardController>) -> Option<TVec2<usize>> {
+        let board_state = board.board().clone();
         let my_player_idx = board_state.current_player_idx();
         board_state.valid_moves()
             .map(|possible_move| {

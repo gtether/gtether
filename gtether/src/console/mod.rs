@@ -8,6 +8,7 @@ use crate::console::command::{Command, CommandError, CommandRegisterError, Comma
 use crate::console::log::ConsoleLog;
 
 pub mod command;
+#[cfg(feature = "gui")]
 pub mod gui;
 pub mod log;
 

@@ -2,220 +2,28 @@
 
 extern crate nalgebra_glm as glm;
 
-use gtether::console::gui::ConsoleGui;
-use gtether::console::log::{ConsoleLog, ConsoleLogLayer};
-use gtether::console::Console;
-use gtether::event::Event;
-use gtether::gui::input::InputDelegate;
-use gtether::gui::window::{CreateWindowInfo, WindowAttributes, WindowHandle};
-use gtether::render::font::glyph::GlyphFontLoader;
-use gtether::render::model::obj::ModelObjLoader;
-use gtether::render::model::ModelVertexNormal;
-use gtether::render::render_pass::EngineRenderPassBuilder;
-use gtether::render::uniform::Uniform;
-use gtether::render::{RendererEventData, RendererEventType};
-use gtether::resource::manager::{LoadPriority, ResourceManager};
+use gtether::gui::window::winit::WinitDriver;
+use gtether::console::log::ConsoleLogLayer;
+use gtether::net::gns::GnsSubsystem;
+use gtether::resource::manager::ResourceManager;
 use gtether::resource::source::constant::ConstantResourceSource;
-use gtether::{Application, Engine, EngineBuilder, EngineMetadata, Registry};
-use std::cell::OnceCell;
-use std::sync::Arc;
-use std::time::Duration;
-use parry3d::na::Point3;
+use gtether::EngineBuilder;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use vulkano::format::Format;
-use vulkano::image::SampleCount;
-use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentStoreOp};
-use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
-use crate::board::Board;
-use crate::bot::minimax::MinimaxAlgorithm;
-use crate::player::Player;
-use crate::render_util::{Camera, DeferredLightingRendererBootstrap, ModelTransform, PointLight};
+
+use crate::client::ReversiClient;
 
 mod board;
 mod bot;
 mod render_util;
 mod player;
-
-#[derive(Debug)]
-struct ResetCommand {
-    board: Arc<Board>,
-}
-
-impl Command for ResetCommand {
-    fn handle(&self, parameters: &[String]) -> Result<(), CommandError> {
-        ParamCountCheck::Equal(0).check(parameters.len() as u32)?;
-        self.board.reset();
-        Ok(())
-    }
-}
-
-struct ReversiApp {
-    console: Arc<Console>,
-    window: OnceCell<WindowHandle>,
-    board: OnceCell<Arc<Board>>,
-    input: OnceCell<InputDelegate>,
-}
-
-impl ReversiApp {
-    fn new() -> Self {
-        let console = Arc::new(Console::builder()
-            .log(ConsoleLog::new(1000))
-            .build());
-
-        Self {
-            console,
-            window: OnceCell::new(),
-            board: OnceCell::new(),
-            input: OnceCell::new(),
-        }
-    }
-}
-
-impl Application for ReversiApp {
-    fn init(&self, engine: &Engine<Self>, registry: &mut Registry) {
-        let mut cmd_registry = self.console.registry();
-
-        let window = registry.window.create_window(CreateWindowInfo {
-            attributes: WindowAttributes::default()
-                .with_title("Reversi"),
-            ..Default::default()
-        });
-
-        let console_font = engine.resources().get_or_load(
-            "console_font",
-            GlyphFontLoader::new(window.renderer().clone()),
-            LoadPriority::Immediate,
-        );
-        let model_tile = engine.resources().get_or_load(
-            "tile.obj",
-            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().device().clone()),
-            LoadPriority::Immediate,
-        );
-        let model_piece = engine.resources().get_or_load(
-            "piece.obj",
-            ModelObjLoader::<ModelVertexNormal>::new(window.renderer().device().clone()),
-            LoadPriority::Immediate,
-        );
-
-        let transform = Arc::new(Uniform::new(
-            window.renderer().device().clone(),
-            window.renderer().frame_manager(),
-            ModelTransform::new(),
-        ).unwrap());
-
-        let camera = Arc::new(Uniform::new(
-            window.renderer().device().clone(),
-            window.renderer().frame_manager(),
-            Camera::new(
-                window.renderer().target(),
-                &Point3::new(0.0, 5.0, -2.0),
-                &Point3::new(0.0, 0.0, -0.5),
-                &glm::vec3(0.0, 1.0, 0.0),
-            ),
-        ).unwrap());
-        {
-            let camera = camera.clone();
-            window.renderer().event_bus().register(
-                RendererEventType::Stale,
-                move |event: &mut Event<RendererEventType, RendererEventData>| {
-                    camera.write().update(event.target());
-                }
-            );
-        }
-
-        let board = Board::new(
-            window.input_state().create_delegate(),
-            transform.clone(),
-            camera.clone(),
-            vec![
-                Arc::new(Player::human("Player1", glm::vec3(0.05, 0.05, 0.05))),
-                Arc::new(Player::bot(
-                    "Player2",
-                    glm::vec3(0.95, 0.95, 0.95),
-                    MinimaxAlgorithm::new(5),
-                )),
-            ],
-            glm::vec2(8, 8),
-        );
-
-        cmd_registry.register_command("reset", Box::new(ResetCommand {
-            board: board.clone(),
-        })).unwrap();
-
-        let deferred_lighting_renderer = DeferredLightingRendererBootstrap::new(
-            window.renderer(),
-            vec![
-                PointLight {
-                    position: glm::vec4(-4.0, 10.0, 4.0, 1.0),
-                    color: glm::vec3(0.8, 0.8, 0.8),
-                }
-            ]
-        );
-
-        let console_font = console_font.wait().unwrap();
-        let console_gui = ConsoleGui::builder(self.console.clone())
-            .window(&window)
-            .font(console_font.clone())
-            .build().unwrap();
-
-        let render_pass = EngineRenderPassBuilder::new(window.renderer().clone())
-            .attachment("color", AttachmentDescription {
-                format: Format::A2B10G10R10_UNORM_PACK32,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::DontCare,
-                ..Default::default()
-            }, Some([0.0, 0.0, 0.0, 1.0]))
-            .attachment("normals", AttachmentDescription {
-                format: Format::R16G16B16A16_SFLOAT,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::DontCare,
-                ..Default::default()
-            }, Some([0.0, 0.0, 0.0, 1.0]))
-            .attachment("depth", AttachmentDescription {
-                format: Format::D16_UNORM,
-                samples: SampleCount::Sample1,
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::DontCare,
-                ..Default::default()
-            }, Some(1.0))
-            .final_color_attachment("final_color", [0.0, 0.0, 0.0, 1.0]).unwrap()
-            .begin_subpass()
-                .color_attachment("color")
-                .color_attachment("normals")
-                .depth_stencil_attachment("depth")
-                .handler(board.bootstrap_renderer(
-                    model_tile.wait().unwrap(),
-                    model_piece.wait().unwrap(),
-                ))
-            .end_subpass()
-            .begin_subpass()
-                .input_attachment("color")
-                .input_attachment("normals")
-                .color_attachment("final_color")
-                .handler(deferred_lighting_renderer.bootstrap())
-                .handler(board.bootstrap_text_renderer(console_font))
-                .handler(console_gui.bootstrap_renderer())
-            .end_subpass()
-            .build().unwrap();
-        window.renderer().set_render_pass(render_pass);
-
-        self.input.set(window.input_state().create_delegate()).unwrap();
-        self.window.set(window).unwrap();
-        self.board.set(board).unwrap();
-    }
-
-    fn tick(&self, _engine: &Engine<Self>, _delta: Duration) {
-        /* noop */
-    }
-}
+mod server;
+mod client;
 
 fn main() {
-    let app = ReversiApp::new();
+    let app = ReversiClient::new();
 
     let subscriber_builder = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env()
@@ -225,7 +33,7 @@ fn main() {
     let subscriber_builder = subscriber_builder.with_writer(std::io::sink);
     subscriber_builder
         .finish()
-        .with(ConsoleLogLayer::new(app.console.log()))
+        .with(ConsoleLogLayer::new(app.console().log()))
         .init();
 
     let resources = ResourceManager::builder()
@@ -237,12 +45,12 @@ fn main() {
         .build();
 
     EngineBuilder::new()
-        .metadata(EngineMetadata {
-            application_name: Some("gTether Example - reversi".to_owned()),
-            ..Default::default()
-        })
         .app(app)
+        .app_driver(WinitDriver::builder()
+            .application_name("gTether Example - reversi")
+            .build())
         .resources(resources)
+        .networking_driver(GnsSubsystem::get())
         .build()
         .start();
 }

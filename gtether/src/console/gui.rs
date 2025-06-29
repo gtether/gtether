@@ -24,7 +24,7 @@ use crate::console::log::ConsoleLogRecord;
 use crate::console::Console;
 use crate::event::{Event, EventHandler};
 use crate::gui::input::{InputDelegateEvent, InputDelegateLock};
-use crate::gui::window::WindowHandle;
+use crate::gui::window::winit::WindowHandle;
 use crate::render::font::compositor::FontCompositor;
 use crate::render::font::layout::{LayoutAlignment, LayoutHorizontalAlignment, LayoutVerticalAlignment, TextLayout, TextLayoutCreateInfo};
 use crate::render::font::sheet::{FontSheet, FontSheetRenderer, UnicodeFontSheetMap};
@@ -33,7 +33,7 @@ use crate::render::font::Font;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::uniform::Uniform;
-use crate::render::{FlatVertex, RenderTarget, Renderer, RendererEventData, RendererEventType, VulkanoError};
+use crate::render::{FlatVertex, RenderTarget, Renderer, RendererStaleEvent, VulkanoError};
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
 use crate::render::descriptor_set::EngineDescriptorSet;
@@ -173,7 +173,7 @@ impl Default for ConsoleGuiBackground {
 /// # use std::sync::Arc;
 /// # use gtether::console::Console;
 /// use gtether::console::gui::ConsoleGui;
-/// # use gtether::gui::window::WindowHandle;
+/// # use gtether::gui::window::winit::WindowHandle;
 /// # use gtether::render::font::Font;
 /// # use gtether::render::render_pass::EngineRenderSubpassBuilder;
 /// # use gtether::resource::Resource;
@@ -198,7 +198,7 @@ impl Default for ConsoleGuiBackground {
 /// # use std::sync::Arc;
 /// # use gtether::console::Console;
 /// use gtether::console::gui::ConsoleGui;
-/// # use gtether::gui::window::WindowHandle;
+/// # use gtether::gui::window::winit::WindowHandle;
 /// # use gtether::render::font::Font;
 /// # use gtether::resource::Resource;
 /// #
@@ -327,7 +327,7 @@ impl ConsoleGui {
             text_log: Mutex::new(text_log),
             text_prompt: Mutex::new(text_prompt),
         });
-        window_handle.renderer().event_bus().register(RendererEventType::Stale, orig_gui.clone());
+        window_handle.renderer().event_bus().register(orig_gui.clone()).unwrap();
 
         let gui = orig_gui.clone();
         thread::spawn(move || {
@@ -353,9 +353,13 @@ impl ConsoleGui {
                                 true
                             } else if event.physical_key == PhysicalKey::Code(KeyCode::Enter) {
                                 if gui.visible.load(Ordering::Relaxed) {
-                                    let mut input = gui.text_prompt.lock();
-                                    let _ = gui.console.handle_command(input.to_string());
-                                    input.clear();
+                                    let cmd = {
+                                        let mut input = gui.text_prompt.lock();
+                                        let cmd = input.to_string();
+                                        input.clear();
+                                        cmd
+                                    };
+                                    let _ = gui.console.handle_command(cmd);
                                     true
                                 } else {
                                     false
@@ -403,10 +407,8 @@ impl ConsoleGui {
     }
 }
 
-impl EventHandler<RendererEventType, RendererEventData> for ConsoleGui {
-    fn handle_event(&self, event: &mut Event<RendererEventType, RendererEventData>) {
-        assert_eq!(event.event_type(), &RendererEventType::Stale,
-                   "ConsoleGui can only handle 'Stale' Renderer events");
+impl EventHandler<RendererStaleEvent> for ConsoleGui {
+    fn handle_event(&self, event: &mut Event<RendererStaleEvent>) {
         let target = event.target();
 
         let (mut new_text_log, mut new_text_prompt) = Self::create_text_layouts(
@@ -838,7 +840,6 @@ impl ConsoleGuiBuilder {
             font,
             font_sheet,
         );
-        window_handle.renderer().event_bus().register(RendererEventType::Stale, console_gui.clone());
 
         Ok(console_gui)
     }

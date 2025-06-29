@@ -345,6 +345,7 @@ impl EngineRenderHandler for DeferredLightingRenderer {
     }
 }
 
+#[derive(Debug)]
 pub struct DeferredLightingRendererBootstrap {
     ambient_light: Arc<Uniform<AmbientLight>>,
     point_lights: Arc<UniformSet<PointLight, 8>>,
@@ -380,9 +381,38 @@ impl DeferredLightingRendererBootstrap {
         }
     }
 
+    #[allow(unused)]
     #[inline]
     pub fn ambient_light(&self) -> &Arc<Uniform<AmbientLight>> { &self.ambient_light }
 
+    #[allow(unused)]
     #[inline]
     pub fn point_lights(&self) -> &Arc<UniformSet<PointLight, 8>> { &self.point_lights }
+}
+
+pub fn hsv_to_rgb(hsv: glm::TVec3<f32>) -> glm::TVec3<f32> {
+    let hue = (hsv.x % 360.0).abs();
+    let saturation = hsv.y.clamp(0.0, 1.0);
+    let value = hsv.z.clamp(0.0, 1.0);
+
+    let chroma = saturation * value;
+    let hue_prime = hue / 60.0;
+    let x = chroma * (1.0 - ((hue_prime % 2.0) - 1.0).abs());
+
+    let (r, g, b) = if hue_prime < 1.0 {
+        (chroma, x, 0.0)
+    } else if hue_prime < 2.0 {
+        (x, chroma, 0.0)
+    } else if hue_prime < 3.0 {
+        (0.0, chroma, x)
+    } else if hue_prime < 4.0 {
+        (0.0, x, chroma)
+    } else if hue_prime < 5.0 {
+        (x, 0.0, chroma)
+    } else {
+        (chroma, 0.0, x)
+    };
+
+    let m = value - chroma;
+    glm::vec3(r + m, g + m, b + m)
 }

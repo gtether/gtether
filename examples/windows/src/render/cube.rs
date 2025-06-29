@@ -5,7 +5,7 @@ use gtether::render::descriptor_set::EngineDescriptorSet;
 use gtether::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use gtether::render::render_pass::EngineRenderHandler;
 use gtether::render::uniform::Uniform;
-use gtether::render::{Renderer, RendererEventData, RendererEventType, VulkanoError};
+use gtether::render::{Renderer, RendererStaleEvent, VulkanoError};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -174,8 +174,7 @@ impl CubeRenderer {
 
         let reset_vp = vp.clone();
         renderer.event_bus().register(
-            RendererEventType::Stale,
-            move |event: &mut Event<RendererEventType, RendererEventData>| {
+            move |event: &mut Event<RendererStaleEvent>| {
                 let extent = event.target().extent().cast::<f32>();
                 reset_vp.write().projection = glm::perspective(
                     extent.x / extent.y,
@@ -183,7 +182,7 @@ impl CubeRenderer {
                     0.01, 100.0,
                 );
             }
-        );
+        ).unwrap();
 
         let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
             .layout(descriptor_layout)
