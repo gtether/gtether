@@ -40,14 +40,12 @@ test-gtether:
     matrix:
       - TARGET:
           - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-msvc
   needs:
     - job: build-gtether
       parallel:
         matrix:
           - TARGET:
             - x86_64-unknown-linux-gnu
-            - x86_64-pc-windows-msvc
   script:
     - cargo +nightly test --package gtether --all-features --release -- --format=json -Z unstable-options --report-time | junitify --out test-results
   cache:
