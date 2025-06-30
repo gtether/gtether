@@ -150,7 +150,7 @@ impl PlayerManager {
         });
 
         net.insert_msg_handler(Arc::downgrade(&player_manager));
-        net.event_bus().register(player_manager.clone()).unwrap();
+        net.event_bus().register(Arc::downgrade(&player_manager)).unwrap();
 
         player_manager
     }

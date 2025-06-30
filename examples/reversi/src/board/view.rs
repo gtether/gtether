@@ -596,7 +596,7 @@ impl BoardTextRendererLayout {
             font_sheet,
             layout: Mutex::new(layout),
         });
-        renderer.event_bus().register(render_layout.clone()).unwrap();
+        renderer.event_bus().register(Arc::downgrade(&render_layout)).unwrap();
         render_layout
     }
 }

@@ -327,7 +327,7 @@ impl ConsoleGui {
             text_log: Mutex::new(text_log),
             text_prompt: Mutex::new(text_prompt),
         });
-        window_handle.renderer().event_bus().register(orig_gui.clone()).unwrap();
+        window_handle.renderer().event_bus().register(Arc::downgrade(&orig_gui)).unwrap();
 
         let gui = orig_gui.clone();
         thread::spawn(move || {

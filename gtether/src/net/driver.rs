@@ -620,7 +620,7 @@ pub mod tests {
             let event_handler = Arc::new(move |_: &mut Event<NetworkingDisconnectEvent>| {
                 event_waker.lock().wake_by_ref();
             });
-            self.net().event_bus().register(&event_handler)
+            self.net().event_bus().register(Arc::downgrade(&event_handler))
                 .expect("NetworkingDisconnectEvent type should be valid");
             NetworkingClosedFuture {
                 net: self.net.clone(),

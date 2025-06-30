@@ -187,7 +187,7 @@ impl EngineGraphicsPipeline {
             viewport_type,
             inner: Mutex::new(EngineGraphicsPipelineState::default()),
         });
-        renderer.event_bus().register(graphics.clone()).unwrap();
+        renderer.event_bus().register(Arc::downgrade(&graphics)).unwrap();
         graphics
     }
 }

@@ -3,14 +3,14 @@
 //! This module contains the framework for creating, driving, and hooking into
 //! [event-driven buses][eb]. These event buses follow a publish-subscribe pattern, where a
 //! particular code site may [publish][ebf] an event, which is then propagated to all
-//! [subscribers][es] registered to events of that type.
+//! [subscribers][eh] registered to events of that type.
 //!
 //! These event buses are primarily synchronous, in that any subscribed event handlers are triggered
 //! inline on the same thread that fires the event.
 //!
 //! [eb]: EventBus
 //! [ebf]: EventBus::fire
-//! [es]: EventSubscriber
+//! [eh]: EventHandler
 use parking_lot::RwLock;
 use smol::prelude::*;
 use std::any::{Any, TypeId};
@@ -29,9 +29,9 @@ pub trait EventCancellable {}
 /// Instance of an event that has been published.
 ///
 /// Each instance of Event represents a single event that has been fired/published, and will be
-/// handled by possibly many [subscribers][es].
+/// handled by possibly many [subscribers][eh].
 ///
-/// [es]: EventSubscriber
+/// [eh]: EventHandler
 pub struct Event<T> {
     inner: T,
     cancelled: bool,
@@ -52,7 +52,7 @@ impl<T> Event<T> {
     /// Consume this event and yield the data it contains.
     ///
     /// This is usually used after an event has been fired, to retrieve any data that
-    /// [subscribers][es] may have added to it.
+    /// [subscribers][eh] may have added to it.
     ///
     /// # Examples
     /// ```
@@ -65,7 +65,7 @@ impl<T> Event<T> {
     /// # }
     /// ```
     ///
-    /// [es]: EventSubscriber
+    /// [eh]: EventHandler
     #[inline]
     pub fn into_data(self) -> T { self.inner }
 }
@@ -98,17 +98,24 @@ impl<T> DerefMut for Event<T> {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
 }
 
-pub type SubscriberFn<T> = Arc<dyn Fn(&mut Event<T>) + Send + Sync + 'static>;
 pub type SubscriberFnOnce<T> = Box<dyn FnOnce(&mut Event<T>) + Send>;
 
-/// User-defined event handler.
+/// User-defined event handler for specific [Events](Event).
 ///
-/// This trait can be used to make a complex struct-based event handler. If a simple function event
-/// handler is desired, a function that aligns with [SubscriberFn] can be used instead. See
-/// [EventSubscriber] for more.
+/// An EventHandler is triggered when any [Events][evt] that it is listening for are fired. An
+/// EventHandler is tied to a particular event type.
 pub trait EventHandler<T>: Send + Sync + 'static {
     /// Handle a particular [Event] that has been fired.
     fn handle_event(&self, event: &mut Event<T>);
+
+    /// Whether this handler is still valid.
+    ///
+    /// If it is not valid, it will be removed and no longer used to handle events. This is
+    /// primarily used with e.g. handlers implemented for weak references. Note that EventHandler is
+    /// automatically implemented for any `Weak<H: EventHandler>`, where this method will return
+    /// `false` if the weak reference is no longer valid.
+    #[inline]
+    fn is_valid(&self) -> bool { true }
 }
 
 impl<T, F> EventHandler<T> for F
@@ -121,126 +128,57 @@ where
     }
 }
 
-/// Event handler subscribed to specific [Events][evt].
-///
-/// An EventSubscriber is triggered when any [Events][evt] that it is listening for are fired. An
-/// EventSubscriber is tied to a particular event type. An EventSubscriber can be created using
-/// several different methods, depending on the use case.
-///
-/// If you have a simple event handler, you can create an EventSubscriber from a closure that
-/// matches [SubscriberFn].
-///
-/// For more complex cases, a struct-based event handler that implements [EventHandler] can be used.
-/// Struct-based handlers can be turned into two different types of EventSubscribers:
-///
-///  * A Ref EventSubscriber. This is created by giving either an Arc or Weak smart pointer to a
-///    [register function][reg]. The [EventBus] does not own these handlers, and only maintains a
-///    weak reference, allowing them to be dropped externally.
-///  * An Owned EventSubscriber. This is created by directly giving an [EventHandler] to a
-///    [register function][reg].
-///
-/// [evt]: Event
-/// [reg]: EventBusRegistry::register
-pub enum EventSubscriber<T> {
-    Owned(Box<dyn EventHandler<T>>),
-    Ref(Weak<dyn EventHandler<T>>),
-    Fn(SubscriberFn<T>),
-}
-
-impl<T> EventSubscriber<T> {
-    #[inline]
-    pub fn owned<H: EventHandler<T>>(handler: H) -> Self {
-        Self::Owned(Box::new(handler))
-    }
-}
-
-impl<T, H> From<Arc<H>> for EventSubscriber<T>
+impl<T, H> EventHandler<T> for Arc<H>
 where
     H: EventHandler<T>,
 {
     #[inline]
-    fn from(value: Arc<H>) -> Self {
-        Self::Ref(Arc::downgrade(&value) as Weak<dyn EventHandler<T>>)
+    fn handle_event(&self, event: &mut Event<T>) {
+        (**self).handle_event(event)
     }
 }
 
-impl<T, H> From<&Arc<H>> for EventSubscriber<T>
+impl<T, H> EventHandler<T> for Weak<H>
 where
     H: EventHandler<T>,
 {
     #[inline]
-    fn from(value: &Arc<H>) -> Self {
-        Self::Ref(Arc::downgrade(value) as Weak<dyn EventHandler<T>>)
+    fn handle_event(&self, event: &mut Event<T>) {
+        if let Some(handler) = self.upgrade() {
+            handler.handle_event(event)
+        }
     }
-}
 
-impl<T, H> From<Weak<H>> for EventSubscriber<T>
-where
-    H: EventHandler<T>,
-{
     #[inline]
-    fn from(value: Weak<H>) -> Self {
-        Self::Ref(value)
-    }
-}
-
-impl<T, F> From<F> for EventSubscriber<T>
-where
-    F: Fn(&mut Event<T>) + Send + Sync + 'static,
-{
-    #[inline]
-    fn from(value: F) -> Self {
-        Self::Fn(Arc::new(value))
-    }
-}
-
-impl<T> From<EventSubscriber<T>> for SubscriberEntry
-where
-    for<'a> T: 'a,
-{
-    fn from(value: EventSubscriber<T>) -> Self {
-        match value {
-            EventSubscriber::Owned(handler) => Self::Owned(Box::new(handler)),
-            EventSubscriber::Ref(handler) => Self::Ref(Box::new(handler)),
-            EventSubscriber::Fn(handler) => Self::Fn(Box::new(handler)),
+    fn is_valid(&self) -> bool {
+        if let Some(handler) = self.upgrade() {
+            handler.is_valid()
+        } else {
+            false
         }
     }
 }
 
-enum SubscriberEntry {
-    Owned(Box<dyn Any + Send + Sync + 'static>),
-    Ref(Box<dyn Any + Send + Sync + 'static>),
-    Fn(Box<dyn Any + Send + Sync + 'static>),
-}
+struct SubscriberEntry(Box<dyn Any + Send + Sync + 'static>);
 
 impl SubscriberEntry {
+    fn new<T>(handler: Box<dyn EventHandler<T>>) -> Self
+    where
+        for<'a> T: 'a,
+    {
+        Self(Box::new(handler))
+    }
+
     fn handle_event<T>(&self, event: &mut Event<T>) -> bool
     where
         for<'a> T: 'a,
     {
-        match self {
-            Self::Owned(handler) => {
-                handler.downcast_ref::<Box<dyn EventHandler<T>>>()
-                    .unwrap()
-                    .handle_event(event);
-                true
-            },
-            Self::Ref(handler) => {
-                let weak = handler.downcast_ref::<Weak<dyn EventHandler<T>>>()
-                    .unwrap();
-                if let Some(handler) = weak.upgrade() {
-                    handler.handle_event(event);
-                    true
-                } else {
-                    false
-                }
-            },
-            Self::Fn(handler) => {
-                let handler = handler.downcast_ref::<SubscriberFn<T>>()
-                    .unwrap();
-                handler(event);
-                true
-            },
+        let handler = self.0.downcast_ref::<Box<dyn EventHandler<T>>>().unwrap();
+        if handler.is_valid() {
+            handler.handle_event(event);
+            true
+        } else {
+            false
         }
     }
 }
@@ -425,15 +363,15 @@ impl Display for InvalidTypeIdError {
 
 impl Error for InvalidTypeIdError {}
 
-/// Registry for registering new [EventSubscribers][es] to.
+/// Registry for registering new [EventHandlers][eh] to.
 ///
 /// This is the public-facing part of [EventBus], where users can register additional
-/// [EventSubscribers][es] to receive published [Events][evt]. In addition to registering standard
+/// [EventHandlers][eh] to receive published [Events][evt]. In addition to registering standard
 /// handlers with [EventBusRegistry::register()], temporary one-off handlers can be registered using
 /// [EventBusRegistry::register_once()]. These will receive exactly one [Event][evt], and can be
 /// used for scheduling actions according to certain lifecycle breakpoints.
 ///
-/// [es]: EventSubscriber
+/// [eh]: EventHandler
 /// [evt]: Event
 pub struct EventBusRegistry {
     valid_type_ids: HashSet<TypeId>,
@@ -442,23 +380,22 @@ pub struct EventBusRegistry {
 }
 
 impl EventBusRegistry {
-    /// Register a new [EventSubscriber].
+    /// Register a new [EventHandler].
     ///
-    /// The [EventSubscriber] will be registered under the [TypeId] of `T`.
+    /// The [EventHandler] will be registered under the [TypeId] of `T`.
     pub fn register<T>(
         &self,
-        subscriber: impl Into<EventSubscriber<T>>,
+        subscriber: impl EventHandler<T>,
     ) -> Result<(), InvalidTypeIdError>
     where
         for<'a> T: 'a,
     {
         let type_id = TypeId::of::<T>();
         if self.valid_type_ids.contains(&type_id) {
-            let subscriber = subscriber.into();
             self.subscribers.write()
                 .entry(type_id)
                 .or_default()
-                .push(subscriber.into());
+                .push(SubscriberEntry::new(Box::new(subscriber)));
             Ok(())
         } else {
             Err(InvalidTypeIdError { type_id })
@@ -507,7 +444,7 @@ impl EventBusRegistry {
 /// For example, a Renderer has one EventBus that is responsible for all of that Renderer's events,
 /// but no others.
 ///
-/// An EventBus has an [EventBusRegistry] for registering [EventSubscribers][es], that can be
+/// An EventBus has an [EventBusRegistry] for registering [EventHandlers][eh], that can be
 /// accessed via [EventBus::registry()].
 ///
 /// # Handler Execution Order
@@ -528,7 +465,7 @@ impl EventBusRegistry {
 /// [cancellation flag][ec].
 ///
 /// [evt]: Event
-/// [es]: EventSubscriber
+/// [eh]: EventHandler
 /// [etc]: EventCancellable
 /// [ec]: Event::is_cancelled
 pub struct EventBus {
@@ -551,15 +488,15 @@ impl EventBus {
     /// Fire/publish an [Event].
     ///
     /// Given user-derived event data, create an [Event] and send it to any registered
-    /// [EventSubscribers][es] that match the event data's [TypeId]. All standard
-    /// [EventSubscribers][es] receive the [Event] first, then any one-off handlers.
+    /// [EventHandlers][eh] that match the event data's [TypeId]. All standard
+    /// [EventHandlers][eh] receive the [Event] first, then any one-off handlers.
     ///
     /// The [Event] will be returned after all handlers are done with it, which allows any relevant
     /// data generated from handlers to be [extracted from it][evid].
     ///
     /// See also: [struct-level documentation](Self)
     ///
-    /// [es]: EventSubscriber
+    /// [eh]: EventHandler
     /// [evid]: Event::into_data
     pub fn fire<T>(&self, event_data: T) -> Event<T>
     where
@@ -679,7 +616,7 @@ mod tests {
     #[test]
     fn test_fire_event_single_subscriber() {
         let event_bus = create_event_bus();
-        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
+        event_bus.registry().register(IncrementHandler::default()).unwrap();
 
         let result = event_bus.fire(IncrementEvent(0));
         assert_eq!(result.into_data().0, 1);
@@ -693,7 +630,7 @@ mod tests {
     fn test_fire_event_multiple_subscribers() {
         let event_bus = create_event_bus();
         for _ in 0..3 {
-            event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
+            event_bus.registry().register(IncrementHandler::default()).unwrap();
         }
 
         let result = event_bus.fire(IncrementEvent(0));
@@ -751,7 +688,7 @@ mod tests {
     #[test]
     fn test_fire_event_subscriber_and_once() {
         let event_bus = create_event_bus();
-        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
+        event_bus.registry().register(IncrementHandler::default()).unwrap();
         let once_fut = event_bus.registry().register_once(|event: &mut Event<IncrementEvent>| {
             event.data().0 += 1;
         }).unwrap();
@@ -794,7 +731,7 @@ mod tests {
     #[test]
     fn test_fire_event_weak() {
         let event_bus = create_event_bus();
-        event_bus.registry().register(EventSubscriber::owned(IncrementHandler::default())).unwrap();
+        event_bus.registry().register(IncrementHandler::default()).unwrap();
         let handler2 = Arc::new(IncrementHandler::default());
         event_bus.registry().register(handler2.clone()).unwrap();
         let handler3 = Arc::new(IncrementHandler::default());
@@ -803,14 +740,14 @@ mod tests {
         let result = event_bus.fire(IncrementEvent(0));
         assert_eq!(result.into_data().0, 3);
 
-        // Drop the direct weak ref
+        // Drop the weak ref - *should* reduce handlers
         drop(handler3);
         let result = event_bus.fire(IncrementEvent(0));
         assert_eq!(result.into_data().0, 2);
 
-        // Drop the indirect weak ref
+        // Drop the strong ref - shouldn't reduce handlers
         drop(handler2);
         let result = event_bus.fire(IncrementEvent(0));
-        assert_eq!(result.into_data().0, 1);
+        assert_eq!(result.into_data().0, 2);
     }
 }
