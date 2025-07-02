@@ -12,6 +12,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-2-Clause-Plus-Patent"
+description = "Highly concurrent multiplayer focused game engine, with an emphasis on realtime streamable asset management."
+repository = "https://github.com/gtether/gtether"
 keywords = ["gamedev", "multiplayer"]
 categories = ["game-engines"]
 
