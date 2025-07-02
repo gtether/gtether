@@ -11,8 +11,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["James De Broeck <debroejm@gmail.com>"]
 license = "BSD-2-Clause-Plus-Patent"
-description = "Highly concurrent multiplayer focused game engine, with an emphasis on realtime streamable asset management."
 repository = "https://github.com/gtether/gtether"
 keywords = ["gamedev", "multiplayer"]
 categories = ["game-engines"]
@@ -54,7 +54,9 @@ vulkano-shaders = "0.34"
 winit = { version = "0.30", features = ["x11", "rwh_05"] }
 
 [workspace.dependencies.gtether]
+version = "0.1"
 path = "gtether"
 
 [workspace.dependencies.gtether_derive]
+version = "0.1"
 path = "gtether_derive"

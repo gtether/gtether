@@ -2,8 +2,13 @@
 name = "gtether"
 version.workspace = true
 edition.workspace = true
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors.workspace = true
+license.workspace = true
+description = "Highly concurrent multiplayer focused game engine, with an emphasis on realtime streamable asset management."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../README.md"
 
 [features]
 derive = [
