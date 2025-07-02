@@ -2,7 +2,8 @@
 
 members = [
     "gtether",
-    "examples/*", "gtether_derive",
+    "gtether_derive",
+    "examples/*",
 ]
 
 resolver = "2"
@@ -10,7 +11,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "BSD-2-Clause Plus Patent"
+license = "BSD-2-Clause-Plus-Patent"
+keywords = ["gamedev", "multiplayer"]
+categories = ["game-engines"]
 
 [workspace.dependencies]
 ab_glyph = "0.2"
