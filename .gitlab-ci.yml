@@ -119,7 +119,7 @@ release-example-windows:
     expose_as: "example-windows"
     paths:
       - "target/x86_64-unknown-linux-gnu/release/windows"
-      - "target/x86_64-pc-windows-gnu/release/windows.exe"
+      - "target/x86_64-pc-windows-msvc/release/windows.exe"
 
 release-example-reversi:
   extends:
@@ -159,4 +159,4 @@ release-example-reversi:
     expose_as: "example-reversi"
     paths:
       - "target/x86_64-unknown-linux-gnu/release/reversi"
-      - "target/x86_64-pc-windows-gnu/release/reversi.exe"
+      - "target/x86_64-pc-windows-msvc/release/reversi.exe"
