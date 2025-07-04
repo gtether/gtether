@@ -38,7 +38,7 @@ chrono = { workspace = true }
 crossbeam = { workspace = true }
 educe = { workspace = true }
 flagset = { workspace = true }
-gns = { workspace = true }
+game-networking-sockets = { workspace = true }
 gtether_derive = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 itertools = { workspace = true }
