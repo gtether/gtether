@@ -1,6 +1,8 @@
 # g(ame)Tether
 
 ![License](https://img.shields.io/badge/license-BSD--2--clause%20Plus%20Patent-blue.svg)
+[![Crates.io](https://img.shields.io/crates/v/gtether.svg)](https://crates.io/crates/gtether)
+[![Docs](https://docs.rs/gtether/badge.svg)](https://docs.rs/gtether/latest/gtether/)
 
 ## What It Is
 
