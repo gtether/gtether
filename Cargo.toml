@@ -9,7 +9,6 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
 edition = "2021"
 authors = ["James De Broeck <debroejm@gmail.com>"]
 license = "BSD-2-Clause-Patent"
