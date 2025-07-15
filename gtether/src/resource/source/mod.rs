@@ -432,9 +432,9 @@ impl ResourceData {
     /// [module-level documentation][mod] for more.
     ///
     /// [more]: super::source#data-hashing
-    pub fn new<R: AsyncRead + Unpin + Send + 'static>(data: Box<R>, hash: String) -> Self {
+    pub fn new(data: Box<dyn AsyncRead + Unpin + Send + 'static>, hash: String) -> Self {
         Self {
-            data: Box::pin(data),
+            data: Box::into_pin(data),
             hash,
             source_idx: None,
         }
