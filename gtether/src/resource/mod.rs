@@ -32,7 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::resource::manager::{ResourceLoadResult, ResourceManager};
+use crate::resource::manager::{LoadPriority, ResourceLoadResult, ResourceManager};
 use crate::resource::path::ResourcePath;
 
 pub mod manager;
@@ -404,6 +404,50 @@ impl Error for ResourceLoadError {}
 /// Raw data type for loading resources from.
 pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 
+/// Contextual data for loading resources.
+pub struct ResourceLoadContext {
+    manager: Arc<ResourceManager>,
+    id: ResourcePath,
+    priority: LoadPriority,
+}
+
+impl ResourceLoadContext {
+    #[inline]
+    pub(in crate::resource) fn new(
+        manager: Arc<ResourceManager>,
+        id: ResourcePath,
+        priority: LoadPriority,
+    ) -> Self {
+        Self {
+            manager,
+            id,
+            priority,
+        }
+    }
+
+    /// A reference to the [ResourceManager], used to chain-load resources.
+    ///
+    /// When chain-loading resources, they should be loaded with [Self::priority()].
+    #[inline]
+    pub fn manager(&self) -> &ResourceManager {
+        &self.manager
+    }
+
+    /// The resource [id](ResourcePath) that is currently being loaded.
+    #[inline]
+    pub fn id(&self) -> ResourcePath {
+        self.id.clone()
+    }
+
+    /// The [priority](LoadPriority) that the load task was spawned with.
+    ///
+    /// When chain-loading resources, they should be loaded with this priority.
+    #[inline]
+    pub fn priority(&self) -> LoadPriority {
+        self.priority
+    }
+}
+
 /// User-defined interface for loading [Resources][res] from [raw data][rd].
 ///
 /// ResourceLoaders are used to define the behavior for loading and updating [Resources][res] from
@@ -420,7 +464,7 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 /// ```
 /// use std::sync::Arc;
 /// use async_trait::async_trait;
-/// use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+/// use gtether::resource::{ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 /// use smol::prelude::*;
 /// use gtether::resource::manager::ResourceManager;
 /// use gtether::resource::path::ResourcePath;
@@ -429,7 +473,11 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 ///
 /// #[async_trait]
 /// impl ResourceLoader<String> for StringLoader {
-///     async fn load(&self, manager: &Arc<ResourceManager>, id: ResourcePath, mut data: ResourceReadData) -> Result<Box<String>, ResourceLoadError> {
+///     async fn load(
+///         &self,
+///         mut data: ResourceReadData,
+///         _ctx: ResourceLoadContext,
+///     ) -> Result<Box<String>, ResourceLoadError> {
 ///         let mut output = String::new();
 ///         data.read_to_string(&mut output).await
 ///             .map_err(ResourceLoadError::from_error)
@@ -450,9 +498,8 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
     /// [rd]: ResourceReadData
     async fn load(
         &self,
-        manager: &Arc<ResourceManager>,
-        id: ResourcePath,
         data: ResourceReadData,
+        ctx: ResourceLoadContext,
     ) -> Result<Box<T>, ResourceLoadError>;
 
     /// Given a [mutable resource handle][rm], load and update a resource from [raw data][rd].
@@ -464,14 +511,13 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
     /// [rd]: ResourceReadData
     async fn update(
         &self,
-        manager: &Arc<ResourceManager>,
-        id: ResourcePath,
         resource: ResourceMut<T>,
         data: ResourceReadData,
+        ctx: ResourceLoadContext,
     )
         -> Result<(), ResourceLoadError>
     {
-        resource.replace(self.load(manager, id, data).await?);
+        resource.replace(self.load(data, ctx).await?);
         Ok(())
     }
 }

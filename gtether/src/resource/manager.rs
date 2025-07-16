@@ -81,7 +81,7 @@ use tracing::{debug, info_span, warn, Instrument};
 
 use crate::resource::path::ResourcePath;
 use crate::resource::source::{SealedResourceDataResult, ResourceSource, ResourceWatcher, SourceIndex, ResourceUpdate, SealedResourceDataSource};
-use crate::resource::{Resource, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+use crate::resource::{Resource, ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 
 #[derive(Debug, Clone)]
 struct ManagerResourceWatcher {
@@ -644,7 +644,13 @@ where
                                 let (resource_mut, drop_checker) = ResourceMut::from_resource(
                                     strong.clone(),
                                 );
-                                match async_loader.update(&async_manager, async_id.clone(), resource_mut, data).await {
+                                let ctx = ResourceLoadContext::new(
+                                    async_manager.clone(),
+                                    async_id.clone(),
+                                    // TODO: Do Delayed and Update need to be different?
+                                    LoadPriority::Delayed,
+                                );
+                                match async_loader.update(resource_mut, data, ctx).await {
                                     Ok(_) => {
                                         match drop_checker.recv().await {
                                             Ok(_) => { debug!("Drop-checker received an unexpected message"); }
@@ -969,7 +975,12 @@ impl ResourceManager {
             let _test_ctx_lock = task_self.test_ctx.sync_load.run().await;
             let (result, source_idx) = match task_self.find_data(&task_id).await {
                 Some(Ok(data)) => {
-                    match task_loader.load(&task_self, task_id.clone(), data.data).await {
+                    let ctx = ResourceLoadContext::new(
+                        task_self.clone(),
+                        task_id.clone(),
+                        load_priority,
+                    );
+                    match task_loader.load(data.data, ctx).await {
                         Ok(v) => (Ok((Arc::new(Resource::new(v)), data.source.hash)), data.source.idx),
                         Err(e) => (Err(e), data.source.idx),
                     }
@@ -1195,11 +1206,10 @@ pub(in crate::resource) mod tests {
     impl ResourceLoader<String> for TestResourceLoader {
         async fn load(
             &self,
-            _manager: &Arc<ResourceManager>,
-            id: ResourcePath,
             mut data: ResourceReadData,
+            ctx: ResourceLoadContext,
         ) -> Result<Box<String>, ResourceLoadError> {
-            assert_eq!(id, self.expected_id);
+            assert_eq!(ctx.id(), self.expected_id);
             let mut output = String::new();
             data.read_to_string(&mut output).await
                 .map_err(|err| ResourceLoadError::from_error(err))
