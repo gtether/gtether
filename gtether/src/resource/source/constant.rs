@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use crate::resource::path::ResourcePath;
-use crate::resource::source::{ResourceData, ResourceWatcher};
+use crate::resource::source::{ResourceData, ResourceDataSource, ResourceWatcher};
 use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
@@ -43,6 +43,14 @@ impl ConstantResourceSource {
 
 #[async_trait]
 impl ResourceSource for ConstantResourceSource {
+    fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+        if let Some((_, hash)) = self.raw.get(id) {
+            Some(ResourceDataSource::new(hash.clone()))
+        } else {
+            None
+        }
+    }
+
     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
         if let Some((data, hash)) = self.raw.get(id) {
             Ok(ResourceData::new(Box::new(*data), hash.clone()))

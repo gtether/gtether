@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::resource::path::ResourcePath;
-use crate::resource::source::ResourceWatcher;
+use crate::resource::source::{ResourceDataSource, ResourceWatcher};
 use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
 
@@ -26,6 +26,16 @@ impl ResourceSourceList {
 
 #[async_trait]
 impl ResourceSource for ResourceSourceList {
+    fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+        for (idx, source) in self.inner.iter().enumerate() {
+            match source.hash(id) {
+                Some(s) => return Some(s.wrap(idx)),
+                None => {},
+            }
+        }
+        None
+    }
+
     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
         for (idx, source) in self.inner.iter().enumerate() {
             match source.load(id).await {

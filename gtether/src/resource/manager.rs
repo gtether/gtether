@@ -80,7 +80,7 @@ use strum::EnumCount;
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::resource::path::ResourcePath;
-use crate::resource::source::{SealedResourceDataResult, ResourceSource, ResourceWatcher, SourceIndex};
+use crate::resource::source::{SealedResourceDataResult, ResourceSource, ResourceWatcher, SourceIndex, ResourceUpdate, SealedResourceDataSource};
 use crate::resource::{Resource, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 
 #[derive(Debug, Clone)]
@@ -91,9 +91,9 @@ struct ManagerResourceWatcher {
 
 impl ResourceWatcher for ManagerResourceWatcher {
     #[inline]
-    fn notify_update(&self, id: &ResourcePath, hash: String) {
+    fn notify_update(&self, id: &ResourcePath, update: ResourceUpdate) {
         if let Some(manager) = self.manager.upgrade() {
-            manager.update(id.clone(), self.idx.clone(), hash);
+            manager.update(id.clone(), self.idx.clone(), update);
         }
     }
 
@@ -567,14 +567,15 @@ impl CacheEntryState {
         id: &ResourcePath,
         source: &Box<dyn ResourceSource>,
         new_idx: &SourceIndex,
+        ignore_priority: bool,
     ) -> CacheEntryUpdateResult {
         match self {
             CacheEntryState::Loading { .. } => {
                 warn!(%id, "Tried to update currently loading Resource");
                 CacheEntryUpdateResult::Ok
             },
-            CacheEntryState::CachedValue { source_idx, update, .. } => {
-                if new_idx <= source_idx {
+            CacheEntryState::CachedValue { hash, source_idx, update, .. } => {
+                if ignore_priority || new_idx <= source_idx {
                     let sub_data_result = match new_idx.sub_idx() {
                         Some(sub_idx) => source.sub_load(id, sub_idx).await,
                         None => source.load(id).await,
@@ -589,7 +590,8 @@ impl CacheEntryState {
                         CacheEntryUpdateResult::Expired => return CacheEntryUpdateResult::Expired,
                         CacheEntryUpdateResult::Err(e) => return CacheEntryUpdateResult::Err(e),
                     }
-                    *source_idx = data.source_idx;
+                    *hash = data.source.hash;
+                    *source_idx = data.source.idx;
                 } else {
                     warn!(%id, %new_idx, %source_idx, "Tried to update Resource from lower priority source");
                 }
@@ -731,8 +733,9 @@ impl CacheEntry {
         manager: &Arc<ResourceManager>,
         source: &Box<dyn ResourceSource>,
         new_idx: &SourceIndex,
+        ignore_priority: bool,
     ) -> CacheEntryUpdateResult {
-        self.state.lock().await.update(manager, &self.id, source, new_idx).await
+        self.state.lock().await.update(manager, &self.id, source, new_idx, ignore_priority).await
     }
 
     #[inline]
@@ -834,7 +837,7 @@ impl ResourceManager {
         }
     }
 
-    fn update(&self, id: ResourcePath, source_idx: SourceIndex, hash: String) {
+    fn update(&self, id: ResourcePath, source_idx: SourceIndex, update: ResourceUpdate) {
         let task_self = self.weak.upgrade()
             .expect("ResourceManager cyclic reference should not be broken");
         let task_id = id.clone();
@@ -851,6 +854,20 @@ impl ResourceManager {
                 }
             };
 
+            let (hash, task_source_idx, ignore_priority) = match update {
+                ResourceUpdate::Added(hash) | ResourceUpdate::Modified(hash)
+                => (hash, task_source_idx, false),
+                ResourceUpdate::Removed => {
+                    match task_self.find_hash(&task_id) {
+                        Some(s) => (s.hash, s.idx, true),
+                        None => {
+                            warn!(id = %task_id, "Resource source removed and no matching backup sources found");
+                            return;
+                        }
+                    }
+                },
+            };
+
             if Some(&hash) == before_entry.hash().await.as_ref() {
                 debug!(id = %task_id, hash, "Ignoring update as hashes match");
                 return;
@@ -864,7 +881,12 @@ impl ResourceManager {
                 }
             };
 
-            let update_result = before_entry.update(&task_self, source, &task_source_idx).await;
+            let update_result = before_entry.update(
+                &task_self,
+                source,
+                &task_source_idx,
+                ignore_priority,
+            ).await;
 
             let mut cache = task_self.cache.lock();
             let after_entry = match cache.get(&task_id) {
@@ -889,6 +911,16 @@ impl ResourceManager {
                 debug!(id = %task_id, "Cache entry changed before resource update completed");
             }
         }.instrument(info_span!("resource_update", %id, %source_idx))).detach();
+    }
+
+    fn find_hash(&self, id: &ResourcePath) -> Option<SealedResourceDataSource> {
+        for (idx, source) in self.sources.iter().enumerate() {
+            match source.hash(id) {
+                Some(hash) => return Some(hash.seal(idx)),
+                None => {},
+            }
+        }
+        None
     }
 
     async fn find_data(&self, id: &ResourcePath) -> Option<SealedResourceDataResult> {
@@ -938,8 +970,8 @@ impl ResourceManager {
             let (result, source_idx) = match task_self.find_data(&task_id).await {
                 Some(Ok(data)) => {
                     match task_loader.load(&task_self, task_id.clone(), data.data).await {
-                        Ok(v) => (Ok((Arc::new(Resource::new(v)), data.hash)), data.source_idx),
-                        Err(e) => (Err(e), data.source_idx),
+                        Ok(v) => (Ok((Arc::new(Resource::new(v)), data.source.hash)), data.source.idx),
+                        Err(e) => (Err(e), data.source.idx),
                     }
                 },
                 Some(Err(e)) => (Err(e), SourceIndex::max()),
@@ -1059,7 +1091,7 @@ pub(in crate::resource) mod tests {
     use smol::Timer;
     use std::time::Duration;
     use parking_lot::RwLock;
-    use crate::resource::source::{ResourceData, ResourceDataResult};
+    use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource};
 
     pub async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -1187,14 +1219,26 @@ pub(in crate::resource) mod tests {
         }
 
         fn insert_impl(&self, id: ResourcePath, data: &'static [u8], hash: String) {
-            self.raw.write().insert(id.clone(), (data, hash.clone()));
+            let update = match self.raw.write().insert(id.clone(), (data, hash.clone())).is_some() {
+                true => ResourceUpdate::Modified(hash),
+                false => ResourceUpdate::Added(hash),
+            };
             if let Some(watcher) = self.watch_list.read().get(&id) {
-                watcher.notify_update(&id, hash);
+                watcher.notify_update(&id, update);
             }
         }
 
         pub fn insert(&self, id: impl Into<ResourcePath>, data: &'static [u8], hash: impl Into<String>) {
             self.insert_impl(id.into(), data, hash.into())
+        }
+
+        pub fn remove(&self, id: impl Into<ResourcePath>) {
+            let id = id.into();
+            if self.raw.write().remove(&id).is_some() {
+                if let Some(watcher) = self.watch_list.read().get(&id) {
+                    watcher.notify_update(&id, ResourceUpdate::Removed);
+                }
+            }
         }
 
         fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>) {
@@ -1229,6 +1273,14 @@ pub(in crate::resource) mod tests {
 
     #[async_trait]
     impl ResourceSource for TestResourceSource {
+        fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+            if let Some((_, hash)) = self.inner.get(id) {
+                Some(ResourceDataSource::new(hash))
+            } else {
+                None
+            }
+        }
+
         async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
             if let Some((data, hash)) = self.inner.get(id) {
                 Ok(ResourceData::new(Box::new(data), hash))
@@ -1478,6 +1530,14 @@ pub(in crate::resource) mod tests {
         assert_eq!(*value.read(), "new_value_0");
         data_maps[0].assert_watch("key", true);
         data_maps[1].assert_watch("key", false);
+        data_maps[2].assert_watch("key", false);
+
+        // Removing higher priority should fall back to new lower priority value
+        data_maps[0].remove("key");
+        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(3), Duration::from_secs(1)));
+        assert_eq!(*value.read(), "new_new_value_1");
+        data_maps[0].assert_watch("key", true);
+        data_maps[1].assert_watch("key", true);
         data_maps[2].assert_watch("key", false);
     }
 
