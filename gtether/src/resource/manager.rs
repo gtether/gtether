@@ -64,6 +64,7 @@
 //! [res]: Resource
 //! [rp]: ResourcePath
 //! [rf]: ResourceFuture
+use futures_core::task::__internal::AtomicWaker;
 use parking_lot::{Mutex, MutexGuard};
 use smol::prelude::*;
 use smol::{future, Executor, Task};
@@ -71,17 +72,18 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake};
 use std::thread;
 use std::thread::JoinHandle;
 use strum::EnumCount;
-use tracing::{debug, info_span, warn, Instrument};
+use tracing::{debug, info_span, trace, warn, Instrument};
 
 use crate::resource::path::ResourcePath;
-use crate::resource::source::{SealedResourceDataResult, ResourceSource, ResourceWatcher, SourceIndex, ResourceUpdate, SealedResourceDataSource};
-use crate::resource::{Resource, ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+use crate::resource::source::{ResourceSource, ResourceUpdate, ResourceWatcher, SealedResourceData, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
+use crate::resource::{Resource, ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut};
 
 #[derive(Debug, Clone)]
 struct ManagerResourceWatcher {
@@ -244,7 +246,7 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFutureState<T> {
             Self::Delayed { cache, load_fn } => {
                 if let Some(strong_cache) = cache.upgrade() {
                     Self::Awaiting {
-                        future: Box::pin(async move { strong_cache.wait().await }),
+                        future: Box::pin(async move { strong_cache.wait::<T>().await }),
                         load_fn,
                     }.poll(cx)
                 } else {
@@ -426,36 +428,64 @@ impl<T: ?Sized + Send + Sync + 'static> From<Result<(Arc<Resource<T>>, String), 
     }
 }
 
+enum CacheEntryUpdateFutResult<'fut> {
+    Skip,
+    Evict,
+    Run(Pin<Box<dyn Future<Output = CacheEntryUpdateResult> + Send + 'fut>>)
+}
+
 enum CacheEntryUpdateResult {
-    Ok,
+    Ok(SealedResourceDataSource),
     Expired,
     Err(ResourceLoadError),
 }
 
-impl From<Result<(), ResourceLoadError>> for CacheEntryUpdateResult {
-    #[inline]
-    fn from(value: Result<(), ResourceLoadError>) -> Self {
-        match value {
-            Ok(_) => CacheEntryUpdateResult::Ok,
-            Err(e) => CacheEntryUpdateResult::Err(e),
-        }
+type CacheEntryStateUpdateFn = Arc<dyn (Fn(&Arc<ResourceManager>, SealedResourceData)
+    -> Box<dyn Future<Output = CacheEntryUpdateResult> + Send>) + Send + Sync>;
+
+#[derive(Default)]
+struct MultiWaker(Mutex<Vec<Weak<AtomicWaker>>>);
+
+impl Wake for MultiWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.lock().retain(|weak| {
+            if let Some(waker) = weak.upgrade() {
+                waker.wake();
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 
-type CacheEntryStateUpdateFn = Box<dyn (Fn(&Arc<ResourceManager>, ResourceReadData)
-    -> Box<dyn Future<Output = CacheEntryUpdateResult> + Send>) + Send + Sync>;
+impl MultiWaker {
+    #[inline]
+    fn push(&self, waker: &Arc<AtomicWaker>) {
+        self.0.lock().push(Arc::downgrade(waker))
+    }
+}
+
+struct CacheEntryStateValue {
+    resource: Weak<dyn Any + Send + Sync>, // Weak<Resource<T>>
+    resource_type: TypeId,
+    hash: String,
+    source_idx: SourceIndex,
+}
 
 enum CacheEntryState {
     Loading {
         task: Box<dyn Any + Send>, // Box<Task<ResourceTaskData<T>>>
+        wakers: Arc<MultiWaker>,
         resource_type: TypeId,
         manager: Arc<ResourceManager>,
     },
     CachedValue {
-        value: Weak<dyn Any + Send + Sync>, // Weak<Resource<T>>
-        resource_type: TypeId,
-        hash: String,
-        source_idx: SourceIndex,
+        value: CacheEntryStateValue,
+        update: CacheEntryStateUpdateFn,
+    },
+    Updating {
+        value: CacheEntryStateValue,
         update: CacheEntryStateUpdateFn,
     },
     CachedError(ResourceLoadError),
@@ -470,6 +500,7 @@ impl CacheEntryState {
     {
         Self::Loading {
             task: Box::new(task) as Box<dyn Any + Send>,
+            wakers: Arc::new(MultiWaker::default()),
             resource_type: TypeId::of::<T>(),
             manager,
         }
@@ -480,30 +511,40 @@ impl CacheEntryState {
         T: ?Sized + Send + Sync + 'static,
     {
         match self {
-            CacheEntryState::Loading { task, resource_type, manager } => {
+            Self::Loading { task, resource_type, manager, wakers } => {
                 match task.downcast::<Task<ResourceTaskData<T>>>() {
-                    Ok(task) => {
-                        if task.is_finished() {
-                            let task_result = future::block_on(task);
-                            manager.watch_n(&task_result.id, &task_result.source_idx);
-                            let result = task_result.result.clone().into();
-                            (task_result.into(), Some(result))
-                        } else {
-                            (Self::from_task(*task, manager), None)
+                    Ok(mut task) => {
+                        let waker = wakers.clone().into();
+                        let mut cx = Context::from_waker(&waker);
+                        match task.poll(&mut cx) {
+                            Poll::Ready(task_result) => {
+                                manager.watch_n(&task_result.id, &task_result.source_idx);
+                                let result = task_result.result.clone().into();
+                                (task_result.into(), Some(result))
+                            },
+                            Poll::Pending => (
+                                Self::Loading {
+                                    task: task as Box<dyn Any + Send>,
+                                    wakers,
+                                    resource_type,
+                                    manager,
+                                },
+                                None,
+                            )
                         }
                     },
                     Err(task) => (
-                        CacheEntryState::Loading { task, resource_type, manager },
+                        Self::Loading { task, resource_type, manager, wakers },
                         Some(CacheEntryGetResult::Err(ResourceLoadError::from_mismatch::<T>(resource_type))),
                     )
                 }
             },
-            CacheEntryState::CachedValue { ref value, ref resource_type, .. } => {
-                if let Some(value) = value.upgrade() {
-                    match value.downcast::<Resource<T>>() {
+            Self::CachedValue { ref value, .. } | Self::Updating { ref value, .. } => {
+                if let Some(resource) = value.resource.upgrade() {
+                    match resource.downcast::<Resource<T>>() {
                         Ok(resource) => (self, Some(CacheEntryGetResult::Ok(resource))),
                         Err(_) => {
-                            let resource_type = resource_type.clone();
+                            let resource_type = value.resource_type.clone();
                             (self, Some(CacheEntryGetResult::Err(ResourceLoadError::from_mismatch::<T>(resource_type))))
                         },
                     }
@@ -511,104 +552,98 @@ impl CacheEntryState {
                     (self, Some(CacheEntryGetResult::Expired))
                 }
             },
-            CacheEntryState::CachedError(ref error) => {
+            Self::CachedError(ref error) => {
                 let error = error.clone();
                 (self, Some(CacheEntryGetResult::Err(error)))
             },
-            CacheEntryState::Uninit =>
+            Self::Uninit =>
                 panic!("Found uninit state in inner CacheEntry"),
         }
     }
 
-    async fn wait<T>(self) -> (Self, CacheEntryGetResult<T>)
-    where
-        T: ?Sized + Send + Sync + 'static,
-    {
+    fn insert_waker(&self, waker: &Arc<AtomicWaker>) {
         match self {
-            CacheEntryState::Loading { task, resource_type, manager } => {
-                match task.downcast::<Task<ResourceTaskData<T>>>() {
-                    Ok(task) => {
-                        let task_result = task.await;
-                        manager.watch_n(&task_result.id, &task_result.source_idx);
-                        let result = task_result.result.clone().into();
-                        (task_result.into(), result)
-                    },
-                    Err(task) => (
-                        CacheEntryState::Loading { task, resource_type, manager },
-                        CacheEntryGetResult::Err(ResourceLoadError::from_mismatch::<T>(resource_type)),
-                    )
-                }
+            Self::Loading { wakers, .. } => {
+                wakers.push(waker);
             },
-            CacheEntryState::CachedValue { ref value, ref resource_type, .. } => {
-                if let Some(value) = value.upgrade() {
-                    match value.downcast::<Resource<T>>() {
-                        Ok(resource) => (self, CacheEntryGetResult::Ok(resource)),
-                        Err(_) => {
-                            let resource_type = resource_type.clone();
-                            (self, CacheEntryGetResult::Err(ResourceLoadError::from_mismatch::<T>(resource_type)))
-                        },
-                    }
-                } else {
-                    (self, CacheEntryGetResult::Expired)
-                }
-            },
-            CacheEntryState::CachedError(ref error) => {
-                let error = error.clone();
-                (self, CacheEntryGetResult::Err(error))
-            },
-            CacheEntryState::Uninit =>
-                panic!("Found uninit state in inner CacheEntry"),
+            _ => {},
         }
     }
 
-    async fn update(
-        &mut self,
-        manager: &Arc<ResourceManager>,
-        id: &ResourcePath,
-        source: &Box<dyn ResourceSource>,
-        new_idx: &SourceIndex,
+    fn update<'fut>(
+        self,
+        manager: &'fut Arc<ResourceManager>,
+        id: &'fut ResourcePath,
+        source: &'fut Box<dyn ResourceSource>,
+        new_idx: &'fut SourceIndex,
         ignore_priority: bool,
-    ) -> CacheEntryUpdateResult {
+    ) -> (Self, CacheEntryUpdateFutResult<'fut>) {
         match self {
-            CacheEntryState::Loading { .. } => {
+            Self::Loading { .. } => {
+                // TODO: Queue/replace existing load
                 warn!(%id, "Tried to update currently loading Resource");
-                CacheEntryUpdateResult::Ok
+                (self, CacheEntryUpdateFutResult::Skip)
             },
-            CacheEntryState::CachedValue { hash, source_idx, update, .. } => {
-                if ignore_priority || new_idx <= source_idx {
-                    let sub_data_result = match new_idx.sub_idx() {
-                        Some(sub_idx) => source.sub_load(id, sub_idx).await,
-                        None => source.load(id).await,
-                    };
-                    // TODO: Replace with custom ?/Try when that is stabilized
-                    let data = match sub_data_result {
-                        Ok(sub_data) => sub_data.seal(new_idx.idx()),
-                        Err(e) => return CacheEntryUpdateResult::Err(e),
-                    };
-                    match Box::into_pin(update(manager, data.data)).await {
-                        CacheEntryUpdateResult::Ok => {},
-                        CacheEntryUpdateResult::Expired => return CacheEntryUpdateResult::Expired,
-                        CacheEntryUpdateResult::Err(e) => return CacheEntryUpdateResult::Err(e),
-                    }
-                    *hash = data.source.hash;
-                    *source_idx = data.source.idx;
+            Self::CachedValue { value, update } => {
+                if ignore_priority || new_idx <= &value.source_idx {
+                    let fut_update = update.clone();
+                    let fut = Box::pin(async move {
+                        let sub_data_result = match new_idx.sub_idx() {
+                            Some(sub_idx) => source.sub_load(id, sub_idx).await,
+                            None => source.load(id).await,
+                        };
+                        // TODO: Replace with custom ?/Try when that is stabilized
+                        let data = match sub_data_result {
+                            Ok(sub_data) => sub_data.seal(new_idx.idx()),
+                            Err(e) => return CacheEntryUpdateResult::Err(e),
+                        };
+                        Box::into_pin(fut_update(manager, data)).await
+                    });
+                    (Self::Updating { value, update }, CacheEntryUpdateFutResult::Run(fut))
                 } else {
-                    warn!(%id, %new_idx, %source_idx, "Tried to update Resource from lower priority source");
+                    warn!(
+                        %id,
+                        %new_idx,
+                        source_idx = %value.source_idx,
+                        "Tried to update Resource from lower priority source",
+                    );
+                    (Self::CachedValue { value, update }, CacheEntryUpdateFutResult::Skip)
                 }
-                CacheEntryUpdateResult::Ok
             },
-            CacheEntryState::CachedError(_) => CacheEntryUpdateResult::Expired,
+            Self::Updating { .. } => {
+                // TODO: Queue/replace existing update
+                warn!(%id, "Tried to update currently updating Resource");
+                (self, CacheEntryUpdateFutResult::Skip)
+            },
+            CacheEntryState::CachedError(_) => (self, CacheEntryUpdateFutResult::Evict),
             CacheEntryState::Uninit =>
                 panic!("Found uninit state in inner CacheEntry"),
+        }
+    }
+
+    fn finalize_update(
+        self,
+        data_source: SealedResourceDataSource,
+    ) -> (Self, ()) {
+        match self {
+            Self::Updating { mut value, update } => {
+                value.hash = data_source.hash;
+                value.source_idx = data_source.idx;
+                (Self::CachedValue { value, update }, ())
+            },
+            _ => {
+                warn!("Tried to finalize update when not in Updating state! Possibly have inconsistent state.");
+                (self, ())
+            },
         }
     }
 
     fn hash(&self) -> Option<String> {
         match self {
-            CacheEntryState::Loading { .. } => None,
-            CacheEntryState::CachedValue { hash, .. } => Some(hash.clone()),
-            CacheEntryState::CachedError(_) => None,
-            CacheEntryState::Uninit =>
+            Self::Loading { .. } | Self::CachedError(_) => None,
+            Self::CachedValue { value, .. } | Self::Updating { value, .. }
+                => Some(value.hash.clone()),
+            Self::Uninit =>
                 panic!("Found uninit state in inner CacheEntry"),
         }
     }
@@ -627,11 +662,13 @@ where
                 let source_idx = value.source_idx;
                 drop(resource);
                 Self::CachedValue {
-                    value: weak.clone(),
-                    resource_type: TypeId::of::<T>(),
-                    hash,
-                    source_idx,
-                    update: Box::new(move |manager, data| Box::new({
+                    value: CacheEntryStateValue {
+                        resource: weak.clone(),
+                        resource_type: TypeId::of::<T>(),
+                        hash,
+                        source_idx,
+                    },
+                    update: Arc::new(move |manager, data| Box::new({
                         let async_manager = manager.clone();
                         let async_weak = weak.clone();
                         let async_id = id.clone();
@@ -650,7 +687,7 @@ where
                                     // TODO: Do Delayed and Update need to be different?
                                     LoadPriority::Delayed,
                                 );
-                                match async_loader.update(resource_mut, data, ctx).await {
+                                match async_loader.update(resource_mut, data.data, ctx).await {
                                     Ok(_) => {
                                         match drop_checker.recv().await {
                                             Ok(_) => { debug!("Drop-checker received an unexpected message"); }
@@ -659,7 +696,7 @@ where
 
                                         strong.update_sub_resources(&async_id).await;
 
-                                        CacheEntryUpdateResult::Ok
+                                        CacheEntryUpdateResult::Ok(data.source)
                                     },
                                     Err(e) => CacheEntryUpdateResult::Err(e),
                                 }
@@ -685,7 +722,7 @@ impl From<ResourceLoadError> for CacheEntryState {
 }
 
 struct CacheEntry {
-    state: smol::lock::Mutex<CacheEntryState>,
+    state: Mutex<CacheEntryState>,
     id: ResourcePath,
 }
 
@@ -697,25 +734,13 @@ impl CacheEntry {
         manager: Arc<ResourceManager>,
     ) -> Self {
         Self {
-            state: smol::lock::Mutex::new(CacheEntryState::from_task(task, manager)),
+            state: Mutex::new(CacheEntryState::from_task(task, manager)),
             id,
         }
     }
 
-    async fn with_state<R, Fut>(&self, func: impl FnOnce(CacheEntryState) -> Fut) -> R
-    where
-        Fut: Future<Output=(CacheEntryState, R)>,
-    {
-        let mut lock = self.state.lock().await;
-        let mut state = CacheEntryState::Uninit;
-        std::mem::swap(&mut *lock, &mut state);
-        let (mut state, result) = func(state).await;
-        std::mem::swap(&mut *lock, &mut state);
-        result
-    }
-
-    fn with_state_blocking<R>(&self, func: impl FnOnce(CacheEntryState) -> (CacheEntryState, R)) -> R {
-        let mut lock = self.state.lock_blocking();
+    fn with_state<R>(&self, func: impl FnOnce(CacheEntryState) -> (CacheEntryState, R)) -> R {
+        let mut lock = self.state.lock();
         let mut state = CacheEntryState::Uninit;
         std::mem::swap(&mut *lock, &mut state);
         let (mut state, result) = func(state);
@@ -725,28 +750,63 @@ impl CacheEntry {
 
     #[inline]
     fn poll<T: ?Sized + Send + Sync + 'static>(&self) -> Option<CacheEntryGetResult<T>> {
-        self.with_state_blocking(|state| state.poll())
+        self.with_state(CacheEntryState::poll)
     }
 
     #[inline]
-    async fn wait<T: ?Sized + Send + Sync + 'static>(&self) -> CacheEntryGetResult<T> {
-        self.with_state(|state| async move { state.wait().await }).await
+    fn wait<T: ?Sized + Send + Sync + 'static>(&self) -> CacheEntryWaitFuture<T> {
+        let fut = CacheEntryWaitFuture {
+            entry: self,
+            waker: Arc::new(AtomicWaker::new()),
+            _phantom: PhantomData::default(),
+        };
+        self.state.lock().insert_waker(&fut.waker);
+        fut
     }
 
     #[inline]
-    async fn update(
-        &self,
-        manager: &Arc<ResourceManager>,
-        source: &Box<dyn ResourceSource>,
-        new_idx: &SourceIndex,
+    fn update<'fut>(
+        &'fut self,
+        manager: &'fut Arc<ResourceManager>,
+        source: &'fut Box<dyn ResourceSource>,
+        new_idx: &'fut SourceIndex,
         ignore_priority: bool,
-    ) -> CacheEntryUpdateResult {
-        self.state.lock().await.update(manager, &self.id, source, new_idx, ignore_priority).await
+    ) -> CacheEntryUpdateFutResult<'fut> {
+        self.with_state(|state| state.update(
+            manager,
+            &self.id,
+            source,
+            new_idx,
+            ignore_priority,
+        ))
     }
 
     #[inline]
-    async fn hash(&self) -> Option<String> {
-        self.state.lock().await.hash()
+    fn finalize_update(&self, data_source: SealedResourceDataSource) {
+        self.with_state(|state| state.finalize_update(data_source))
+    }
+
+    #[inline]
+    fn hash(&self) -> Option<String> {
+        self.state.lock().hash()
+    }
+}
+
+struct CacheEntryWaitFuture<'a, T: ?Sized + Send + Sync + 'static> {
+    entry: &'a CacheEntry,
+    waker: Arc<AtomicWaker>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: ?Sized + Send + Sync + 'static> Future for CacheEntryWaitFuture<'a, T> {
+    type Output = CacheEntryGetResult<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.waker.register(cx.waker());
+        match self.entry.poll() {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Pending,
+        }
     }
 }
 
@@ -874,7 +934,7 @@ impl ResourceManager {
                 },
             };
 
-            if Some(&hash) == before_entry.hash().await.as_ref() {
+            if Some(&hash) == before_entry.hash().as_ref() {
                 debug!(id = %task_id, hash, "Ignoring update as hashes match");
                 return;
             }
@@ -887,12 +947,24 @@ impl ResourceManager {
                 }
             };
 
-            let update_result = before_entry.update(
-                &task_self,
-                source,
-                &task_source_idx,
-                ignore_priority,
-            ).await;
+            let fut = {
+                let mut cache = task_self.cache.lock();
+                let fut_result = before_entry.update(
+                    &task_self,
+                    source,
+                    &task_source_idx,
+                    ignore_priority,
+                );
+                match fut_result {
+                    CacheEntryUpdateFutResult::Skip => return,
+                    CacheEntryUpdateFutResult::Evict => {
+                        task_self.remove(&mut cache, &task_id);
+                        return;
+                    },
+                    CacheEntryUpdateFutResult::Run(fut) => fut,
+                }
+            };
+            let update_result = fut.await;
 
             let mut cache = task_self.cache.lock();
             let after_entry = match cache.get(&task_id) {
@@ -905,7 +977,10 @@ impl ResourceManager {
 
             if Arc::ptr_eq(after_entry, &before_entry) {
                 match update_result {
-                    CacheEntryUpdateResult::Ok => task_self.watch_n(&task_id, &task_source_idx),
+                    CacheEntryUpdateResult::Ok(data_source) => {
+                        task_self.watch_n(&task_id, &task_source_idx);
+                        after_entry.finalize_update(data_source);
+                    },
                     CacheEntryUpdateResult::Err(e)
                         => warn!(id = %task_id, source_idx = %task_source_idx, %e, "Failed to update resource from source"),
                     CacheEntryUpdateResult::Expired => {
@@ -1097,12 +1172,14 @@ impl ResourceManagerBuilder {
 #[cfg(test)]
 pub(in crate::resource) mod tests {
     use super::*;
-    use crate::resource::ResourceReadData;
+
     use async_trait::async_trait;
+    use parking_lot::RwLock;
     use smol::Timer;
     use std::time::Duration;
-    use parking_lot::RwLock;
+
     use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource};
+    use crate::resource::ResourceReadData;
 
     pub async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
