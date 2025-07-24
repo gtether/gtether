@@ -1211,9 +1211,8 @@ pub(in crate::resource) mod tests {
         ) -> Result<Box<String>, ResourceLoadError> {
             assert_eq!(ctx.id(), self.expected_id);
             let mut output = String::new();
-            data.read_to_string(&mut output).await
-                .map_err(|err| ResourceLoadError::from_error(err))
-                .map(|_| Box::new(output))
+            data.read_to_string(&mut output).await?;
+            Ok(Box::new(output))
         }
     }
 

@@ -138,8 +138,7 @@ pub type ResourceLock<'a, T> = MappedRwLockReadGuard<'a, T>;
 /// async fn update(&self, resource: ResourceMut<String>, mut data: ResourceReadData)
 ///         -> Result<(), ResourceLoadError> {
 ///     let mut output = String::new();
-///     data.read_to_string(&mut output).await
-///         .map_err(|err| ResourceLoadError::from_error(err))?;
+///     data.read_to_string(&mut output).await?;
 ///
 ///     // Grab the lock _after_ all async awaiting is done
 ///     *resource.write() = output;
@@ -386,6 +385,13 @@ impl From<String> for ResourceLoadError {
     }
 }
 
+impl From<std::io::Error> for ResourceLoadError {
+    #[inline]
+    fn from(value: std::io::Error) -> Self {
+        Self::ReadError(Arc::new(value))
+    }
+}
+
 impl Display for ResourceLoadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -479,9 +485,8 @@ impl ResourceLoadContext {
 ///         _ctx: ResourceLoadContext,
 ///     ) -> Result<Box<String>, ResourceLoadError> {
 ///         let mut output = String::new();
-///         data.read_to_string(&mut output).await
-///             .map_err(ResourceLoadError::from_error)
-///             .map(|_| Box::new(output))
+///         data.read_to_string(&mut output).await?;
+///         Ok(Box::new(output))
 ///     }
 ///
 ///     // update() does not need to be implemented if you don't have any custom synchronization logic
