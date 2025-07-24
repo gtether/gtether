@@ -79,7 +79,7 @@ use std::task::{Context, Poll, Wake};
 use std::thread;
 use std::thread::JoinHandle;
 use strum::EnumCount;
-use tracing::{debug, info_span, trace, warn, Instrument};
+use tracing::{debug, info_span, warn, Instrument};
 
 use crate::resource::path::ResourcePath;
 use crate::resource::source::{ResourceSource, ResourceUpdate, ResourceWatcher, SealedResourceData, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
