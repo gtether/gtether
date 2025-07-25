@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::resource::path::ResourcePath;
+use crate::resource::id::ResourceId;
 use crate::resource::source::{ResourceDataSource, ResourceWatcher};
 use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
 use crate::resource::ResourceLoadError;
@@ -26,7 +26,7 @@ impl ResourceSourceList {
 
 #[async_trait]
 impl ResourceSource for ResourceSourceList {
-    fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+    fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
         for (idx, source) in self.inner.iter().enumerate() {
             match source.hash(id) {
                 Some(s) => return Some(s.wrap(idx)),
@@ -36,7 +36,7 @@ impl ResourceSource for ResourceSourceList {
         None
     }
 
-    async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+    async fn load(&self, id: &ResourceId) -> ResourceDataResult {
         for (idx, source) in self.inner.iter().enumerate() {
             match source.load(id).await {
                 Ok(data) => return Ok(data.wrap(idx)),
@@ -47,7 +47,7 @@ impl ResourceSource for ResourceSourceList {
         Err(ResourceLoadError::NotFound(id.clone()))
     }
 
-    async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceDataResult {
+    async fn sub_load(&self, id: &ResourceId, sub_idx: &SourceIndex) -> ResourceDataResult {
         if let Some(source) = self.inner.get(sub_idx.idx) {
             match sub_idx.sub_idx() {
                 Some(sub_idx) => source.sub_load(id, sub_idx).await,
@@ -58,7 +58,7 @@ impl ResourceSource for ResourceSourceList {
         }
     }
 
-    fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) {
+    fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) {
         let sub_idx = sub_idx.unwrap_or(SourceIndex::new(self.inner.len()));
         for (idx, source) in self.inner.iter().enumerate() {
             if idx <= sub_idx.idx() {
@@ -73,7 +73,7 @@ impl ResourceSource for ResourceSourceList {
         }
     }
 
-    fn unwatch(&self, id: &ResourcePath) {
+    fn unwatch(&self, id: &ResourceId) {
         for source in &self.inner {
             source.unwatch(id);
         }

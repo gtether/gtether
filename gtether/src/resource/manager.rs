@@ -62,7 +62,7 @@
 //! ```
 //!
 //! [res]: Resource
-//! [rp]: ResourcePath
+//! [rp]: ResourceId
 //! [rf]: ResourceFuture
 use futures_core::task::__internal::AtomicWaker;
 use parking_lot::{Mutex, MutexGuard};
@@ -81,7 +81,7 @@ use std::thread::JoinHandle;
 use strum::EnumCount;
 use tracing::{debug, info_span, warn, Instrument};
 
-use crate::resource::path::ResourcePath;
+use crate::resource::id::ResourceId;
 use crate::resource::source::{ResourceSource, ResourceUpdate, ResourceWatcher, SealedResourceData, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
 use crate::resource::{Resource, ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut};
 
@@ -93,7 +93,7 @@ struct ManagerResourceWatcher {
 
 impl ResourceWatcher for ManagerResourceWatcher {
     #[inline]
-    fn notify_update(&self, id: &ResourcePath, update: ResourceUpdate) {
+    fn notify_update(&self, id: &ResourceId, update: ResourceUpdate) {
         if let Some(manager) = self.manager.upgrade() {
             manager.update(id.clone(), self.idx.clone(), update);
         }
@@ -220,7 +220,7 @@ impl Drop for ManagerExecutor {
 }
 
 struct ResourceTaskData<T: ?Sized + Send + Sync + 'static> {
-    id: ResourcePath,
+    id: ResourceId,
     result: Result<(Arc<Resource<T>>, String), ResourceLoadError>,
     source_idx: SourceIndex,
     loader: Arc<dyn ResourceLoader<T>>,
@@ -285,7 +285,7 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFutureState<T> {
 /// handle was generated.
 ///
 /// [res]: Resource
-/// [id]: ResourcePath
+/// [id]: ResourceId
 /// [rl]: ResourceLoader
 /// [rm]: ResourceManager
 pub struct ResourceFuture<T: ?Sized + Send + Sync + 'static> {
@@ -345,7 +345,7 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<T> {
     fn from_cache_entry(
         entry: Weak<CacheEntry>,
         manager: Arc<ResourceManager>,
-        id: ResourcePath,
+        id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
         load_priority: LoadPriority,
     ) -> Self {
@@ -573,7 +573,7 @@ impl CacheEntryState {
     fn update<'fut>(
         self,
         manager: &'fut Arc<ResourceManager>,
-        id: &'fut ResourcePath,
+        id: &'fut ResourceId,
         source: &'fut Box<dyn ResourceSource>,
         new_idx: &'fut SourceIndex,
         ignore_priority: bool,
@@ -723,13 +723,13 @@ impl From<ResourceLoadError> for CacheEntryState {
 
 struct CacheEntry {
     state: Mutex<CacheEntryState>,
-    id: ResourcePath,
+    id: ResourceId,
 }
 
 impl CacheEntry {
     #[inline]
     fn from_task<T: ?Sized + Send + Sync + 'static>(
-        id: ResourcePath,
+        id: ResourceId,
         task: Task<ResourceTaskData<T>>,
         manager: Arc<ResourceManager>,
     ) -> Self {
@@ -844,7 +844,7 @@ impl<'a, T: ?Sized + Send + Sync + 'static> Future for CacheEntryWaitFuture<'a, 
 pub struct ResourceManager {
     executor: Arc<ManagerExecutor>,
     sources: Vec<Box<dyn ResourceSource>>,
-    cache: Mutex<HashMap<ResourcePath, Arc<CacheEntry>>>,
+    cache: Mutex<HashMap<ResourceId, Arc<CacheEntry>>>,
     weak: Weak<Self>,
     #[cfg(test)]
     test_ctx: tests::ResourceManagerTestContext,
@@ -883,7 +883,7 @@ impl ResourceManager {
     #[inline]
     pub fn test_ctx(&self) -> &tests::ResourceManagerTestContext { &self.test_ctx }
 
-    fn watch_n(&self, id: &ResourcePath, source_idx: &SourceIndex) {
+    fn watch_n(&self, id: &ResourceId, source_idx: &SourceIndex) {
         for (idx, source) in self.sources.iter().enumerate() {
             if idx <= source_idx.idx() {
                 source.watch(id.clone(), Box::new(ManagerResourceWatcher {
@@ -896,14 +896,14 @@ impl ResourceManager {
         }
     }
 
-    fn remove(&self, cache: &mut MutexGuard<HashMap<ResourcePath, Arc<CacheEntry>>>, id: &ResourcePath) {
+    fn remove(&self, cache: &mut MutexGuard<HashMap<ResourceId, Arc<CacheEntry>>>, id: &ResourceId) {
         cache.remove(id);
         for source in &self.sources {
             source.unwatch(id);
         }
     }
 
-    fn update(&self, id: ResourcePath, source_idx: SourceIndex, update: ResourceUpdate) {
+    fn update(&self, id: ResourceId, source_idx: SourceIndex, update: ResourceUpdate) {
         let task_self = self.weak.upgrade()
             .expect("ResourceManager cyclic reference should not be broken");
         let task_id = id.clone();
@@ -994,7 +994,7 @@ impl ResourceManager {
         }.instrument(info_span!("resource_update", %id, %source_idx))).detach();
     }
 
-    fn find_hash(&self, id: &ResourcePath) -> Option<SealedResourceDataSource> {
+    fn find_hash(&self, id: &ResourceId) -> Option<SealedResourceDataSource> {
         for (idx, source) in self.sources.iter().enumerate() {
             match source.hash(id) {
                 Some(hash) => return Some(hash.seal(idx)),
@@ -1004,7 +1004,7 @@ impl ResourceManager {
         None
     }
 
-    async fn find_data(&self, id: &ResourcePath) -> Option<SealedResourceDataResult> {
+    async fn find_data(&self, id: &ResourceId) -> Option<SealedResourceDataResult> {
         for (idx, source) in self.sources.iter().enumerate() {
             match source.load(id).await {
                 Ok(data) => return Some(Ok(data.seal(idx))),
@@ -1032,8 +1032,8 @@ impl ResourceManager {
 
     fn load<T>(
         &self,
-        cache: &mut MutexGuard<HashMap<ResourcePath, Arc<CacheEntry>>>,
-        id: ResourcePath,
+        cache: &mut MutexGuard<HashMap<ResourceId, Arc<CacheEntry>>>,
+        id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
         load_priority: LoadPriority,
     ) -> ResourceFuture<T>
@@ -1079,7 +1079,7 @@ impl ResourceManager {
 
     fn get_or_load_impl<T>(
         &self,
-        id: ResourcePath,
+        id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
         load_priority: LoadPriority,
     ) -> ResourceFuture<T>
@@ -1125,12 +1125,12 @@ impl ResourceManager {
     /// resolved, it will trigger a new load using the given [loader][rl].
     ///
     /// [res]: Resource
-    /// [rp]: ResourcePath
+    /// [rp]: ResourceId
     /// [rl]: ResourceLoader
     /// [rf]: ResourceFuture
     pub fn get_or_load<T>(
         &self,
-        id: impl Into<ResourcePath>,
+        id: impl Into<ResourceId>,
         loader: impl ResourceLoader<T>,
         load_priority: LoadPriority,
     ) -> ResourceFuture<T>
@@ -1267,12 +1267,12 @@ pub(in crate::resource) mod tests {
     }
 
     pub struct TestResourceLoader {
-        expected_id: ResourcePath,
+        expected_id: ResourceId,
     }
 
     impl TestResourceLoader {
         #[inline]
-        pub fn new(expected_id: impl Into<ResourcePath>) -> Self {
+        pub fn new(expected_id: impl Into<ResourceId>) -> Self {
             Self {
                 expected_id: expected_id.into(),
             }
@@ -1295,16 +1295,16 @@ pub(in crate::resource) mod tests {
 
     #[derive(Default)]
     pub struct ResourceDataMap {
-        raw: RwLock<HashMap<ResourcePath, (&'static [u8], String)>>,
-        watch_list: RwLock<HashMap<ResourcePath, Box<dyn ResourceWatcher>>>,
+        raw: RwLock<HashMap<ResourceId, (&'static [u8], String)>>,
+        watch_list: RwLock<HashMap<ResourceId, Box<dyn ResourceWatcher>>>,
     }
 
     impl ResourceDataMap {
-        fn get(&self, id: &ResourcePath) -> Option<(&'static [u8], String)> {
+        fn get(&self, id: &ResourceId) -> Option<(&'static [u8], String)> {
             self.raw.read().get(id).map(|(r, h)| (*r, h.clone()))
         }
 
-        fn insert_impl(&self, id: ResourcePath, data: &'static [u8], hash: String) {
+        fn insert_impl(&self, id: ResourceId, data: &'static [u8], hash: String) {
             let update = match self.raw.write().insert(id.clone(), (data, hash.clone())).is_some() {
                 true => ResourceUpdate::Modified(hash),
                 false => ResourceUpdate::Added(hash),
@@ -1314,11 +1314,11 @@ pub(in crate::resource) mod tests {
             }
         }
 
-        pub fn insert(&self, id: impl Into<ResourcePath>, data: &'static [u8], hash: impl Into<String>) {
+        pub fn insert(&self, id: impl Into<ResourceId>, data: &'static [u8], hash: impl Into<String>) {
             self.insert_impl(id.into(), data, hash.into())
         }
 
-        pub fn remove(&self, id: impl Into<ResourcePath>) {
+        pub fn remove(&self, id: impl Into<ResourceId>) {
             let id = id.into();
             if self.raw.write().remove(&id).is_some() {
                 if let Some(watcher) = self.watch_list.read().get(&id) {
@@ -1327,15 +1327,15 @@ pub(in crate::resource) mod tests {
             }
         }
 
-        fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>) {
+        fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>) {
             self.watch_list.write().insert(id, watcher);
         }
 
-        fn unwatch(&self, id: &ResourcePath) {
+        fn unwatch(&self, id: &ResourceId) {
             self.watch_list.write().remove(id);
         }
 
-        pub fn assert_watch(&self, id: impl Into<ResourcePath>, should_watch: bool) {
+        pub fn assert_watch(&self, id: impl Into<ResourceId>, should_watch: bool) {
             let id = id.into();
             let watch_list = self.watch_list.read();
             match (watch_list.get(&id), should_watch) {
@@ -1359,7 +1359,7 @@ pub(in crate::resource) mod tests {
 
     #[async_trait]
     impl ResourceSource for TestResourceSource {
-        fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+        fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
             if let Some((_, hash)) = self.inner.get(id) {
                 Some(ResourceDataSource::new(hash))
             } else {
@@ -1367,7 +1367,7 @@ pub(in crate::resource) mod tests {
             }
         }
 
-        async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+        async fn load(&self, id: &ResourceId) -> ResourceDataResult {
             if let Some((data, hash)) = self.inner.get(id) {
                 Ok(ResourceData::new(Box::new(data), hash))
             } else {
@@ -1375,11 +1375,11 @@ pub(in crate::resource) mod tests {
             }
         }
 
-        fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
+        fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
             self.inner.watch(id, watcher);
         }
 
-        fn unwatch(&self, id: &ResourcePath) {
+        fn unwatch(&self, id: &ResourceId) {
             self.inner.unwatch(id);
         }
     }
@@ -1403,7 +1403,7 @@ pub(in crate::resource) mod tests {
         let err = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect_err("No resource data should be present for 'key'");
         assert_matches!(err, ResourceLoadError::NotFound(id) => {
-            assert_eq!(id, ResourcePath::new("key"));
+            assert_eq!(id, ResourceId::from("key"));
         });
         manager.test_ctx().sync_load.assert_count(1);
 
@@ -1414,7 +1414,7 @@ pub(in crate::resource) mod tests {
             .expect("Error should be cached and pollable")
             .expect_err("No resource data should be present for 'key'");
         assert_matches!(err, ResourceLoadError::NotFound(id) => {
-            assert_eq!(id, ResourcePath::new("key"));
+            assert_eq!(id, ResourceId::from("key"));
         });
         manager.test_ctx().sync_load.assert_count(0);
     }

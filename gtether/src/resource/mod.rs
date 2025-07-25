@@ -33,16 +33,16 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::resource::manager::{LoadPriority, ResourceLoadResult, ResourceManager};
-use crate::resource::path::ResourcePath;
+use crate::resource::id::ResourceId;
 
 pub mod manager;
-pub mod path;
+pub mod id;
 pub mod source;
 
 struct SubResourceRef<P: ?Sized + Send + Sync + 'static> {
     type_id: Option<TypeId>,
     update_fn: Box<dyn (
-        Fn(ResourcePath, Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
+        Fn(ResourceId, Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
     ) + Send + Sync + 'static>,
 }
 
@@ -97,7 +97,7 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
         }
     }
 
-    async fn update(&self, id: ResourcePath, parent: Arc<Resource<P>>) -> Result<(), ResourceLoadError> {
+    async fn update(&self, id: ResourceId, parent: Arc<Resource<P>>) -> Result<(), ResourceLoadError> {
         Box::into_pin((self.update_fn)(id, parent)).await
     }
 }
@@ -202,7 +202,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
         }
     }
 
-    pub(in crate::resource) async fn update_sub_resources(self: &Arc<Self>, id: &ResourcePath) {
+    pub(in crate::resource) async fn update_sub_resources(self: &Arc<Self>, id: &ResourceId) {
         let sub_resources = self.sub_resources.lock().await;
         for sub_resource in &*sub_resources {
             let sub_id = id.clone() + ":<sub-resource>";
@@ -280,7 +280,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
 ///
 /// The update lock is dropped when the ResourceMut is dropped.
 ///
-/// [id]: ResourcePath
+/// [id]: ResourceId
 /// [rm]: manager::ResourceManager
 pub struct ResourceMut<T: ?Sized + Send + Sync + 'static> {
     inner: Arc<Resource<T>>,
@@ -344,8 +344,8 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceMut<T> {
 pub enum ResourceLoadError {
     /// There was no resource or resource data found for the given [id].
     ///
-    /// [id]: ResourcePath
-    NotFound(ResourcePath),
+    /// [id]: ResourceId
+    NotFound(ResourceId),
 
     /// The existing resource type did not match the requested resource type.
     TypeMismatch{
@@ -413,7 +413,7 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 /// Contextual data for loading resources.
 pub struct ResourceLoadContext {
     manager: Arc<ResourceManager>,
-    id: ResourcePath,
+    id: ResourceId,
     priority: LoadPriority,
 }
 
@@ -421,7 +421,7 @@ impl ResourceLoadContext {
     #[inline]
     pub(in crate::resource) fn new(
         manager: Arc<ResourceManager>,
-        id: ResourcePath,
+        id: ResourceId,
         priority: LoadPriority,
     ) -> Self {
         Self {
@@ -439,9 +439,9 @@ impl ResourceLoadContext {
         &self.manager
     }
 
-    /// The resource [id](ResourcePath) that is currently being loaded.
+    /// The resource [id](ResourceId) that is currently being loaded.
     #[inline]
-    pub fn id(&self) -> ResourcePath {
+    pub fn id(&self) -> ResourceId {
         self.id.clone()
     }
 
@@ -473,7 +473,7 @@ impl ResourceLoadContext {
 /// use gtether::resource::{ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 /// use smol::prelude::*;
 /// use gtether::resource::manager::ResourceManager;
-/// use gtether::resource::path::ResourcePath;
+/// use gtether::resource::id::ResourceId;
 ///
 /// struct StringLoader {}
 ///

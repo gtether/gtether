@@ -29,21 +29,21 @@
 //! ```
 //! use async_trait::async_trait;
 //! use smol::io::Cursor;
-//! use gtether::resource::path::ResourcePath;
+//! use gtether::resource::id::ResourceId;
 //! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex, ResourceData, ResourceDataSource};
 //!
 //! struct ReflectingSource {}
 //!
 //! #[async_trait]
 //! impl ResourceSource for ReflectingSource {
-//!     fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+//!     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
 //!         Some(ResourceDataSource::new(
 //!             // The hash can simply be the ID, since the value won't change for the same ID
 //!             id.to_string().clone()
 //!         ))
 //!     }
 //!
-//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+//!     async fn load(&self, id: &ResourceId) -> ResourceDataResult {
 //!         Ok(ResourceData::new(
 //!             Box::new(Cursor::new(id.to_string().into_bytes())),
 //!             // The hash can simply be the ID, since the value won't change for the same ID
@@ -51,8 +51,8 @@
 //!         ))
 //!     }
 //!
-//!     fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) { /* noop */ }
-//!     fn unwatch(&self, id: &ResourcePath) { /* noop */ }
+//!     fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) { /* noop */ }
+//!     fn unwatch(&self, id: &ResourceId) { /* noop */ }
 //! }
 //! ```
 //!
@@ -75,11 +75,11 @@
 //! use std::collections::HashMap;
 //! use std::sync::Mutex;
 //! use async_trait::async_trait;
-//! use gtether::resource::path::ResourcePath;
+//! use gtether::resource::id::ResourceId;
 //! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex, ResourceDataSource};
 //!
 //! struct ChangingSource {
-//!     watchers: Mutex<HashMap<ResourcePath, Box<dyn ResourceWatcher>>>,
+//!     watchers: Mutex<HashMap<ResourceId, Box<dyn ResourceWatcher>>>,
 //! }
 //!
 //! impl ChangingSource {
@@ -88,20 +88,20 @@
 //!
 //! #[async_trait]
 //! impl ResourceSource for ChangingSource {
-//!     fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+//!     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
 //!         todo!("Some custom hash retrieval")
 //!     }
 //!
-//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+//!     async fn load(&self, id: &ResourceId) -> ResourceDataResult {
 //!         todo!("Some custom load operation")
 //!     }
 //!
-//!     fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
+//!     fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
 //!         // _sub_idx can be ignored for this implementation
 //!         self.watchers.lock().unwrap().insert(id, watcher);
 //!     }
 //!
-//!     fn unwatch(&self, id: &ResourcePath) {
+//!     fn unwatch(&self, id: &ResourceId) {
 //!         self.watchers.lock().unwrap().remove(id);
 //!     }
 //! }
@@ -120,7 +120,7 @@
 //! Example wrapping a single sub-source:
 //! ```
 //! use async_trait::async_trait;
-//! use gtether::resource::path::ResourcePath;
+//! use gtether::resource::id::ResourceId;
 //! use gtether::resource::source::{ResourceSource, ResourceDataResult, ResourceWatcher, SourceIndex, ResourceDataSource};
 //!
 //! struct WrapperSource<S: ResourceSource> {
@@ -129,32 +129,32 @@
 //!
 //! #[async_trait]
 //! impl<S: ResourceSource> ResourceSource for WrapperSource<S> {
-//!     fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+//!     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
 //!         // Do any custom wrapper logic
 //!         let hash = self.inner.hash(id);
 //!         // Possibly modify result if necessary
 //!         hash
 //!     }
 //!
-//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+//!     async fn load(&self, id: &ResourceId) -> ResourceDataResult {
 //!         // Do any custom wrapper logic
 //!         let result = self.inner.load(id).await;
 //!         // Possibly modify result if necessary
 //!         result
 //!     }
 //!
-//!     async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceDataResult {
+//!     async fn sub_load(&self, id: &ResourceId, sub_idx: &SourceIndex) -> ResourceDataResult {
 //!         // Do any custom wrapper logic
 //!         let result = self.inner.sub_load(id, sub_idx).await;
 //!         // Possibly modify result if necessary
 //!         result
 //!     }
 //!
-//!     fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) {
+//!     fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) {
 //!         self.inner.watch(id, watcher, sub_idx)
 //!     }
 //!
-//!     fn unwatch(&self, id: &ResourcePath) {
+//!     fn unwatch(&self, id: &ResourceId) {
 //!         self.inner.unwatch(id)
 //!     }
 //! }
@@ -167,7 +167,7 @@
 //! Example using sub-indices with multiple sub-sources:
 //! ```
 //! use async_trait::async_trait;
-//! use gtether::resource::path::ResourcePath;
+//! use gtether::resource::id::ResourceId;
 //! use gtether::resource::ResourceLoadError;
 //! use gtether::resource::source::{ResourceSource, ResourceData, ResourceDataResult, ResourceWatcher, SourceIndex, ResourceDataSource};
 //!
@@ -183,30 +183,30 @@
 //!         todo!("Yield a sub-source")
 //!     }
 //!
-//!     fn find_sub_hash(&self, id: &ResourcePath) -> Option<(usize, ResourceDataSource)> {
+//!     fn find_sub_hash(&self, id: &ResourceId) -> Option<(usize, ResourceDataSource)> {
 //!         todo!("Yield a hash from a particular sub-source, as well as the sub-source's index")
 //!     }
 //!
-//!     fn find_sub_data(&self, id: &ResourcePath) -> Result<(usize, ResourceData), ResourceLoadError> {
+//!     fn find_sub_data(&self, id: &ResourceId) -> Result<(usize, ResourceData), ResourceLoadError> {
 //!         todo!("Yield data from a particular sub-source, as well as the sub-source's index")
 //!     }
 //! }
 //!
 //! #[async_trait]
 //! impl ResourceSource for MultiSource {
-//!     fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource> {
+//!     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
 //!         let (idx, hash) = self.find_sub_hash(id)?;
 //!         // The inner sub-hash must be wrapped with its sub-sources index
 //!         Some(hash.wrap(idx))
 //!     }
 //!
-//!     async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+//!     async fn load(&self, id: &ResourceId) -> ResourceDataResult {
 //!         let (idx, data) = self.find_sub_data(id)?;
 //!         // The inner sub-data must be wrapped with its sub-sources index
 //!         Ok(data.wrap(idx))
 //!     }
 //!
-//!     async fn sub_load(&self, id: &ResourcePath, sub_idx: &SourceIndex) -> ResourceDataResult {
+//!     async fn sub_load(&self, id: &ResourceId, sub_idx: &SourceIndex) -> ResourceDataResult {
 //!         let source = self.get_sub_source(sub_idx)?;
 //!         match sub_idx.sub_idx() {
 //!             Some(sub_idx) => source.sub_load(id, sub_idx).await,
@@ -214,7 +214,7 @@
 //!         }
 //!     }
 //!
-//!     fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) {
+//!     fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>) {
 //!         let sub_idx = sub_idx.unwrap_or(SourceIndex::max());
 //!         for (idx, source) in self.sub_sources() {
 //!             if idx <= sub_idx.idx() {
@@ -230,7 +230,7 @@
 //!         }
 //!     }
 //!
-//!     fn unwatch(&self, id: &ResourcePath) {
+//!     fn unwatch(&self, id: &ResourceId) {
 //!         for (_, source) in self.sub_sources() {
 //!             source.unwatch(id);
 //!         }
@@ -260,7 +260,7 @@
 //! [rsw]: ResourceSource::watch()
 //! [rsu]: ResourceSource::unwatch()
 //! [rd]: ResourceReadData
-//! [rp]: ResourcePath
+//! [rp]: ResourceId
 //! [si]: SourceIndex
 //! [rw]: ResourceWatcher
 use async_trait::async_trait;
@@ -268,7 +268,7 @@ use smol::io::AsyncRead;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display, Formatter};
 
-use crate::resource::path::ResourcePath;
+use crate::resource::id::ResourceId;
 use crate::resource::{ResourceLoadError, ResourceReadData};
 
 pub mod list;
@@ -554,16 +554,16 @@ pub enum ResourceUpdate {
 ///
 /// [rd]: ResourceReadData
 /// [rs]: ResourceSource
-/// [rp]: ResourcePath
+/// [rp]: ResourceId
 pub trait ResourceWatcher: Debug + Send + Sync + 'static {
     /// [ResourceSources][rs] call this when their data changes for a specific [id][rp].
     ///
     /// See [module-level documentation][mod] for more information on the expected hash.
     ///
     /// [rs]: ResourceSource
-    /// [rp]: ResourcePath
+    /// [rp]: ResourceId
     /// [mod]: super::source#data-hashing
-    fn notify_update(&self, id: &ResourcePath, update: ResourceUpdate);
+    fn notify_update(&self, id: &ResourceId, update: ResourceUpdate);
 
     /// Clone this ResourceWatcher with the context of a specific sub-index.
     ///
@@ -583,17 +583,17 @@ pub trait ResourceWatcher: Debug + Send + Sync + 'static {
 /// [mod]: super::source
 #[async_trait]
 pub trait ResourceSource: Send + Sync + 'static {
-    /// Given an [id](ResourcePath), attempt to retrieve the [hash](super::source#data-hashing)
+    /// Given an [id](ResourceId), attempt to retrieve the [hash](super::source#data-hashing)
     /// associated with it.
     ///
     /// If this source doesn't have data associated with the given id, yields `None`.
-    fn hash(&self, id: &ResourcePath) -> Option<ResourceDataSource>;
+    fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource>;
 
     /// Given an [id][rp], attempt to retrieve the [raw data][rd] associated with it.
     ///
-    /// [rp]: ResourcePath
+    /// [rp]: ResourceId
     /// [rd]: ResourceReadData
-    async fn load(&self, id: &ResourcePath) -> ResourceDataResult;
+    async fn load(&self, id: &ResourceId) -> ResourceDataResult;
 
     /// Given an [id][rp] and [sub-idx][si], attempt to retrieve the [raw data][rd] associated with it.
     ///
@@ -603,11 +603,11 @@ pub trait ResourceSource: Send + Sync + 'static {
     ///
     /// Default implementation of this method is to delegate to [Self::load()].
     ///
-    /// [rp]: ResourcePath
+    /// [rp]: ResourceId
     /// [si]: SourceIndex
     /// [rd]: ResourceReadData
     /// [rs]: ResourceSource
-    async fn sub_load(&self, id: &ResourcePath, _sub_idx: &SourceIndex) -> ResourceDataResult {
+    async fn sub_load(&self, id: &ResourceId, _sub_idx: &SourceIndex) -> ResourceDataResult {
         self.load(id).await
     }
 
@@ -618,18 +618,18 @@ pub trait ResourceSource: Send + Sync + 'static {
     /// expected to be given copies of the watcher, and any sources that belong to greater
     /// sub-indices are expected to be [unwatched](Self::unwatch()).
     ///
-    /// [rp]: ResourcePath
+    /// [rp]: ResourceId
     /// [rs]: ResourceSource
     /// [si]: SourceIndex
-    fn watch(&self, id: ResourcePath, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>);
+    fn watch(&self, id: ResourceId, watcher: Box<dyn ResourceWatcher>, sub_idx: Option<SourceIndex>);
 
     /// Unwatch a given [id][rp] for data changes.
     ///
     /// An [id][rp] that is unwatched is expected to no longer report data changes, and any relevant
     /// watchers that have been stored for said [id][rp] are expected to be purged.
     ///
-    /// [rp]: ResourcePath
-    fn unwatch(&self, id: &ResourcePath);
+    /// [rp]: ResourceId
+    fn unwatch(&self, id: &ResourceId);
 }
 
 impl<S: ResourceSource> From<S> for Box<dyn ResourceSource> {
