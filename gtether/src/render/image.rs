@@ -69,3 +69,11 @@ impl VKDescriptorSource for ImageSampler {
         self.random_state.hash_one(view.clone())
     }
 }
+
+/// Helper trait for retrieving dynamic [ImageViews](ImageView).
+///
+/// This is mostly useful for use with [Resources](crate::resource::Resource), where a generic API
+/// interface can request input via `Arc<Resource<dyn VKImageViewSource>>`.
+pub trait VKImageViewSource: Debug + Send + Sync {
+    fn image_view(&self) -> &Arc<ImageView>;
+}

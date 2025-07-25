@@ -716,3 +716,62 @@ impl FlatVertex {
         Self::buffer(alloc, glm::vec2(-1.0, -1.0), glm::vec2(1.0, 1.0))
     }
 }
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct TexturedFlatVertex {
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
+    #[format(R32G32_SFLOAT)]
+    uv: [f32; 2],
+}
+
+impl TexturedFlatVertex {
+    pub fn rect(
+        pos_min: glm::TVec2<f32>,
+        pos_max: glm::TVec2<f32>,
+        uv_min: glm::TVec2<f32>,
+        uv_max: glm::TVec2<f32>,
+    ) -> [TexturedFlatVertex; 6] {
+        [
+            TexturedFlatVertex { position: [ pos_min.x, pos_min.y ], uv: [ uv_min.x, uv_min.y ]},
+            TexturedFlatVertex { position: [ pos_min.x, pos_max.y ], uv: [ uv_min.x, uv_max.y ]},
+            TexturedFlatVertex { position: [ pos_max.x, pos_max.y ], uv: [ uv_max.x, uv_max.y ]},
+            TexturedFlatVertex { position: [ pos_min.x, pos_min.y ], uv: [ uv_min.x, uv_min.y ]},
+            TexturedFlatVertex { position: [ pos_max.x, pos_max.y ], uv: [ uv_max.x, uv_max.y ]},
+            TexturedFlatVertex { position: [ pos_max.x, pos_min.y ], uv: [ uv_max.x, uv_min.y ]},
+        ]
+    }
+
+    pub fn buffer(
+        alloc: Arc<dyn MemoryAllocator>,
+        pos_min: glm::TVec2<f32>,
+        pos_max: glm::TVec2<f32>,
+        uv_min: glm::TVec2<f32>,
+        uv_max: glm::TVec2<f32>,
+    ) -> Subbuffer<[Self]> {
+        Buffer::from_iter(
+            alloc,
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            Self::rect(pos_min, pos_max, uv_min, uv_max),
+        ).unwrap()
+    }
+
+    #[inline]
+    pub fn screen_buffer(alloc: Arc<dyn MemoryAllocator>) -> Subbuffer<[Self]> {
+        Self::buffer(
+            alloc,
+            glm::vec2(-1.0, -1.0),
+            glm::vec2(1.0, 1.0),
+            glm::vec2(0.0, 0.0),
+            glm::vec2(1.0, 1.0),
+        )
+    }
+}
