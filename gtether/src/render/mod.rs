@@ -10,7 +10,7 @@ use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, Standar
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Features, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
 use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
@@ -194,11 +194,15 @@ impl EngineDevice {
     ///
     /// This generally only needs to be used if you are implementing a custom RenderTarget, as
     /// otherwise device creation is handled by the engine.
-    pub fn for_surface(instance: Arc<Instance>, surface: Arc<Surface>) -> Self {
-        // TODO: does this need to be configurable?
+    pub fn for_surface(
+        instance: Arc<Instance>,
+        device_extensions: DeviceExtensions,
+        device_features: Features,
+        surface: Arc<Surface>,
+    ) -> Self {
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
-            ..DeviceExtensions::empty()
+            ..device_extensions
         };
 
         let (physical_device, queue_family_index) = instance
@@ -228,6 +232,7 @@ impl EngineDevice {
                     ..Default::default()
                 }],
                 enabled_extensions: device_extensions,
+                enabled_features: device_features,
                 ..Default::default()
             },
         ).expect("Failed to create device");

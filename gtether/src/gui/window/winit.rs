@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::{fmt, thread};
 use tracing::{event, info, warn, Level};
+use vulkano::device::{DeviceExtensions, Features};
 use vulkano::instance::InstanceExtensions;
 use vulkano::swapchain::Surface;
 use winit::application::ApplicationHandler;
@@ -75,6 +76,16 @@ pub struct CreateWindowInfo {
     /// Default is true.
     pub exit_on_close: bool,
 
+    /// Any additional Vulkan device extensions.
+    ///
+    /// Default is empty.
+    pub device_extensions: DeviceExtensions,
+
+    /// Any additional Vulkan device features.
+    ///
+    /// Default is empty.
+    pub device_features: Features,
+
     pub _ne: NonExhaustive,
 }
 
@@ -83,6 +94,8 @@ impl Default for CreateWindowInfo {
         Self {
             attributes: WindowAttributes::default(),
             exit_on_close: true,
+            device_extensions: DeviceExtensions::empty(),
+            device_features: Features::empty(),
             _ne: NonExhaustive(()),
         }
     }
@@ -180,6 +193,8 @@ impl Window {
         event_loop: &ActiveEventLoop,
         event_loop_proxy: EventLoopProxy<EngineEvent>,
         instance: &Arc<Instance>,
+        device_extensions: DeviceExtensions,
+        device_features: Features,
         application_name: String,
     ) -> (WindowHandle, thread::JoinHandle<()>) {
         let mut attributes = attributes;
@@ -198,6 +213,8 @@ impl Window {
         );
         let device = Arc::new(EngineDevice::for_surface(
             instance.clone(),
+            device_extensions,
+            device_features,
             target.surface().clone(),
         ));
         let renderer = Arc::new(Renderer::new(
@@ -449,6 +466,8 @@ impl<A: Application> WindowOrchestrator<A> {
             event_loop,
             self.event_loop_proxy.clone(),
             &self.render_instance,
+            create_info.device_extensions,
+            create_info.device_features,
             self.application_name.clone(),
         );
         self.windows.insert(handle.id(), WindowEntry {
