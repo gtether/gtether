@@ -694,7 +694,7 @@ where
                                             Err(_) => { /* sender was dropped, this is expected */ }
                                         }
 
-                                        strong.update_sub_resources(&async_id).await;
+                                        strong.update_sub_resources().await;
 
                                         CacheEntryUpdateResult::Ok(data.source)
                                     },
@@ -1056,7 +1056,10 @@ impl ResourceManager {
                         load_priority,
                     );
                     match task_loader.load(data.data, ctx).await {
-                        Ok(v) => (Ok((Arc::new(Resource::new(v)), data.source.hash)), data.source.idx),
+                        Ok(v) => (
+                            Ok((Arc::new(Resource::new(task_id.clone(), v)), data.source.hash)),
+                            data.source.idx,
+                        ),
                         Err(e) => (Err(e), data.source.idx),
                     }
                 },

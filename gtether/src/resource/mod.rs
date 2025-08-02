@@ -42,7 +42,7 @@ pub mod source;
 struct SubResourceRef<P: ?Sized + Send + Sync + 'static> {
     type_id: Option<TypeId>,
     update_fn: Box<dyn (
-        Fn(ResourceId, Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
+        Fn(Arc<Resource<P>>) -> Box<dyn Future<Output = Result<(), ResourceLoadError>> + Send + 'static>
     ) + Send + Sync + 'static>,
 }
 
@@ -54,7 +54,7 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
         let weak = Arc::downgrade(resource);
         Self {
             type_id: Some(TypeId::of::<T>()),
-            update_fn: Box::new(move |id, parent| Box::new({
+            update_fn: Box::new(move |parent| Box::new({
                 let async_weak = weak.clone();
                 let async_loader = loader.clone();
                 async move {
@@ -71,7 +71,7 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
                             Ok(_) => { debug!("Drop-checker received an unexpected message"); }
                             Err(_) => { /* sender was dropped, this is expected */ }
                         }
-                        resource.update_sub_resources(&id).await;
+                        resource.update_sub_resources().await;
                     }
                     Ok(())
                 }
@@ -87,7 +87,7 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
         let callback = Arc::new(callback);
         Self {
             type_id: None,
-            update_fn: Box::new(move |_, parent| {
+            update_fn: Box::new(move |parent| {
                 let callback = callback.clone();
                 Box::new(async move {
                     callback(parent).await;
@@ -97,8 +97,8 @@ impl<P: ?Sized + Send + Sync + 'static> SubResourceRef<P> {
         }
     }
 
-    async fn update(&self, id: ResourceId, parent: Arc<Resource<P>>) -> Result<(), ResourceLoadError> {
-        Box::into_pin((self.update_fn)(id, parent)).await
+    async fn update(&self, parent: Arc<Resource<P>>) -> Result<(), ResourceLoadError> {
+        Box::into_pin((self.update_fn)(parent)).await
     }
 }
 
@@ -187,6 +187,7 @@ pub type ResourceMutLock<'a, T> = MappedRwLockWriteGuard<'a, T>;
 /// [ar]: Resource::attach_sub_resource
 #[derive(Debug)]
 pub struct Resource<T: ?Sized + Send + Sync + 'static> {
+    id: ResourceId,
     value: RwLock<Box<T>>,
     sub_resources: smol::lock::Mutex<Vec<SubResourceRef<T>>>,
     update_lock: smol::lock::Mutex<()>,
@@ -194,23 +195,32 @@ pub struct Resource<T: ?Sized + Send + Sync + 'static> {
 
 impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     #[inline]
-    pub(in crate::resource) fn new(value: Box<T>) -> Self {
+    pub(in crate::resource) fn new(id: ResourceId, value: Box<T>) -> Self {
         Self {
+            id,
             value: RwLock::new(value),
             sub_resources: smol::lock::Mutex::new(Vec::new()),
             update_lock: smol::lock::Mutex::new(()),
         }
     }
 
-    pub(in crate::resource) async fn update_sub_resources(self: &Arc<Self>, id: &ResourceId) {
+    pub(in crate::resource) async fn update_sub_resources(self: &Arc<Self>) {
         let sub_resources = self.sub_resources.lock().await;
         for sub_resource in &*sub_resources {
-            let sub_id = id.clone() + ":<sub-resource>";
-            match sub_resource.update(sub_id.clone(), self.clone()).await {
+            match sub_resource.update(self.clone()).await {
                 Ok(_) => {},
-                Err(error) => debug!(id = %sub_id, %error, "Failed to update sub-resource"),
+                Err(error) => debug!(
+                    parent_id = %self.id,
+                    %error,
+                    "Failed to update sub-resource",
+                ),
             }
         }
+    }
+
+    #[inline]
+    pub fn id(&self) -> &ResourceId {
+        &self.id
     }
 
     /// Retrieve a read-only [lock guard][lg] for this Resource.
@@ -230,7 +240,8 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     ) -> ResourceLoadResult<S> {
         let sub_value = loader.load(&self.read()).await?;
         let mut sub_resources = self.sub_resources.lock().await;
-        let sub_resource = Arc::new(Resource::new(sub_value));
+        let sub_id = self.id.join(format!("<sub-{}>", sub_resources.len()));
+        let sub_resource = Arc::new(Resource::new(sub_id, sub_value));
         sub_resources.push(SubResourceRef::from_sub_resource(&sub_resource, Arc::new(loader)));
         Ok(sub_resource)
     }
