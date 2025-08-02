@@ -8,14 +8,15 @@
 //! These utilities are entirely optional, and you are free to roll your own logic for Vulkan
 //! uniforms.
 
+use ahash::RandomState;
 use arrayvec::ArrayVec;
 use bytemuck::NoUninit;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use ahash::RandomState;
 use vulkano::buffer::{AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::descriptor_set::layout::DescriptorSetLayoutBinding;
 use vulkano::descriptor_set::{DescriptorBufferInfo, WriteDescriptorSet};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::{DeviceSize, Validated};
@@ -179,7 +180,12 @@ impl<T: BufferContents, U: UniformValue<T>> Uniform<T, U> {
 }
 
 impl<T: BufferContents, U: UniformValue<T>> VKDescriptorSource for Uniform<T, U> {
-    fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+    fn write_descriptor(
+        &self,
+        frame_idx: usize,
+        binding: u32,
+        _layout: &DescriptorSetLayoutBinding,
+    ) -> (WriteDescriptorSet, u64) {
         let buffer = self.buffers.get(frame_idx).unwrap();
         (
             WriteDescriptorSet::buffer(binding, buffer.buffer.clone()),
@@ -377,7 +383,12 @@ impl<T: BufferContents, const CAP: usize, U: UniformValue<T>> UniformSet<T, CAP,
 }
 
 impl<T: BufferContents + NoUninit, const CAP: usize, U: UniformValue<T>> VKDescriptorSource for UniformSet<T, CAP, U> {
-    fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+    fn write_descriptor(
+        &self,
+        frame_idx: usize,
+        binding: u32,
+        _layout: &DescriptorSetLayoutBinding,
+    ) -> (WriteDescriptorSet, u64) {
         let buffer = self.buffers.get(frame_idx).unwrap();
         (
             WriteDescriptorSet::buffer_with_range(

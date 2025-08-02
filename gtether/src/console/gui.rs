@@ -38,7 +38,7 @@ use crate::render::{FlatVertex, RenderTarget, Renderer, RendererStaleEvent, Text
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
 use crate::render::descriptor_set::EngineDescriptorSet;
-use crate::render::image::{ImageSampler, VKImageViewSource};
+use crate::render::image::{EngineImageViewSampler, VKImageViewSource};
 
 /// General alignment configuration for a [ConsoleGui] section.
 #[derive(Debug, Clone)]
@@ -732,7 +732,7 @@ impl ConsoleBackgroundImageRenderer {
             ViewportType::TopLeft,
         );
 
-        let sampler = Arc::new(ImageSampler::new(
+        let sampler = Arc::new(EngineImageViewSampler::new(
             image.image.read().image_view().clone(),
             Sampler::new(
                 renderer.device().vk_device().clone(),

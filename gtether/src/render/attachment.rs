@@ -7,9 +7,10 @@
 //! Vulkan attachments where applicable.
 
 use ahash::RandomState;
+use educe::Educe;
 use std::fmt::Debug;
 use std::sync::Arc;
-use educe::Educe;
+use vulkano::descriptor_set::layout::DescriptorSetLayoutBinding;
 use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::image::view::ImageView;
 
@@ -124,7 +125,12 @@ impl AttachmentDescriptor {
 }
 
 impl VKDescriptorSource for AttachmentDescriptor {
-    fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+    fn write_descriptor(
+        &self,
+        frame_idx: usize,
+        binding: u32,
+        _layout: &DescriptorSetLayoutBinding,
+    ) -> (WriteDescriptorSet, u64) {
         let image_view = self.frames
             .framebuffer(frame_idx).unwrap()
             .get_attachment(self.input_name.clone())

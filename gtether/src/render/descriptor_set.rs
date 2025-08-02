@@ -14,18 +14,18 @@
 //! These utilities are entirely optional, and you are free to roll your own logic for Vulkan
 //! descriptor sets.
 
-use std::convert::Infallible;
-use std::fmt::Debug;
-use std::sync::Arc;
 use educe::Educe;
 use parking_lot::MappedMutexGuard;
 use smallvec::SmallVec;
+use std::convert::Infallible;
+use std::fmt::Debug;
+use std::sync::Arc;
+use vulkano::descriptor_set::layout::{DescriptorSetLayout, DescriptorSetLayoutBinding};
 use vulkano::descriptor_set::{DescriptorSet, DescriptorSetWithOffsets, PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::descriptor_set::layout::DescriptorSetLayout;
 use vulkano::{Validated, VulkanError};
 
-use crate::render::{EngineDevice, Renderer};
 use crate::render::frame::{Frame, FrameManager, FrameSet};
+use crate::render::{EngineDevice, Renderer};
 
 /// Iterator for descriptor memory offset values
 ///
@@ -106,6 +106,7 @@ impl ExactSizeIterator for DescriptorOffsetIter {}
 /// Basic implementation for e.g. an image view write descriptor:
 /// ```
 /// use std::sync::Arc;
+/// use vulkano::descriptor_set::layout::DescriptorSetLayoutBinding;
 /// use vulkano::descriptor_set::WriteDescriptorSet;
 /// use vulkano::image::sampler::Sampler;
 /// use vulkano::image::view::ImageView;
@@ -121,7 +122,12 @@ impl ExactSizeIterator for DescriptorOffsetIter {}
 /// }
 ///
 /// impl VKDescriptorSource for ImageViewDescriptor {
-///     fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+///     fn write_descriptor(
+///         &self,
+///         _frame_idx: usize,
+///         binding: u32,
+///         _layout: &DescriptorSetLayoutBinding,
+///     ) -> (WriteDescriptorSet, u64) {
 ///         (
 ///             WriteDescriptorSet::image_view_sampler(
 ///                 binding,
@@ -146,6 +152,7 @@ impl ExactSizeIterator for DescriptorOffsetIter {}
 /// use std::sync::Mutex;
 /// use vulkano::buffer::Subbuffer;
 /// use vulkano::descriptor_set::{DescriptorBufferInfo, WriteDescriptorSet};
+/// use vulkano::descriptor_set::layout::DescriptorSetLayoutBinding;
 /// use vulkano::DeviceSize;
 ///
 /// use gtether::render::descriptor_set::{DescriptorOffsetIter, VKDescriptorSource};
@@ -159,7 +166,12 @@ impl ExactSizeIterator for DescriptorOffsetIter {}
 /// }
 ///
 /// impl<const N: usize> VKDescriptorSource for DynamicBufferDescriptor<N> {
-///     fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64) {
+///     fn write_descriptor(
+///         &self,
+///         frame_idx: usize,
+///         binding: u32,
+///         _layout: &DescriptorSetLayoutBinding,
+///     ) -> (WriteDescriptorSet, u64) {
 ///         let buffers = self.dynamic_buffers.lock().unwrap();
 ///         let buffer = buffers.get(frame_idx).unwrap();
 ///         (
@@ -221,7 +233,12 @@ pub trait VKDescriptorSource: Debug + Send + Sync {
     /// Generate a write descriptor for a specific `frame_idx` and `binding`.
     ///
     /// Also yield a [hash](VKDescriptorSource#hashing) for the generated write descriptor.
-    fn write_descriptor(&self, frame_idx: usize, binding: u32) -> (WriteDescriptorSet, u64);
+    fn write_descriptor(
+        &self,
+        frame_idx: usize,
+        binding: u32,
+        layout: &DescriptorSetLayoutBinding,
+    ) -> (WriteDescriptorSet, u64);
 
     /// Update this descriptor source for a specific `frame_idx`.
     ///
@@ -364,6 +381,7 @@ impl EngineDescriptorSet {
             .map(|descriptor| descriptor.source.write_descriptor(
                 frame_idx,
                 descriptor.binding,
+                layout.bindings().get(&descriptor.binding).unwrap(),
             ))
             .unzip();
         let descriptor_set = PersistentDescriptorSet::new(

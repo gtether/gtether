@@ -32,7 +32,7 @@ use crate::render::font::compositor::FontRenderer;
 use crate::render::font::layout::PositionedChar;
 use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
-use crate::render::image::ImageSampler;
+use crate::render::image::EngineImageViewSampler;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererPostEvent, VulkanoError};
 use crate::render::descriptor_set::EngineDescriptorSet;
@@ -381,7 +381,7 @@ impl FontSheetRenderer {
             ViewportType::TopLeft,
         );
 
-        let font_sampler = Arc::new(ImageSampler::new(
+        let font_sampler = Arc::new(EngineImageViewSampler::new(
             font_sheet.read().image_view().clone(),
             Sampler::new(
                 renderer.device().vk_device().clone(),
