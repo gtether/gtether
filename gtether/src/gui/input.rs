@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use tracing::{error, event, Level};
 use winit::event::{DeviceEvent, KeyEvent as WinitKeyEvent, WindowEvent};
 
-pub use winit::event::{ElementState, MouseButton};
+pub use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 pub use winit::keyboard::{Key as LogicalKey, KeyCode, KeyLocation, ModifiersState, PhysicalKey};
 
 pub trait InputStateLayer {
@@ -140,6 +140,15 @@ pub struct MouseButtonEvent {
     pub position: glm::TVec2<f64>,
 }
 
+/// Event representing the mouse scroll wheel moving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MouseWheelEvent {
+    /// The amount that has been scrolled.
+    ///
+    /// See [MouseScrollDelta] for more information on possible values.
+    pub delta: MouseScrollDelta,
+}
+
 /// Events that are consumed by [InputDelegate]s when inputs happen.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputDelegateEvent {
@@ -154,6 +163,8 @@ pub enum InputDelegateEvent {
     /// suitable for motion controlled applications such as 3d camera movement. The value is the
     /// delta amount that the mouse moved.
     MouseMotion(glm::TVec2<f64>),
+    /// The mouse scroll wheel moved.
+    MouseWheel(MouseWheelEvent),
 }
 
 /// Lock struct for locking [InputDelegate]s.
@@ -476,6 +487,7 @@ pub(crate) enum InputEvent {
     Key(KeyEvent),
     Modifiers(ModifiersState),
     MouseInput{ button: MouseButton, state: ElementState },
+    MouseWheel { delta: MouseScrollDelta },
     CursorMoved(glm::TVec2<f64>),
     MouseMotion(glm::TVec2<f64>),
 }
@@ -491,6 +503,9 @@ impl InputEvent {
             },
             WindowEvent::MouseInput { state, button, .. } => {
                 Some(Self::MouseInput { button, state })
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                Some(Self::MouseWheel { delta })
             },
             WindowEvent::CursorMoved { position, .. } => {
                 Some(Self::CursorMoved(glm::vec2(position.x, position.y)))
@@ -559,6 +574,11 @@ impl InputState {
                     button,
                     state,
                     position: self.state.mouse_position(),
+                }))
+            },
+            InputEvent::MouseWheel { delta } => {
+                self.delegates.send_event(InputDelegateEvent::MouseWheel(MouseWheelEvent {
+                    delta,
                 }))
             },
             InputEvent::CursorMoved(position) => {
