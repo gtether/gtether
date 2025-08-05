@@ -32,7 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::resource::manager::{LoadPriority, ResourceLoadResult, ResourceManager};
+use crate::resource::manager::{ResourceLoadContext, ResourceLoadResult};
 use crate::resource::id::ResourceId;
 
 pub mod manager;
@@ -421,50 +421,6 @@ impl Error for ResourceLoadError {}
 /// Raw data type for loading resources from.
 pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 
-/// Contextual data for loading resources.
-pub struct ResourceLoadContext {
-    manager: Arc<ResourceManager>,
-    id: ResourceId,
-    priority: LoadPriority,
-}
-
-impl ResourceLoadContext {
-    #[inline]
-    pub(in crate::resource) fn new(
-        manager: Arc<ResourceManager>,
-        id: ResourceId,
-        priority: LoadPriority,
-    ) -> Self {
-        Self {
-            manager,
-            id,
-            priority,
-        }
-    }
-
-    /// A reference to the [ResourceManager], used to chain-load resources.
-    ///
-    /// When chain-loading resources, they should be loaded with [Self::priority()].
-    #[inline]
-    pub fn manager(&self) -> &ResourceManager {
-        &self.manager
-    }
-
-    /// The resource [id](ResourceId) that is currently being loaded.
-    #[inline]
-    pub fn id(&self) -> ResourceId {
-        self.id.clone()
-    }
-
-    /// The [priority](LoadPriority) that the load task was spawned with.
-    ///
-    /// When chain-loading resources, they should be loaded with this priority.
-    #[inline]
-    pub fn priority(&self) -> LoadPriority {
-        self.priority
-    }
-}
-
 /// User-defined interface for loading [Resources][res] from [raw data][rd].
 ///
 /// ResourceLoaders are used to define the behavior for loading and updating [Resources][res] from
@@ -481,9 +437,9 @@ impl ResourceLoadContext {
 /// ```
 /// use std::sync::Arc;
 /// use async_trait::async_trait;
-/// use gtether::resource::{ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+/// use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
 /// use smol::prelude::*;
-/// use gtether::resource::manager::ResourceManager;
+/// use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
 /// use gtether::resource::id::ResourceId;
 ///
 /// struct StringLoader {}
@@ -493,7 +449,7 @@ impl ResourceLoadContext {
 ///     async fn load(
 ///         &self,
 ///         mut data: ResourceReadData,
-///         _ctx: ResourceLoadContext,
+///         _ctx: &ResourceLoadContext,
 ///     ) -> Result<Box<String>, ResourceLoadError> {
 ///         let mut output = String::new();
 ///         data.read_to_string(&mut output).await?;
@@ -515,7 +471,7 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
     async fn load(
         &self,
         data: ResourceReadData,
-        ctx: ResourceLoadContext,
+        ctx: &ResourceLoadContext,
     ) -> Result<Box<T>, ResourceLoadError>;
 
     /// Given a [mutable resource handle][rm], load and update a resource from [raw data][rd].
@@ -529,7 +485,7 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
         &self,
         resource: ResourceMut<T>,
         data: ResourceReadData,
-        ctx: ResourceLoadContext,
+        ctx: &ResourceLoadContext,
     )
         -> Result<(), ResourceLoadError>
     {
@@ -592,10 +548,25 @@ where
     }
 }
 
+/// Trait used to define a "default" [ResourceLoader] for a resource type.
+///
+/// Any resource type that implements ResourceDefaultLoader can be loaded via
+/// [`ResourceManager::get()`](manager::ResourceManager::get), where the used [ResourceLoader] is
+/// automatically determined and created.
+///
+/// Note that ResourceLoaders created by this trait must be able to do so without any extra
+/// arguments.
+pub trait ResourceDefaultLoader: Send + Sync + 'static {
+    /// The concrete default [ResourceLoader] type.
+    type Loader: ResourceLoader<Self>;
+
+    /// Create a default [ResourceLoader] for this resource type.
+    fn default_loader() -> Self::Loader;
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-    use crate::resource::manager::LoadPriority;
     use super::*;
     use super::manager::tests::*;
 
@@ -659,7 +630,7 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
@@ -672,7 +643,7 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
@@ -690,7 +661,7 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 
@@ -713,7 +684,7 @@ mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
 

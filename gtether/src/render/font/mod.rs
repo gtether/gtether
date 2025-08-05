@@ -32,10 +32,9 @@
 //! # let render_target: Arc<dyn RenderTarget> = return;
 //! # let font_data: Vec<u8> = return;
 //!
-//! let font = resource_manager.get_or_load(
+//! let font = resource_manager.get_with_loader(
 //!     "my_font",
 //!     GlyphFontLoader::new(renderer.clone()),
-//!     LoadPriority::Immediate
 //! ).wait().unwrap();
 //!
 //! let font_sheet = FontSheet::from_font(

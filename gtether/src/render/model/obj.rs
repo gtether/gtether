@@ -9,7 +9,8 @@ use vulkano::Validated;
 
 use crate::render::model::{Model, ModelVertex, ModelVertexNormal, ModelVertexNormalColor, ModelVertexNormalTex};
 use crate::render::EngineDevice;
-use crate::resource::{ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceReadData};
+use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+use crate::resource::manager::ResourceLoadContext;
 
 pub struct ModelObjLoader<V: Vertex> {
     device: Arc<EngineDevice>,
@@ -93,7 +94,7 @@ impl ResourceLoader<Model<ModelVertex>> for ModelObjLoader<ModelVertex> {
     async fn load(
         &self,
         data: ResourceReadData,
-        _ctx: ResourceLoadContext,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertex>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
 
@@ -113,7 +114,7 @@ impl ResourceLoader<Model<ModelVertexNormal>> for ModelObjLoader<ModelVertexNorm
     async fn load(
         &self,
         data: ResourceReadData,
-        _ctx: ResourceLoadContext,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertexNormal>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
         Self::check_obj_normals(&model)?;
@@ -138,7 +139,7 @@ impl ResourceLoader<Model<ModelVertexNormalColor>> for ModelObjLoader<ModelVerte
     async fn load(
         &self,
         data: ResourceReadData,
-        _ctx: ResourceLoadContext,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertexNormalColor>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
         Self::check_obj_normals(&model)?;
@@ -166,7 +167,7 @@ impl ResourceLoader<Model<ModelVertexNormalTex>> for ModelObjLoader<ModelVertexN
     async fn load(
         &self,
         data: ResourceReadData,
-        _ctx: ResourceLoadContext,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertexNormalTex>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
         Self::check_obj_normals(&model)?;

@@ -16,7 +16,6 @@ use gtether::render::model::{Model, ModelVertexNormal};
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::Uniform;
 use gtether::render::RendererStaleEvent;
-use gtether::resource::manager::LoadPriority;
 use gtether::resource::Resource;
 use gtether::Engine;
 use parking_lot::{Mutex, RwLock};
@@ -216,20 +215,17 @@ impl Application for ReversiClient {
             ..Default::default()
         }).await;
 
-        let console_font = engine.resources().get_or_load(
+        let console_font = engine.resources().get_with_loader(
             "console_font",
             GlyphFontLoader::new(window.renderer().clone()),
-            LoadPriority::Immediate,
         );
-        let model_tile = engine.resources().get_or_load(
+        let model_tile = engine.resources().get_with_loader(
             "tile.obj",
             ModelObjLoader::<ModelVertexNormal>::new(window.renderer().device().clone()),
-            LoadPriority::Immediate,
         );
-        let model_piece = engine.resources().get_or_load(
+        let model_piece = engine.resources().get_with_loader(
             "piece.obj",
             ModelObjLoader::<ModelVertexNormal>::new(window.renderer().device().clone()),
-            LoadPriority::Immediate,
         );
 
         let transform = Arc::new(Uniform::new(

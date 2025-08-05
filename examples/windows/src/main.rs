@@ -23,7 +23,7 @@ use gtether::net::driver::NoNetDriver;
 use gtether::render::font::glyph::GlyphFontLoader;
 use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::{Uniform, UniformSet};
-use gtether::resource::manager::{LoadPriority, ResourceManager};
+use gtether::resource::manager::ResourceManager;
 use gtether::resource::source::constant::ConstantResourceSource;
 use gtether::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
 use gtether::{Engine, EngineBuilder};
@@ -262,10 +262,9 @@ impl Application for WindowsApp {
             ]
         );
 
-        let console_font = engine.resources().get_or_load(
+        let console_font = engine.resources().get_with_loader(
             "console_font",
             GlyphFontLoader::new(window.renderer().clone()),
-            LoadPriority::Immediate,
         ).await.unwrap();
         let console_gui = ConsoleGui::builder(self.console.clone())
             .window(&window)

@@ -22,14 +22,14 @@
 //!
 //! # fn wrapper<T: Send + Sync + 'static>(manager: &ResourceManager, loader1: impl ResourceLoader<T>, loader2: impl ResourceLoader<T>) {
 //! // Poll whether the resource is ready
-//! let res_handle = manager.get_or_load("key1", loader1, LoadPriority::Immediate);
+//! let res_handle = manager.get_with_loader("key1", loader1);
 //! match res_handle.check() {
 //!     Ok(res_result) => { /* do something with the load result */ },
 //!     Err(res_handle) => { /* do something with the unready handle */ },
 //! }
 //!
 //! // Wait for the resource to be ready
-//! let res_handle = manager.get_or_load("key2", loader2, LoadPriority::Immediate);
+//! let res_handle = manager.get_with_loader("key2", loader2);
 //! // Or .wait().await if within an async context
 //! let res_result = res_handle.wait();
 //! # }
@@ -44,9 +44,9 @@
 //!
 //! # async fn wrapper<T, R>(manager: &ResourceManager, loader1: R, loader2: R, loader3: R)
 //! # where T: Send + Sync + 'static, R: ResourceLoader<T> {
-//! let handle1 = manager.get_or_load("key", loader1, LoadPriority::Immediate);
-//! let handle2 = manager.get_or_load("key", loader2, LoadPriority::Immediate);
-//! let handle3 = manager.get_or_load("key", loader3, LoadPriority::Immediate);
+//! let handle1 = manager.get_with_loader("key", loader1);
+//! let handle2 = manager.get_with_loader("key", loader2);
+//! let handle3 = manager.get_with_loader("key", loader3);
 //!
 //! // Multiple handles should refer to same resource
 //! let res1 = handle1.await.unwrap();
@@ -83,7 +83,7 @@ use tracing::{debug, info_span, warn, Instrument};
 
 use crate::resource::id::ResourceId;
 use crate::resource::source::{ResourceSource, ResourceUpdate, ResourceWatcher, SealedResourceData, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
-use crate::resource::{Resource, ResourceLoadContext, ResourceLoadError, ResourceLoader, ResourceMut};
+use crate::resource::{Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoader, ResourceMut};
 
 #[derive(Debug, Clone)]
 struct ManagerResourceWatcher {
@@ -687,7 +687,7 @@ where
                                     // TODO: Do Delayed and Update need to be different?
                                     LoadPriority::Delayed,
                                 );
-                                match async_loader.update(resource_mut, data.data, ctx).await {
+                                match async_loader.update(resource_mut, data.data, &ctx).await {
                                     Ok(_) => {
                                         match drop_checker.recv().await {
                                             Ok(_) => { debug!("Drop-checker received an unexpected message"); }
@@ -823,6 +823,26 @@ impl<'a, T: ?Sized + Send + Sync + 'static> Future for CacheEntryWaitFuture<'a, 
 /// ResourceManager is dropped. Each ResourceManager would contain its own executor, so for that
 /// and for caching reasons, it is recommended to have one global ResourceManager, usually owned
 /// by the [Engine][eng] itself.
+///
+/// # Loading
+///
+/// When retrieving a [Resource] by [ID](ResourceId) and no existing value is already cached for
+/// that ID, the given [ResourceLoader] will be used to load and cache a new [Resource]. Loading is
+/// handled asynchronously, meaning an async task is enqueued to load the Resource via the internal
+/// async executor. In the meantime, a [handle](ResourceFuture) will be returned synchronously from
+/// the relevant `get_*()` method. This handle can be used to synchronously poll or asynchronously
+/// await the load result.
+///
+/// If a [Resource] has already been loaded and cached, it will instead be returned wrapped in a
+/// [handle](ResourceFuture). The given [ResourceLoader] will be attached to the handle, so that if
+/// the cached Resource is expired and evicted before the handle is resolved, it will trigger a new
+/// load using the given loader.
+///
+/// See also:
+///  * [`get()`](ResourceManager::get)
+///  * [`get_with_priority()`](ResourceManager::get_with_priority)
+///  * [`get_with_loader()`](ResourceManager::get_with_loader)
+///  * [`get_with_loader_priority()`](ResourceManager::get_with_loader_priority)
 ///
 /// # Examples
 /// ```
@@ -1055,7 +1075,7 @@ impl ResourceManager {
                         task_id.clone(),
                         load_priority,
                     );
-                    match task_loader.load(data.data, ctx).await {
+                    match task_loader.load(data.data, &ctx).await {
                         Ok(v) => (
                             Ok((Arc::new(Resource::new(task_id.clone(), v)), data.source.hash)),
                             data.source.idx,
@@ -1114,24 +1134,59 @@ impl ResourceManager {
         }
     }
 
-    /// Get an existing [Resource][res], or load a new one.
+    /// Get/load a [Resource] with a default [ResourceLoader] and [LoadPriority].
     ///
-    /// If no [Resource][res] is already cached for the given [id][rp], the given [loader][rl] will
-    /// be used to load and cache a new [Resource][res]. Loading is handled asynchronously, so an
-    /// async task is enqueued to load the [Resource][res] from a separate thread. In the meantime,
-    /// a [handle][rf] will be returned synchronously from this function. This [handle][rf] can be
-    /// used to synchronously poll or asynchronously await the load result.
+    /// Creates and uses the [ResourceLoader] specified by [ResourceDefaultLoader].
     ///
-    /// If a [Resource][res] has already been loaded and cached, it will instead be returned
-    /// (wrapped in a [handle][rf]). The given [loader][rl] will be attached to the [handle][rf],
-    /// so that if the cached [Resource][res] is expired and evicted before the [handle][rf] is
-    /// resolved, it will trigger a new load using the given [loader][rl].
+    /// Uses [LoadPriority::Immediate].
     ///
-    /// [res]: Resource
-    /// [rp]: ResourceId
-    /// [rl]: ResourceLoader
-    /// [rf]: ResourceFuture
-    pub fn get_or_load<T>(
+    /// See also: [Self#loading]
+    #[inline]
+    pub fn get<T>(&self, id: impl Into<ResourceId>) -> ResourceFuture<T>
+    where
+        T: ResourceDefaultLoader,
+    {
+        self.get_with_priority(id, LoadPriority::Immediate)
+    }
+
+    /// Get/load a [Resource] with a default [ResourceLoader].
+    ///
+    /// Creates and uses the [ResourceLoader] specified by [ResourceDefaultLoader].
+    ///
+    /// See also: [Self#loading]
+    #[inline]
+    pub fn get_with_priority<T>(
+        &self,
+        id: impl Into<ResourceId>,
+        load_priority: LoadPriority,
+    ) -> ResourceFuture<T>
+    where
+        T: ResourceDefaultLoader,
+    {
+        self.get_with_loader_priority(id, T::default_loader(), load_priority)
+    }
+
+    /// Get/load a [Resource] with a default [LoadPriority].
+    ///
+    /// Uses [LoadPriority::Immediate].
+    ///
+    /// See also: [Self#loading]
+    #[inline]
+    pub fn get_with_loader<T>(
+        &self,
+        id: impl Into<ResourceId>,
+        loader: impl ResourceLoader<T>,
+    ) -> ResourceFuture<T>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.get_with_loader_priority(id, loader, LoadPriority::Immediate)
+    }
+
+    /// Get/load a [Resource].
+    ///
+    /// See also: [Self#loading]
+    pub fn get_with_loader_priority<T>(
         &self,
         id: impl Into<ResourceId>,
         loader: impl ResourceLoader<T>,
@@ -1169,6 +1224,72 @@ impl ResourceManagerBuilder {
     #[inline]
     pub fn build(self) -> Arc<ResourceManager> {
         ResourceManager::new(self.sources)
+    }
+}
+
+/// Contextual data for loading [Resources](Resource).
+///
+/// This is created by the [ResourceManager], and passed to resource
+/// [`load()`](ResourceLoader::load)/[`update()`](ResourceLoader::update) methods. It provides
+/// layered access to the [ResourceManager], and allows loading additional resources as dependencies
+/// of the currently loading resource.
+pub struct ResourceLoadContext {
+    manager: Arc<ResourceManager>,
+    id: ResourceId,
+    priority: LoadPriority,
+}
+
+impl ResourceLoadContext {
+    #[inline]
+    pub(in crate::resource) fn new(
+        manager: Arc<ResourceManager>,
+        id: ResourceId,
+        priority: LoadPriority,
+    ) -> Self {
+        Self {
+            manager,
+            id,
+            priority,
+        }
+    }
+
+    /// The resource [ID](ResourceId) that is currently being loaded.
+    #[inline]
+    pub fn id(&self) -> ResourceId {
+        self.id.clone()
+    }
+
+    /// Get/load a [Resource] with a default [ResourceLoader].
+    ///
+    /// Creates and uses the [ResourceLoader] specified by [ResourceDefaultLoader].
+    ///
+    /// Uses the same [LoadPriority] as the currently loading resource.
+    ///
+    /// See also: [ResourceManager#loading]
+    pub fn get<T>(
+        &self,
+        id: impl Into<ResourceId>,
+    ) -> ResourceFuture<T>
+    where
+        T: ResourceDefaultLoader,
+    {
+        self.get_with_loader(id, T::default_loader())
+    }
+
+    /// Get/load a [Resource].
+    ///
+    /// Uses the same [LoadPriority] as the currently loading resource.
+    ///
+    /// See also: [ResourceManager#loading]
+    pub fn get_with_loader<T>(
+        &self,
+        id: impl Into<ResourceId>,
+        loader: impl ResourceLoader<T>,
+    ) -> ResourceFuture<T>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.manager.get_with_loader_priority(id, loader, self.priority)
     }
 }
 
@@ -1287,7 +1408,7 @@ pub(in crate::resource) mod tests {
         async fn load(
             &self,
             mut data: ResourceReadData,
-            ctx: ResourceLoadContext,
+            ctx: &ResourceLoadContext,
         ) -> Result<Box<String>, ResourceLoadError> {
             assert_eq!(ctx.id(), self.expected_id);
             let mut output = String::new();
@@ -1402,7 +1523,7 @@ pub(in crate::resource) mod tests {
     fn test_resource_manager_not_found() {
         let (manager, _) = create_resource_manager::<1>();
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let err = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect_err("No resource data should be present for 'key'");
         assert_matches!(err, ResourceLoadError::NotFound(id) => {
@@ -1412,7 +1533,7 @@ pub(in crate::resource) mod tests {
 
         // Result should be cached, and not trigger another load
         manager.test_ctx().clear();
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let err = fut.check()
             .expect("Error should be cached and pollable")
             .expect_err("No resource data should be present for 'key'");
@@ -1429,7 +1550,7 @@ pub(in crate::resource) mod tests {
 
         let fut = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
-            let fut = manager.get_or_load("invalid", TestResourceLoader::new("invalid"), LoadPriority::Immediate);
+            let fut = manager.get_with_loader("invalid", TestResourceLoader::new("invalid"));
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
@@ -1440,7 +1561,7 @@ pub(in crate::resource) mod tests {
 
         // Result should be cached, and not trigger another load
         manager.test_ctx().clear();
-        let fut = manager.get_or_load("invalid", TestResourceLoader::new("invalid"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("invalid", TestResourceLoader::new("invalid"));
         let error = fut.check()
             .expect("Error should be cached and pollable")
             .expect_err("Resource should still fail to load for 'invalid'");
@@ -1455,7 +1576,7 @@ pub(in crate::resource) mod tests {
 
         let fut = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
-            let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+            let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
@@ -1466,7 +1587,7 @@ pub(in crate::resource) mod tests {
 
         // Result should be cached, and not trigger another load
         manager.test_ctx().clear();
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = fut.check()
             .expect("Resource should be cached and pollable")
             .expect("Resource should still be loaded for 'key'");
@@ -1482,8 +1603,8 @@ pub(in crate::resource) mod tests {
         data_maps[0].assert_watch("key", false);
         let (fut1, fut2) = {
             let _lock = future::block_on(manager.test_ctx().sync_load.block(Some(Duration::from_secs(1))));
-            let fut1 = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
-            let fut2 = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+            let fut1 = manager.get_with_loader("key", TestResourceLoader::new("key"));
+            let fut2 = manager.get_with_loader("key", TestResourceLoader::new("key"));
             (fut1, fut2)
         };
 
@@ -1507,7 +1628,7 @@ pub(in crate::resource) mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         data_maps[0].assert_watch("key", true);
@@ -1530,7 +1651,7 @@ pub(in crate::resource) mod tests {
         data_maps[0].insert("key", b"value", "h_value");
 
         data_maps[0].assert_watch("key", false);
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         data_maps[0].assert_watch("key", true);
@@ -1552,7 +1673,7 @@ pub(in crate::resource) mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"\xC0", "h_invalid");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let error = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect_err("Resource should fail to load for 'key'");
         assert_matches!(error, ResourceLoadError::ReadError(_));
@@ -1565,7 +1686,7 @@ pub(in crate::resource) mod tests {
         }
 
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "new_value".to_owned());
@@ -1579,7 +1700,7 @@ pub(in crate::resource) mod tests {
         data_maps[2].insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value_1".to_owned());
@@ -1635,7 +1756,7 @@ pub(in crate::resource) mod tests {
         let (manager, data_maps) = create_resource_manager::<1>();
         data_maps[0].insert("key", b"value", "h_value");
 
-        let fut = manager.get_or_load("key", TestResourceLoader::new("key"), LoadPriority::Immediate);
+        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
         let value = future::block_on(timeout(fut, Duration::from_secs(1)))
             .expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
