@@ -1,5 +1,6 @@
 use futures_core::task::__internal::AtomicWaker;
 use parking_lot::Mutex;
+use smol::future::FutureExt;
 use smol::Task;
 use std::any::{Any, TypeId};
 use std::future::Future;
@@ -267,6 +268,7 @@ where
                                     async_id.clone(),
                                     // TODO: Do Delayed and Update need to be different?
                                     LoadPriority::Delayed,
+                                    []
                                 );
                                 match async_loader.update(resource_mut, data.data, &ctx).await {
                                     Ok(_) => {

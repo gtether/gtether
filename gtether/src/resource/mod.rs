@@ -364,6 +364,12 @@ pub enum ResourceLoadError {
         actual: TypeId,
     },
 
+    /// There was an attempt to create a cyclic load, which would have resulted in a deadlock.
+    CyclicLoad {
+        parents: Vec<ResourceId>,
+        id: ResourceId,
+    },
+
     /// Some other error occurred while reading/loading resource data.
     ReadError(Arc<dyn Error + Send + Sync + 'static>),
 }
@@ -406,11 +412,13 @@ impl From<std::io::Error> for ResourceLoadError {
 impl Display for ResourceLoadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResourceLoadError::NotFound(id) =>
+            Self::NotFound(id) =>
                 write!(f, "No resource found that is associated with ID: '{id}'"),
-            ResourceLoadError::TypeMismatch { requested, actual } =>
+            Self::TypeMismatch { requested, actual } =>
                 write!(f, "Requested type ({requested:?}) does not match previously loaded type ({actual:?})"),
-            ResourceLoadError::ReadError(err) =>
+            Self::CyclicLoad { parents, id } =>
+                write!(f, "Cyclic load detected: {parents:?} => {id}"),
+            Self::ReadError(err) =>
                 std::fmt::Display::fmt(&err, f),
         }
     }

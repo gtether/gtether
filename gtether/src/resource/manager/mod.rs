@@ -64,30 +64,26 @@
 //! [res]: Resource
 //! [rp]: ResourceId
 //! [rf]: ResourceFuture
-use futures_core::task::__internal::AtomicWaker;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
+use smol::future;
 use smol::prelude::*;
-use smol::{future, Executor, Task};
-use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::task::{Context, Poll, Wake};
-use std::thread;
-use std::thread::JoinHandle;
-use strum::EnumCount;
+use std::task::{Context, Poll};
 use tracing::{debug, info_span, warn, Instrument};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::cache::{CacheEntry, CacheEntryGetResult, CacheEntryUpdateFutResult, CacheEntryUpdateResult};
+use crate::resource::manager::dependency::{DependencyGraph, DependencyGraphLayer};
 use crate::resource::manager::executor::{ManagerExecutor, ManagerTask, ResourceTaskData, TaskPriority};
-use crate::resource::source::{ResourceSource, ResourceUpdate, ResourceWatcher, SealedResourceData, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
-use crate::resource::{Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoader, ResourceMut};
+use crate::resource::source::{ResourceSource, ResourceUpdate, ResourceWatcher, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
+use crate::resource::{Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoader};
 
 mod cache;
+mod dependency;
 mod executor;
 
 #[derive(Debug, Clone)]
@@ -262,11 +258,12 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<T> {
         id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
         load_priority: LoadPriority,
+        parents: Vec<ResourceId>,
     ) -> Self {
         Self {
             state: ResourceFutureState::Delayed {
                 cache: entry,
-                load_fn: Box::new(move || manager.get_or_load_impl(id, loader, load_priority)),
+                load_fn: Box::new(move || manager.get_or_load_impl(id, loader, load_priority, parents)),
             }
         }
     }
@@ -381,6 +378,7 @@ pub struct ResourceManager {
     executor: Arc<ManagerExecutor>,
     sources: Vec<Box<dyn ResourceSource>>,
     cache: Mutex<HashMap<ResourceId, Arc<CacheEntry>>>,
+    dependencies: Arc<RwLock<DependencyGraph>>,
     weak: Weak<Self>,
     #[cfg(test)]
     test_ctx: tests::ResourceManagerTestContext,
@@ -393,6 +391,7 @@ impl ResourceManager {
                 executor: Arc::new(ManagerExecutor::new()),
                 sources,
                 cache: Mutex::new(HashMap::default()),
+                dependencies: Arc::new(RwLock::new(DependencyGraph::default())),
                 weak: weak.clone(),
                 #[cfg(test)]
                 test_ctx: tests::ResourceManagerTestContext::default(),
@@ -572,6 +571,7 @@ impl ResourceManager {
         id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
         load_priority: LoadPriority,
+        parents: Vec<ResourceId>,
     ) -> ResourceFuture<T>
     where
         T: ?Sized + Send + Sync + 'static,
@@ -581,6 +581,14 @@ impl ResourceManager {
         let task_self = strong_self.clone();
         let task_id = id.clone();
         let task_loader = loader.clone();
+        let task_parents = parents.clone();
+
+        let span = if parents.is_empty() {
+            info_span!("resource_load", id = %id.clone(), priority = %load_priority)
+        } else {
+            info_span!("sub_load", id = %id.clone())
+        };
+
         let task = self.executor.spawn(load_priority.into(), async move {
             #[cfg(test)]
             let _test_ctx_lock = task_self.test_ctx.sync_load.run().await;
@@ -590,12 +598,17 @@ impl ResourceManager {
                         task_self.clone(),
                         task_id.clone(),
                         load_priority,
+                        task_parents,
                     );
                     match task_loader.load(data.data, &ctx).await {
-                        Ok(v) => (
-                            Ok((Arc::new(Resource::new(task_id.clone(), v)), data.source.hash)),
-                            data.source.idx,
-                        ),
+                        Ok(v) => {
+                            let sub_dependencies = ctx.dependencies.into_inner();
+                            sub_dependencies.apply(&mut task_self.dependencies.write());
+                            (
+                                Ok((Arc::new(Resource::new(task_id.clone(), v)), data.source.hash)),
+                                data.source.idx,
+                            )
+                        },
                         Err(e) => (Err(e), data.source.idx),
                     }
                 },
@@ -609,11 +622,11 @@ impl ResourceManager {
                 source_idx,
                 loader: task_loader,
             }
-        }.instrument(info_span!("resource_load", id = %id.clone(), %load_priority)));
+        }.instrument(span));
         let entry = Arc::new(CacheEntry::from_task(id.clone(), task, strong_self.clone()));
         let weak_entry = Arc::downgrade(&entry);
         cache.insert(id.clone(), entry);
-        ResourceFuture::from_cache_entry(weak_entry, strong_self, id, loader, load_priority)
+        ResourceFuture::from_cache_entry(weak_entry, strong_self, id, loader, load_priority, parents)
     }
 
     fn get_or_load_impl<T>(
@@ -621,6 +634,7 @@ impl ResourceManager {
         id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
         load_priority: LoadPriority,
+        parents: Vec<ResourceId>,
     ) -> ResourceFuture<T>
     where
         T: ?Sized + Send + Sync + 'static,
@@ -633,7 +647,7 @@ impl ResourceManager {
                 Some(CacheEntryGetResult::Err(e))
                     => ResourceFuture::from_result(Err(e)),
                 // Entry is expired, reload
-                Some(CacheEntryGetResult::Expired) => self.load(&mut cache, id, loader, load_priority),
+                Some(CacheEntryGetResult::Expired) => self.load(&mut cache, id, loader, load_priority, parents),
                 // Entry is still loading, return a delayed result
                 None => ResourceFuture::from_cache_entry(
                     Arc::downgrade(entry),
@@ -642,11 +656,12 @@ impl ResourceManager {
                     id,
                     loader,
                     load_priority,
+                    parents,
                 )
             }
         } else {
             // No existing entry, load a new one
-            self.load(&mut cache, id, loader, load_priority)
+            self.load(&mut cache, id, loader, load_priority, parents)
         }
     }
 
@@ -711,7 +726,7 @@ impl ResourceManager {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.get_or_load_impl(id.into(), Arc::new(loader), load_priority)
+        self.get_or_load_impl(id.into(), Arc::new(loader), load_priority, vec![])
     }
 }
 
@@ -753,6 +768,7 @@ pub struct ResourceLoadContext {
     manager: Arc<ResourceManager>,
     id: ResourceId,
     priority: LoadPriority,
+    dependencies: RwLock<DependencyGraphLayer>,
 }
 
 impl ResourceLoadContext {
@@ -761,11 +777,14 @@ impl ResourceLoadContext {
         manager: Arc<ResourceManager>,
         id: ResourceId,
         priority: LoadPriority,
+        parents: impl IntoIterator<Item=ResourceId>,
     ) -> Self {
+        let dependencies = DependencyGraphLayer::new(id.clone(), parents);
         Self {
             manager,
             id,
             priority,
+            dependencies: RwLock::new(dependencies),
         }
     }
 
@@ -805,13 +824,30 @@ impl ResourceLoadContext {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.manager.get_with_loader_priority(id, loader, self.priority)
+        let id = id.into();
+        let parents: Vec<_> = {
+            let mut deps = self.dependencies.write();
+            deps.insert(id.clone());
+            deps.parents()
+                .chain([deps.id()])
+                .cloned()
+                .collect()
+        };
+        if parents.contains(&id) {
+            ResourceFuture::from_result(Err(ResourceLoadError::CyclicLoad {
+                parents,
+                id,
+            }))
+        } else {
+            self.manager.get_or_load_impl(id, Arc::new(loader), self.priority, parents)
+        }
     }
 }
 
 #[cfg(test)]
 pub(in crate::resource) mod tests {
     use super::*;
+    use std::marker::PhantomData;
 
     use async_trait::async_trait;
     use parking_lot::RwLock;
@@ -906,6 +942,23 @@ pub(in crate::resource) mod tests {
         }
     }
 
+    #[derive(Default, Clone)]
+    pub struct StringLoader(());
+
+    #[async_trait]
+    impl ResourceLoader<String> for StringLoader {
+        async fn load(
+            &self,
+            mut data: ResourceReadData,
+            _ctx: &ResourceLoadContext,
+        ) -> Result<Box<String>, ResourceLoadError> {
+            let mut output = String::new();
+            data.read_to_string(&mut output).await?;
+            Ok(Box::new(output))
+        }
+    }
+
+    #[derive(Clone)]
     pub struct TestResourceLoader {
         expected_id: ResourceId,
     }
@@ -923,13 +976,67 @@ pub(in crate::resource) mod tests {
     impl ResourceLoader<String> for TestResourceLoader {
         async fn load(
             &self,
-            mut data: ResourceReadData,
+            data: ResourceReadData,
             ctx: &ResourceLoadContext,
         ) -> Result<Box<String>, ResourceLoadError> {
             assert_eq!(ctx.id(), self.expected_id);
-            let mut output = String::new();
-            data.read_to_string(&mut output).await?;
-            Ok(Box::new(output))
+            StringLoader::default().load(data, ctx).await
+        }
+    }
+
+    pub struct TestResourceRef<T: Send + Sync + 'static> {
+        pub resources: Vec<Arc<Resource<T>>>,
+    }
+
+    #[derive(Clone)]
+    pub struct TestResourceRefLoader<T, L>
+    where
+        T: Send + Sync + 'static,
+        L: ResourceLoader<T>,
+    {
+        loader: L,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<T, L> TestResourceRefLoader<T, L>
+    where
+        T: Send + Sync + 'static,
+        L: ResourceLoader<T>,
+    {
+        #[inline]
+        pub fn new(loader: L) -> Self {
+            Self {
+                loader,
+                _phantom: PhantomData::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<T, L> ResourceLoader<TestResourceRef<T>> for TestResourceRefLoader<T, L>
+    where
+        T: Send + Sync + 'static,
+        L: ResourceLoader<T> + Clone,
+    {
+        async fn load(
+            &self,
+            mut data: ResourceReadData,
+            ctx: &ResourceLoadContext,
+        ) -> Result<Box<TestResourceRef<T>>, ResourceLoadError> {
+            let mut ids = String::new();
+            data.read_to_string(&mut ids).await?;
+
+            let futs = ids.split(':')
+                .map(|id| ctx.get_with_loader(id, self.loader.clone()))
+                .collect::<Vec<_>>();
+            let mut resources = Vec::with_capacity(futs.len());
+            for fut in futs {
+                resources.push(fut.await?);
+            }
+
+            Ok(Box::new(TestResourceRef {
+                resources,
+            }))
         }
     }
 
@@ -1286,5 +1393,156 @@ pub(in crate::resource) mod tests {
         data_maps[0].insert("key", b"new_value", "h_new_value");
         future::block_on(timeout(manager.test_ctx().sync_update.wait_count(2), Duration::from_secs(1)));
         assert_eq!(*value.read(), "new_value".to_owned());
+    }
+
+    #[test]
+    fn test_resource_manager_dependencies_linear() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("a", b"b", "h_a");
+        data_maps[0].insert("b", b"c", "h_b");
+        data_maps[0].insert("c", b"value", "h_c");
+
+        {
+            let fut = manager.get_with_loader(
+                "b",
+                TestResourceRefLoader::new(TestResourceLoader::new("c")),
+            );
+            let value = future::block_on(timeout(fut, Duration::from_secs(1)))
+                .expect("Resource should load for 'b'");
+            assert_eq!(*value.read().resources[0].read(), "value".to_owned());
+
+            let mut expected_graph = DependencyGraph::default();
+            expected_graph.add_dependency(ResourceId::from("b"), ResourceId::from("c"));
+            assert_eq!(&*manager.dependencies.read(), &expected_graph);
+        }
+
+        {
+            let fut = manager.get_with_loader(
+                "a",
+                TestResourceRefLoader::new(TestResourceRefLoader::new(TestResourceLoader::new("c"))),
+            );
+            let value = future::block_on(timeout(fut, Duration::from_secs(1)))
+                .expect("Resource should load for 'a'");
+            assert_eq!(*value.read().resources[0].read().resources[0].read(), "value".to_owned());
+
+            let mut expected_graph = DependencyGraph::default();
+            expected_graph.add_dependency(ResourceId::from("a"), ResourceId::from("b"));
+            expected_graph.add_dependency(ResourceId::from("b"), ResourceId::from("c"));
+            assert_eq!(&*manager.dependencies.read(), &expected_graph);
+        }
+    }
+
+    #[test]
+    fn test_resource_manager_dependencies_tree() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("a1", b"b1:b2", "h_a1");
+        data_maps[0].insert("a2", b"b1:b2", "h_a2");
+        data_maps[0].insert("b1", b"c1:c2", "h_b1");
+        data_maps[0].insert("b2", b"c2:c3", "h_b2");
+        data_maps[0].insert("c1", b"value1", "h_c1");
+        data_maps[0].insert("c2", b"value2", "h_c2");
+        data_maps[0].insert("c3", b"value3", "h_c3");
+
+        let fut_a1 = manager.get_with_loader(
+            "a1",
+            TestResourceRefLoader::new(TestResourceRefLoader::new(StringLoader::default())),
+        );
+        let fut_a2 = manager.get_with_loader(
+            "a2",
+            TestResourceRefLoader::new(TestResourceRefLoader::new(StringLoader::default())),
+        );
+        let a1 = future::block_on(timeout(fut_a1, Duration::from_secs(1)))
+            .expect("Resource should load for 'a1'");
+        let a2 = future::block_on(timeout(fut_a2, Duration::from_secs(1)))
+            .expect("Resource should load for 'a2'");
+        {
+            let a1 = a1.read();
+            {
+                let b1 = a1.resources[0].read();
+                let values = b1.resources.iter()
+                    .map(|r| r.read().clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(values, vec!["value1".to_string(), "value2".to_string()]);
+            }
+            {
+                let b2 = a1.resources[1].read();
+                let values = b2.resources.iter()
+                    .map(|r| r.read().clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(values, vec!["value2".to_string(), "value3".to_string()]);
+            }
+        }
+        {
+            let a2 = a2.read();
+            {
+                let b1 = a2.resources[0].read();
+                let values = b1.resources.iter()
+                    .map(|r| r.read().clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(values, vec!["value1".to_string(), "value2".to_string()]);
+            }
+            {
+                let b2 = a2.resources[1].read();
+                let values = b2.resources.iter()
+                    .map(|r| r.read().clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(values, vec!["value2".to_string(), "value3".to_string()]);
+            }
+        }
+
+        let mut expected_graph = DependencyGraph::default();
+        expected_graph.add_dependency(ResourceId::from("a1"), ResourceId::from("b1"));
+        expected_graph.add_dependency(ResourceId::from("a1"), ResourceId::from("b2"));
+        expected_graph.add_dependency(ResourceId::from("a2"), ResourceId::from("b1"));
+        expected_graph.add_dependency(ResourceId::from("a2"), ResourceId::from("b2"));
+        expected_graph.add_dependency(ResourceId::from("b1"), ResourceId::from("c1"));
+        expected_graph.add_dependency(ResourceId::from("b1"), ResourceId::from("c2"));
+        expected_graph.add_dependency(ResourceId::from("b2"), ResourceId::from("c2"));
+        expected_graph.add_dependency(ResourceId::from("b2"), ResourceId::from("c3"));
+        assert_eq!(&*manager.dependencies.read(), &expected_graph);
+    }
+
+    #[derive(Default)]
+    pub struct TestResourceCyclicRefLoader(());
+
+    #[async_trait]
+    impl ResourceLoader<()> for TestResourceCyclicRefLoader {
+        async fn load(
+            &self,
+            mut data: ResourceReadData,
+            ctx: &ResourceLoadContext,
+        ) -> Result<Box<()>, ResourceLoadError> {
+            let mut id_str = String::new();
+            data.read_to_string(&mut id_str).await?;
+
+            let _res = ctx.get_with_loader(
+                id_str,
+                TestResourceCyclicRefLoader::default(),
+            ).await?;
+
+            Ok(Box::new(()))
+        }
+    }
+
+    #[test]
+    fn test_resource_manager_cyclic_load() {
+        let (manager, data_maps) = create_resource_manager::<1>();
+        data_maps[0].insert("a", b"b", "h_a");
+        data_maps[0].insert("b", b"c", "h_b");
+        data_maps[0].insert("c", b"d", "h_c");
+        data_maps[0].insert("d", b"b", "h_d");
+
+        let fut = manager.get_with_loader("a", TestResourceCyclicRefLoader::default());
+        let err = future::block_on(timeout(fut, Duration::from_secs(1)))
+            .expect_err("Cyclic load should be detected");
+        assert_matches!(err, ResourceLoadError::CyclicLoad { parents, id } => {
+            assert_eq!(id, ResourceId::from("b"));
+            assert_eq!(parents, vec![
+                ResourceId::from("a"),
+                ResourceId::from("b"),
+                ResourceId::from("c"),
+                ResourceId::from("d"),
+            ]);
+        });
     }
 }
