@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use tracing::{debug, warn};
 
 use crate::resource::id::ResourceId;
-use crate::resource::manager::executor::{ManagerLoadTask, ResourceTaskData};
+use crate::resource::manager::executor::{ManagerLoadTask, ResourceTaskData, TaskPriority};
 use crate::resource::manager::{LoadPriority, ResourceLoadContext, ResourceManager};
 use crate::resource::source::{ResourceSource, SealedResourceData, SealedResourceDataSource, SourceIndex};
 use crate::resource::{Resource, ResourceLoadError, ResourceMut};
@@ -266,8 +266,7 @@ where
                                 let ctx = ResourceLoadContext::new(
                                     async_manager.clone(),
                                     async_id.clone(),
-                                    // TODO: Do Delayed and Update need to be different?
-                                    LoadPriority::Delayed,
+                                    TaskPriority::Update,
                                     []
                                 );
                                 match async_loader.update(resource_mut, data.data, &ctx).await {

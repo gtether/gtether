@@ -257,13 +257,13 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<T> {
         manager: Arc<ResourceManager>,
         id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
-        load_priority: LoadPriority,
+        task_priority: TaskPriority,
         parents: Vec<ResourceId>,
     ) -> Self {
         Self {
             state: ResourceFutureState::Delayed {
                 cache: entry,
-                load_fn: Box::new(move || manager.get_or_load_impl(id, loader, load_priority, parents)),
+                load_fn: Box::new(move || manager.get_or_load_impl(id, loader, task_priority, parents)),
             }
         }
     }
@@ -570,7 +570,7 @@ impl ResourceManager {
         cache: &mut MutexGuard<HashMap<ResourceId, Arc<CacheEntry>>>,
         id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
-        load_priority: LoadPriority,
+        task_priority: TaskPriority,
         parents: Vec<ResourceId>,
     ) -> ResourceFuture<T>
     where
@@ -584,12 +584,12 @@ impl ResourceManager {
         let task_parents = parents.clone();
 
         let span = if parents.is_empty() {
-            info_span!("resource_load", id = %id.clone(), priority = %load_priority)
+            info_span!("resource_load", id = %id.clone(), priority = %task_priority)
         } else {
             info_span!("sub_load", id = %id.clone())
         };
 
-        let task = self.executor.spawn(load_priority.into(), async move {
+        let task = self.executor.spawn(task_priority, async move {
             #[cfg(test)]
             let _test_ctx_lock = task_self.test_ctx.sync_load.run().await;
             let (result, source_idx) = match task_self.find_data(&task_id).await {
@@ -597,7 +597,7 @@ impl ResourceManager {
                     let ctx = ResourceLoadContext::new(
                         task_self.clone(),
                         task_id.clone(),
-                        load_priority,
+                        task_priority,
                         task_parents,
                     );
                     match task_loader.load(data.data, &ctx).await {
@@ -626,14 +626,14 @@ impl ResourceManager {
         let entry = Arc::new(CacheEntry::from_task(id.clone(), task, strong_self.clone()));
         let weak_entry = Arc::downgrade(&entry);
         cache.insert(id.clone(), entry);
-        ResourceFuture::from_cache_entry(weak_entry, strong_self, id, loader, load_priority, parents)
+        ResourceFuture::from_cache_entry(weak_entry, strong_self, id, loader, task_priority, parents)
     }
 
     fn get_or_load_impl<T>(
         &self,
         id: ResourceId,
         loader: Arc<dyn ResourceLoader<T>>,
-        load_priority: LoadPriority,
+        load_priority: TaskPriority,
         parents: Vec<ResourceId>,
     ) -> ResourceFuture<T>
     where
@@ -726,7 +726,7 @@ impl ResourceManager {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.get_or_load_impl(id.into(), Arc::new(loader), load_priority, vec![])
+        self.get_or_load_impl(id.into(), Arc::new(loader), load_priority.into(), vec![])
     }
 }
 
@@ -767,7 +767,7 @@ impl ResourceManagerBuilder {
 pub struct ResourceLoadContext {
     manager: Arc<ResourceManager>,
     id: ResourceId,
-    priority: LoadPriority,
+    priority: TaskPriority,
     dependencies: RwLock<DependencyGraphLayer>,
 }
 
@@ -776,7 +776,7 @@ impl ResourceLoadContext {
     pub(in crate::resource) fn new(
         manager: Arc<ResourceManager>,
         id: ResourceId,
-        priority: LoadPriority,
+        priority: TaskPriority,
         parents: impl IntoIterator<Item=ResourceId>,
     ) -> Self {
         let dependencies = DependencyGraphLayer::new(id.clone(), parents);

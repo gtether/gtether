@@ -1,16 +1,17 @@
+use smol::future::FutureExt;
+use smol::{future, Executor, Task};
+use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use strum::EnumCount;
-use smol::{future, Executor, Task};
 use tracing::warn;
-use smol::future::FutureExt;
 
 use crate::resource::id::ResourceId;
-use crate::resource::{Resource, ResourceLoadError, ResourceLoader};
 use crate::resource::manager::LoadPriority;
 use crate::resource::source::SourceIndex;
+use crate::resource::{Resource, ResourceLoadError, ResourceLoader};
 
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, EnumCount)]
@@ -18,6 +19,16 @@ pub enum TaskPriority {
     Immediate = 0,
     Delayed = 1,
     Update = 2,
+}
+
+impl Display for TaskPriority {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Immediate => f.write_str("Immediate"),
+            Self::Delayed => f.write_str("Delayed"),
+            Self::Update => f.write_str("Update"),
+        }
+    }
 }
 
 impl From<LoadPriority> for TaskPriority {
