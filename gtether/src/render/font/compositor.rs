@@ -26,7 +26,7 @@
 //!     fn build_commands(
 //!         &self,
 //!         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-//!     ) -> Result<(), Validated<VulkanoError>> {
+//!     ) -> Result<(), VulkanoError> {
 //!         let layout_a = self.layout_a.lock().unwrap();
 //!         let layout_b = self.layout_b.lock().unwrap();
 //!
@@ -44,7 +44,7 @@
 //! ```
 
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
-use vulkano::Validated;
+
 use crate::render::font::layout::{PositionedChar, TextLayout};
 use crate::render::VulkanoError;
 
@@ -58,7 +58,7 @@ pub trait FontRenderer: Send + Sync + 'static {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-    ) -> Result<(), Validated<VulkanoError>>;
+    ) -> Result<(), VulkanoError>;
 }
 
 /// Top-level render helper for rendering fonts.
@@ -111,7 +111,7 @@ impl<'a> FontCompositorPass<'a> {
     }
 
     /// End this pass, and commit all rendering commands.
-    pub fn end_pass(self) -> Result<(), Validated<VulkanoError>> {
+    pub fn end_pass(self) -> Result<(), VulkanoError> {
         let layout_chars = self.layouts.into_iter()
             .map(|layout| layout.iter_build())
             .flatten()

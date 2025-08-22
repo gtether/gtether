@@ -466,21 +466,21 @@ impl EngineRenderHandler for BoardRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
         let selected_graphics = self.selected_graphics.vk_graphics();
         let model_tile = self.model_tile.read();
         let model_piece = self.model_piece.read();
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?;
-        model_tile.draw_instanced(builder, self.instances.clone())?;
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap();
+        model_tile.draw_instanced(builder, self.instances.clone()).unwrap();
 
         let (piece_instances, selected_instance) = {
             let state = self.board_view.state.read();
@@ -531,9 +531,9 @@ impl EngineRenderHandler for BoardRenderer {
                     ..Default::default()
                 },
                 piece_instances,
-            ).map_err(VulkanoError::from_validated)?;
+            ).map_err(Validated::unwrap)?;
 
-            model_piece.draw_instanced(builder, piece_instance_buffer)?;
+            model_piece.draw_instanced(builder, piece_instance_buffer).unwrap();
         }
 
         if selected_instance.is_some() {
@@ -549,10 +549,10 @@ impl EngineRenderHandler for BoardRenderer {
                     ..Default::default()
                 },
                 selected_instance,
-            ).map_err(VulkanoError::from_validated)?;
+            ).map_err(Validated::unwrap)?;
 
-            builder.bind_pipeline_graphics(selected_graphics.clone())?;
-            model_piece.draw_instanced(builder, selected_instance_buffer)?;
+            builder.bind_pipeline_graphics(selected_graphics.clone()).unwrap();
+            model_piece.draw_instanced(builder, selected_instance_buffer).unwrap();
         }
 
         Ok(())
@@ -659,7 +659,7 @@ impl EngineRenderHandler for BoardTextRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let mut pass = self.font_compositor.begin_pass(builder);
 
         let mut layout = self.layout.layout.lock();

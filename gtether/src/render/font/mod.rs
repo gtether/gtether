@@ -74,7 +74,7 @@
 //!     fn build_commands(
 //!         &self,
 //!         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-//!     ) -> Result<(), Validated<VulkanoError>> {
+//!     ) -> Result<(), VulkanoError> {
 //!         let layout = self.layout.lock().unwrap();
 //!         let mut font_pass = self.compositor.begin_pass(builder);
 //!         font_pass.layout(&layout);

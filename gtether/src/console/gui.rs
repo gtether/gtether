@@ -598,24 +598,24 @@ impl ConsoleBackgroundSolidRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?
-            .bind_vertex_buffers(0, self.buffer.clone())?
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
+            .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
             .draw(
                 self.buffer.len() as u32,
                 1,
                 0,
                 0,
-            )?;
+            ).unwrap();
         Ok(())
     }
 }
@@ -773,24 +773,24 @@ impl ConsoleBackgroundImageRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?
-            .bind_vertex_buffers(0, self.buffer.clone())?
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
+            .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
             .draw(
                 self.buffer.len() as u32,
                 1,
                 0,
                 0,
-            )?;
+            ).unwrap();
         Ok(())
     }
 }
@@ -815,7 +815,7 @@ impl ConsoleBackgroundRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         match self {
             ConsoleBackgroundRenderer::Solid(renderer)
                 => renderer.build_commands(builder),
@@ -884,7 +884,7 @@ impl EngineRenderHandler for ConsoleRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         if !self.gui.visible.load(Ordering::Relaxed) {
             // Nothing to draw
             return Ok(());

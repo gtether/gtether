@@ -426,7 +426,7 @@ impl FontRenderer for FontSheetRenderer {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
 
         let font_sheet = self.font_sheet.read();
@@ -478,27 +478,27 @@ impl FontRenderer for FontSheetRenderer {
                 ..Default::default()
             },
             glyphs,
-        ).map_err(VulkanoError::from_validated)?;
+        ).map_err(Validated::unwrap)?;
         let instance_buffer_len = instance_buffer.len() as u32;
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
             .bind_vertex_buffers(0, (
                 self.glyph_buffer.clone(),
                 instance_buffer,
-            ))?
+            )).unwrap()
             .draw(
                 self.glyph_buffer.len() as u32,
                 instance_buffer_len,
                 0,
                 0,
-            )?;
+            ).unwrap();
         Ok(())
     }
 }

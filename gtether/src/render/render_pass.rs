@@ -29,7 +29,7 @@ pub trait EngineRenderPass: Send + Sync + 'static {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         frame: &EngineFramebuffer,
-    ) -> Result<(), Validated<VulkanoError>>;
+    ) -> Result<(), VulkanoError>;
 }
 
 /// An individual render handler, used for rendering specific details of subpasses.
@@ -44,7 +44,7 @@ pub trait EngineRenderHandler: Send + Sync + 'static {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>>;
+    ) -> Result<(), VulkanoError>;
 }
 
 struct EngineRenderSubpass {
@@ -55,7 +55,7 @@ impl EngineRenderSubpass {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         for handler in &self.handlers {
             handler.build_commands(builder)?;
         }
@@ -81,7 +81,7 @@ impl EngineRenderPass for StandardEngineRenderPass {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         frame: &EngineFramebuffer,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
 
         builder.begin_render_pass(
             RenderPassBeginInfo {
@@ -92,7 +92,7 @@ impl EngineRenderPass for StandardEngineRenderPass {
                 contents: SubpassContents::Inline,
                 ..Default::default()
             },
-        )?;
+        ).unwrap();
 
         let mut first = true;
         for subpass in self.subpasses.iter() {
@@ -103,13 +103,13 @@ impl EngineRenderPass for StandardEngineRenderPass {
                         contents: SubpassContents::Inline,
                         ..Default::default()
                     },
-                )?;
+                ).unwrap();
             }
             subpass.build_commands(builder)?;
             first = false;
         }
 
-        builder.end_render_pass(SubpassEndInfo::default())?;
+        builder.end_render_pass(SubpassEndInfo::default()).unwrap();
         Ok(())
     }
 }
@@ -489,7 +489,7 @@ impl EngineRenderPass for NoOpEngineRenderPass {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         frame: &EngineFramebuffer,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -500,8 +500,8 @@ impl EngineRenderPass for NoOpEngineRenderPass {
                     contents: SubpassContents::Inline,
                     ..Default::default()
                 },
-            )?
-            .end_render_pass(SubpassEndInfo::default())?;
+            ).unwrap()
+            .end_render_pass(SubpassEndInfo::default()).unwrap();
         Ok(())
     }
 }

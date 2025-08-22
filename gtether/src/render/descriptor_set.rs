@@ -477,14 +477,14 @@ impl EngineDescriptorSet {
     ///     fn build_commands(
     ///         &self,
     ///         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ///     ) -> Result<(), Validated<VulkanoError>> {
+    ///     ) -> Result<(), VulkanoError> {
     ///         builder
     ///             .bind_descriptor_sets(
     ///                 PipelineBindPoint::Graphics,
     ///                 self.graphics.layout().clone(),
     ///                 0,
-    ///                 self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-    ///             )?
+    ///                 self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+    ///             ).unwrap()
     ///             /* other bind and draw calls */;
     ///         Ok(())
     ///     }
@@ -528,9 +528,9 @@ impl EngineDescriptorSet {
     ///     fn build_commands(
     ///         &self,
     ///         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ///     ) -> Result<(), Validated<VulkanoError>> {
+    ///     ) -> Result<(), VulkanoError> {
     ///         let descriptor_sets = self.descriptor_set
-    ///             .descriptor_set_with_offsets().map_err(VulkanoError::from_validated)?;
+    ///             .descriptor_set_with_offsets().map_err(Validated::unwrap)?;
     ///         for descriptor_set in descriptor_sets {
     ///             builder
     ///                 .bind_descriptor_sets(
@@ -538,7 +538,7 @@ impl EngineDescriptorSet {
     ///                     self.graphics.layout().clone(),
     ///                     0,
     ///                     descriptor_set,
-    ///                 )?
+    ///                 ).unwrap()
     ///                 /* other bind and draw calls */;
     ///         }
     ///         Ok(())
