@@ -26,6 +26,67 @@
 //!  * [`get_with_loader()`](ResourceManager::get_with_loader)
 //!  * [`get_with_loader_priority()`](ResourceManager::get_with_loader_priority)
 //!
+//! ## Note around efficient loading
+//!
+//! [Resource futures](ResourceFuture) actually represent a load task that is enqueued in the
+//! internal [ResourceManager] executor. This means that once the future is created, the work is
+//! already concurrently started, even without awaiting the future. Because of this, when loading
+//! multiple resources, it is more efficient to create all futures before awaiting any of them.
+//!
+//! For example, this loads resources sequentially:
+//! ```
+//! # use async_trait::async_trait;
+//! # use smol::future;
+//! # use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+//! # use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
+//! #
+//! # #[derive(Default)]
+//! # struct MyLoader(());
+//! # #[async_trait]
+//! # impl ResourceLoader<()> for MyLoader {
+//! #     async fn load(&self, data: ResourceReadData, ctx: &ResourceLoadContext) -> Result<Box<()>, ResourceLoadError> {
+//! #         Ok(Box::new(()))
+//! #     }
+//! # }
+//! #
+//! # let manager = ResourceManager::builder().build();
+//! #
+//! # future::block_on(async move {
+//! let res_a = manager.get_with_loader("a", MyLoader::default()).await;
+//! let res_b = manager.get_with_loader("b", MyLoader::default()).await;
+//! let res_c = manager.get_with_loader("c", MyLoader::default()).await;
+//! # })
+//! ```
+//!
+//! Whereas this loads all three resources concurrently:
+//! ```
+//! # use async_trait::async_trait;
+//! # use smol::future;
+//! # use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+//! # use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
+//! #
+//! # #[derive(Default)]
+//! # struct MyLoader(());
+//! # #[async_trait]
+//! # impl ResourceLoader<()> for MyLoader {
+//! #     async fn load(&self, data: ResourceReadData, ctx: &ResourceLoadContext) -> Result<Box<()>, ResourceLoadError> {
+//! #         Ok(Box::new(()))
+//! #     }
+//! # }
+//! #
+//! # let manager = ResourceManager::builder().build();
+//! #
+//! # future::block_on(async move {
+//! let (res_a, res_b, res_c) = {
+//!     let fut_a = manager.get_with_loader("a", MyLoader::default());
+//!     let fut_b = manager.get_with_loader("b", MyLoader::default());
+//!     let fut_c = manager.get_with_loader("c", MyLoader::default());
+//!
+//!     (fut_a.await, fut_b.await, fut_c.await)
+//! };
+//! # })
+//! ```
+//!
 //! # Examples
 //! Load a [Resource][res]
 //! ```
