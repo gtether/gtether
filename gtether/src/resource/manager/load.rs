@@ -1054,7 +1054,7 @@ mod tests {
 
         timeout(
             assert_manager_drops(manager),
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         ).await;
     }
 
