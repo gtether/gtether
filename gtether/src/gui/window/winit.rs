@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::{fmt, thread};
-use tracing::{event, info, warn, Level};
+use tracing::{error, event, info, warn, Level};
 use vulkano::device::{DeviceExtensions, Features};
 use vulkano::instance::InstanceExtensions;
 use vulkano::swapchain::Surface;
@@ -402,12 +402,22 @@ impl LifecyclePhase {
         engine: Arc<Engine<A>>,
         event_loop_proxy: EventLoopProxy<EngineEvent>,
     ) -> thread::JoinHandle<()> {
+        struct DropSender {
+            event_loop_proxy: EventLoopProxy<EngineEvent>,
+            phase: LifecyclePhase,
+        }
+        impl Drop for DropSender {
+            fn drop(&mut self) {
+                self.event_loop_proxy.send_event(EngineEvent::FinishPhase(self.phase)).unwrap();
+            }
+        }
+
         let spawn_self = *self;
         thread::Builder::new()
             .name(format!("engine-task-{}", self.to_string()))
             .spawn(move || {
+                let _guard = DropSender { event_loop_proxy, phase: spawn_self };
                 spawn_self.exec_engine_phase(&engine);
-                event_loop_proxy.send_event(EngineEvent::FinishPhase(spawn_self)).unwrap();
             })
             .unwrap()
     }
@@ -555,7 +565,7 @@ impl<A: Application> ApplicationHandler<EngineEvent> for WindowOrchestrator<A> {
                 }
                 let target = phase.target_stage();
                 if let Err(error) = self.engine_state.set_stage(target) {
-                    warn!(?target, ?error, "Could not advance engine stage to target stage");
+                    error!(?target, ?error, "Could not advance engine stage to target stage");
                     if phase == LifecyclePhase::Terminate {
                         // Crash out anyway, as this is non-recoverable
                         Err::<(), _>(error).unwrap();
