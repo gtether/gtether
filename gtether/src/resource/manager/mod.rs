@@ -75,6 +75,7 @@
 //! [res]: Resource
 //! [rp]: ResourceId
 //! [rf]: ResourceFutureOld
+use ahash::HashMap;
 use educe::Educe;
 use parking_lot::{RwLock, RwLockReadGuard};
 use smol::prelude::*;
@@ -83,7 +84,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use ahash::HashMap;
+
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::DependencyGraph;
 use crate::resource::manager::executor::ManagerExecutor;
@@ -109,27 +110,66 @@ enum ResourceFutureInner<T: ?Sized + Send + Sync + 'static> {
     Cached(ResourceLoadResult<T>),
     Loading(ResourceLoadFuture<T>),
     Updating(ResourceUpdateFuture<T>),
+    Or {
+        base: Box<ResourceFutureInner<T>>,
+        id: ResourceId,
+        loader: Arc<dyn ResourceLoader<T>>,
+    },
 }
 
 impl<T: ?Sized + Send + Sync + 'static> Debug for ResourceFutureInner<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        struct CachedErr<'a>(&'a ResourceLoadError);
-        impl Debug for CachedErr<'_> {
-            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Err(")?;
-                Debug::fmt(&self.0, f)?;
-                f.write_str(")")
+        match self {
+            Self::Cached(Ok(res)) => write!(f, "Cached(Ok({}))", res.id()),
+            Self::Cached(Err(e)) => {
+                write!(f, "Cached(Err(")?;
+                Debug::fmt(e, f)?;
+                write!(f, "))")
+            },
+            Self::Loading(_) => write!(f, "Loading(<load-future>)"),
+            Self::Updating(_) => write!(f, "Updating(<update-future>)"),
+            Self::Or { base, id, .. } => {
+                Debug::fmt(base, f)?;
+                write!(f, " | {}", id)
             }
         }
+    }
+}
 
-        let mut builder = f.debug_struct("ResourceFuture");
+impl<T: ?Sized + Send + Sync + 'static> ResourceFutureInner<T> {
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        cache: Arc<Cache>,
+        load_params: Arc<ResourceLoadParams<T>>,
+    ) -> Result<Poll<ResourceLoadResult<T>>, Self> {
         match self {
-            Self::Cached(Ok(_)) => builder.field("Cached", &"Ok(<resource>)"),
-            Self::Cached(Err(e)) => builder.field("Cached", &CachedErr(e)),
-            Self::Loading(_) => builder.field("Loading", &"<load-future>"),
-            Self::Updating(_) => builder.field("Updating", &"<update-future>"),
-        };
-        builder.finish()
+            Self::Cached(result) => Ok(Poll::Ready(result.clone())),
+            Self::Loading(load_fut) => Ok(load_fut.poll(cx)),
+            Self::Updating(update_fut) => Ok(update_fut.poll(cx)),
+            Self::Or { base, id, loader } => {
+                let poll_result = match base.poll(cx, cache.clone(), load_params.clone()) {
+                    Ok(poll_result) => poll_result,
+                    Err(new_inner) => {
+                        *base = Box::new(new_inner);
+                        return self.poll(cx, cache, load_params)
+                    }
+                };
+                match poll_result {
+                    Poll::Ready(result) => {
+                        match result {
+                            Err(ResourceLoadError::NotFound(_)) => {
+                                let mut load_params = (*load_params).clone();
+                                load_params.loader = loader.clone();
+                                Err(cache.get_or_load(id.clone(), load_params))
+                            },
+                            result => Ok(Poll::Ready(result)),
+                        }
+                    },
+                    poll_result => Ok(poll_result),
+                }
+            }
+        }
     }
 }
 
@@ -151,6 +191,10 @@ impl<T: ?Sized + Send + Sync + 'static> Debug for ResourceFutureInner<T> {
 pub struct ResourceFuture<'ctx, T: ?Sized + Send + Sync + 'static> {
     inner: ResourceFutureInner<T>,
     #[educe(Debug(ignore))]
+    cache: Arc<Cache>,
+    // Needs to be Arc<> due to some weird Pin semantics + borrow splitting in Future::poll()
+    load_params: Arc<ResourceLoadParams<T>>,
+    #[educe(Debug(ignore))]
     ctx: Option<&'ctx ResourceLoadContext>,
 }
 
@@ -158,9 +202,13 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceFuture<'static, T> {
     #[inline]
     fn new(
         inner: impl Into<ResourceFutureInner<T>>,
+        cache: Arc<Cache>,
+        load_params: ResourceLoadParams<T>,
     ) -> Self {
         Self {
             inner: inner.into(),
+            cache,
+            load_params: Arc::new(load_params),
             ctx: None,
         }
     }
@@ -170,10 +218,14 @@ impl<'ctx, T: ?Sized + Send + Sync + 'static> ResourceFuture<'ctx, T> {
     #[inline]
     fn with_context(
         inner: impl Into<ResourceFutureInner<T>>,
+        cache: Arc<Cache>,
+        load_params: ResourceLoadParams<T>,
         ctx: &'ctx ResourceLoadContext,
     ) -> Self {
         Self {
             inner: inner.into(),
+            cache,
+            load_params: Arc::new(load_params),
             ctx: Some(ctx),
         }
     }
@@ -189,16 +241,56 @@ impl<'ctx, T: ?Sized + Send + Sync + 'static> ResourceFuture<'ctx, T> {
             Poll::Pending => Err(self),
         }
     }
+
+    /// Compose this ResourceFuture with a fallback load configuration using a default
+    /// [ResourceLoader].
+    ///
+    /// Creates and uses the [ResourceLoader] specified by [ResourceDefaultLoader].
+    ///
+    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it attempts
+    /// to load this fallback configuration instead.
+    #[inline]
+    pub fn or_get(
+        self,
+        id: impl Into<ResourceId>,
+    ) -> Self
+    where
+        T: ResourceDefaultLoader,
+    {
+        self.or_get_with_loader(id, T::default_loader())
+    }
+
+    /// Compose this ResourceFuture with a fallback load configuration.
+    ///
+    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it attempts
+    /// to load this fallback configuration instead.
+    #[inline]
+    pub fn or_get_with_loader(
+        mut self,
+        id: impl Into<ResourceId>,
+        loader: impl ResourceLoader<T>,
+    ) -> Self {
+        self.inner = ResourceFutureInner::Or {
+            base: Box::new(self.inner),
+            id: id.into(),
+            loader: Arc::new(loader),
+        };
+        self
+    }
 }
 
 impl<'ctx, T: ?Sized + Send + Sync + 'static> Future for ResourceFuture<'ctx, T> {
     type Output = ResourceLoadResult<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let poll_result = match &mut self.inner {
-            ResourceFutureInner::Cached(result) => Poll::Ready(result.clone()),
-            ResourceFutureInner::Loading(load_fut) => load_fut.poll(cx),
-            ResourceFutureInner::Updating(update_fut) => update_fut.poll(cx),
+        let cache = self.cache.clone();
+        let load_params = self.load_params.clone();
+        let poll_result = match self.inner.poll(cx, cache, load_params) {
+            Ok(poll_result) => poll_result,
+            Err(new_inner) => {
+                self.inner = new_inner;
+                return self.poll(cx)
+            }
         };
 
         if let Poll::Ready(result) = &poll_result {
@@ -344,17 +436,19 @@ impl ResourceManager {
     where
         T: ?Sized + Send + Sync + 'static,
     {
+        let load_params = ResourceLoadParams {
+            loader: Arc::new(loader),
+            priority: load_priority.into(),
+            parents: vec![],
+            resource_cache: Arc::new(RwLock::new(HashMap::default())),
+            operation: ResourceLoadOperation::Load,
+        };
+
         let inner = self.cache.get_or_load(
             id.into(),
-            ResourceLoadParams {
-                loader: Arc::new(loader),
-                priority: load_priority.into(),
-                parents: vec![],
-                resource_cache: Arc::new(RwLock::new(HashMap::default())),
-                operation: ResourceLoadOperation::Load,
-            },
+            load_params.clone(),
         );
-        ResourceFuture::new(inner)
+        ResourceFuture::new(inner, self.cache.clone(), load_params)
     }
 }
 
@@ -1142,6 +1236,79 @@ pub mod tests {
             assert_manager_drops(manager),
             Duration::from_millis(200),
         ).await;
+    }
+
+    #[rstest]
+    #[case::first_ok(
+        [
+            TestDataEntry::new("a", b"value1", "h_a"),
+            TestDataEntry::new("b", b"value2", "h_b"),
+            TestDataEntry::new("c", b"value3", "h_c"),
+        ],
+        [
+            TestLoadInfo::new("a", TestResLoader::new("a")),
+            TestLoadInfo::new("b", TestResLoader::new("b")),
+            TestLoadInfo::new("c", TestResLoader::new("c")),
+        ],
+        ExpectedLoadResult::Ok("value1".to_string()),
+    )]
+    #[case::first_not_found(
+        [
+            TestDataEntry::new("b", b"value2", "h_b"),
+            TestDataEntry::new("c", b"value3", "h_c"),
+        ],
+        [
+            TestLoadInfo::new("a", TestResLoader::new("a")),
+            TestLoadInfo::new("b", TestResLoader::new("b")),
+            TestLoadInfo::new("c", TestResLoader::new("c")),
+        ],
+        ExpectedLoadResult::Ok("value2".to_string()),
+    )]
+    #[case::nested_not_found(
+        [
+            TestDataEntry::new("c", b"value3", "h_c"),
+        ],
+        [
+            TestLoadInfo::new("a", TestResLoader::new("a")),
+            TestLoadInfo::new("b", TestResLoader::new("b")),
+            TestLoadInfo::new("c", TestResLoader::new("c")),
+        ],
+        ExpectedLoadResult::Ok("value3".to_string()),
+    )]
+    #[case::none_found(
+        [],
+        [
+            TestLoadInfo::new("a", TestResLoader::new("a")),
+            TestLoadInfo::new("b", TestResLoader::new("b")),
+            TestLoadInfo::new("c", TestResLoader::new("c")),
+        ],
+        ExpectedLoadResult::NotFound(ResourceId::from("c")),
+    )]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_future_or_get(
+        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        #[case] initial_data: impl IntoIterator<Item=TestDataEntry>,
+        #[case] load_info: impl IntoIterator<Item=TestLoadInfo<String, TestResLoader>>,
+        #[case] expected_load_result: ExpectedLoadResult<String>,
+    ) {
+        {
+            let mut lock = data_maps[0].lock();
+            for data in initial_data {
+                lock.insert(data.id, data.data, data.hash);
+            }
+        }
+
+        let mut load_info = load_info.into_iter();
+        let mut fut = {
+            let first = load_info.next().expect("'load_info' should have at least 1 item");
+            manager.get_with_loader(first.key, first.loader)
+        };
+        for next in load_info {
+            fut = fut.or_get_with_loader(next.key, next.loader);
+        }
+
+        let result = fut.await;
+        expected_load_result.assert_matches(result);
     }
 
     pub mod prelude {

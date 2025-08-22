@@ -168,34 +168,44 @@ impl ResourceLoadContext {
                 .cloned()
                 .collect()
         };
+
+        let load_params = ResourceLoadParams {
+            loader: Arc::new(loader),
+            priority: self.priority,
+            parents: parents.clone(),
+            resource_cache: self.resource_cache.clone(),
+            operation: ResourceLoadOperation::Load,
+        };
+
         if parents.contains(&id) {
             let result = Err(ResourceLoadError::CyclicLoad {
                 parents,
                 id,
             });
-            ResourceFuture::with_context(ResourceFutureInner::Cached(result), self)
+            ResourceFuture::with_context(
+                ResourceFutureInner::Cached(result),
+                self.cache.clone(),
+                load_params,
+                self,
+            )
         } else {
             let inner = self.cache.get_or_load(
                 id,
-                ResourceLoadParams {
-                    loader: Arc::new(loader),
-                    priority: self.priority,
-                    parents,
-                    resource_cache: self.resource_cache.clone(),
-                    operation: ResourceLoadOperation::Load,
-                }
+                load_params.clone(),
             );
-            ResourceFuture::with_context(inner, self)
+            ResourceFuture::with_context(inner, self.cache.clone(), load_params, self)
         }
     }
 }
 
 #[derive(Educe)]
-#[educe(Clone)]
+#[educe(Clone, Debug)]
 pub struct ResourceLoadParams<T: ?Sized + Send + Sync + 'static> {
+    #[educe(Debug(ignore))]
     pub loader: Arc<dyn ResourceLoader<T>>,
     pub priority: TaskPriority,
     pub parents: Vec<ResourceId>,
+    #[educe(Debug(ignore))]
     pub resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
     pub operation: ResourceLoadOperation,
 }
