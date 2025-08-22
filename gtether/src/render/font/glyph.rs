@@ -254,13 +254,10 @@ impl ResourceLoader<dyn Font> for GlyphFontLoader {
     async fn update(
         &self,
         resource: ResourceMut<dyn Font>,
-        data: ResourceReadData,
-        ctx: &ResourceLoadContext,
-    ) -> Result<(), ResourceLoadError> {
-        let new_value = self.load(data, ctx).await?;
-        self.renderer.event_bus().register_once(move |_event: &mut Event<RendererPostEvent>| {
+        new_value: Box<dyn Font>,
+    ) {
+        let _ = self.renderer.event_bus().register_once(move |_event: &mut Event<RendererPostEvent>| {
             resource.replace(new_value);
-        }).unwrap().await
-            .map_err(ResourceLoadError::from_error)
+        }).unwrap().await;
     }
 }

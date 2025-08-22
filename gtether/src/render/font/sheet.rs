@@ -36,8 +36,7 @@ use crate::render::image::EngineImageViewSampler;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererPostEvent, VulkanoError};
 use crate::render::descriptor_set::EngineDescriptorSet;
-use crate::resource::manager::ResourceLoadResult;
-use crate::resource::{Resource, ResourceLoadError, ResourceMut, SubResourceLoader};
+use crate::resource::{Resource, ResourceLoadError, ResourceLoadResult, ResourceMut, SubResourceLoader};
 
 /// Starting character code (inclusive) of the Unicode Latin chart
 pub const UNICODE_LATIN_START: u32 = 0x20;

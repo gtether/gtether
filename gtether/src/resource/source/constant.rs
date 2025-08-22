@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+
 use crate::resource::id::ResourceId;
-use crate::resource::source::{ResourceData, ResourceDataSource, ResourceWatcher};
-use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
+use crate::resource::source::{ResourceData, ResourceDataSource, ResourceSourceBuilder, ResourceUpdater};
+use crate::resource::source::{ResourceDataResult, ResourceSource, SourceIndex};
 use crate::resource::ResourceLoadError;
 
 /// [ResourceSource][rs] that contains static global data.
@@ -59,7 +60,7 @@ impl ResourceSource for ConstantResourceSource {
         }
     }
 
-    fn watch(&self, _id: ResourceId, _watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
+    fn watch(&self, _id: ResourceId, _sub_idx: Option<SourceIndex>) {
         // Noop because constant data can't change
     }
 
@@ -96,10 +97,11 @@ impl ConstantResourceSourceBuilder {
         self.raw.insert(id.into(), (data, hash));
         self
     }
+}
 
-    /// Build the [ConstantResourceSource].
-    #[inline]
-    pub fn build(self) -> ConstantResourceSource {
-        ConstantResourceSource::new(self.raw)
+impl ResourceSourceBuilder for ConstantResourceSourceBuilder {
+    fn build(self: Box<Self>, _updater: Box<dyn ResourceUpdater>) -> Box<dyn ResourceSource> {
+        // Constant data can't change
+        Box::new(ConstantResourceSource::new(self.raw))
     }
 }

@@ -369,7 +369,7 @@ impl DeferredLightingRendererBootstrap {
     }
 
     pub fn bootstrap(self: &Arc<Self>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DeferredLightingRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DeferredLightingRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             DeferredLightingRenderer::new(

@@ -32,8 +32,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::resource::manager::{ResourceLoadContext, ResourceLoadResult};
 use crate::resource::id::ResourceId;
+use crate::resource::manager::ResourceLoadContext;
 
 pub mod manager;
 pub mod id;
@@ -190,7 +190,6 @@ pub struct Resource<T: ?Sized + Send + Sync + 'static> {
     id: ResourceId,
     value: RwLock<Box<T>>,
     sub_resources: smol::lock::Mutex<Vec<SubResourceRef<T>>>,
-    update_lock: smol::lock::Mutex<()>,
 }
 
 impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
@@ -200,7 +199,6 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
             id,
             value: RwLock::new(value),
             sub_resources: smol::lock::Mutex::new(Vec::new()),
-            update_lock: smol::lock::Mutex::new(()),
         }
     }
 
@@ -426,6 +424,8 @@ impl Display for ResourceLoadError {
 
 impl Error for ResourceLoadError {}
 
+pub type ResourceLoadResult<T> = Result<Arc<Resource<T>>, ResourceLoadError>;
+
 /// Raw data type for loading resources from.
 pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 
@@ -482,23 +482,20 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
         ctx: &ResourceLoadContext,
     ) -> Result<Box<T>, ResourceLoadError>;
 
-    /// Given a [mutable resource handle][rm], load and update a resource from [raw data][rd].
+    /// Given a [mutable resource handle][rm], update a resource from a [loaded](Self::load) value.
     ///
-    /// The default implementation simply re-uses [ResourceLoader::load()], and replaces the
-    /// resource value with the new value.
+    /// The default implementation simply replaces the resource value with the new value, but this
+    /// can be overridden to allow e.g. synchronization with other threads (such as updating render
+    /// resources between frames).
     ///
     /// [rm]: ResourceMut
     /// [rd]: ResourceReadData
     async fn update(
         &self,
         resource: ResourceMut<T>,
-        data: ResourceReadData,
-        ctx: &ResourceLoadContext,
-    )
-        -> Result<(), ResourceLoadError>
-    {
-        resource.replace(self.load(data, ctx).await?);
-        Ok(())
+        new_value: Box<T>,
+    ) {
+        resource.replace(new_value);
     }
 }
 
@@ -574,9 +571,16 @@ pub trait ResourceDefaultLoader: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-    use super::*;
     use super::manager::tests::*;
+    use super::*;
+
+    use macro_rules_attribute::apply;
+    use rstest::rstest;
+    use smol_macros::test as smol_test;
+    use std::time::Duration;
+    use test_log::test as test_log;
+
+    use crate::resource::manager::ResourceManager;
 
     #[derive(Clone, Debug)]
     enum SubStringLoaderError {
@@ -633,77 +637,92 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sub_resource_load_error() {
-        let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value", "h_value");
+    #[rstest]
+    #[case::err(SubStringLoader::err(), None)]
+    #[case::ok(SubStringLoader::new("subvalue"), Some("subvalue"))]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_sub_resource(
+        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        #[case] sub_loader: SubStringLoader,
+        #[case] expected_sub_value: Option<&str>,
+    ) {
+        data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
-        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
-            .expect("Resource should load for 'key'");
+        let resource = manager.get_with_loader("key", TestResLoader::new("key")).await
+            .expect("Resource should load");
 
-        value.attach_sub_resource_blocking(SubStringLoader::err())
-            .expect_err("Sub-resource should fail to load");
+        let result = resource.attach_sub_resource(sub_loader).await;
+
+        match expected_sub_value {
+            Some(expected_value) => {
+                let sub_resource = result.expect("Sub-resource should load");
+                assert_eq!(*sub_resource.read(), format!("value-{expected_value}"));
+            },
+            None => {
+                result.expect_err("Sub-resource should fail to load");
+            }
+        }
     }
 
-    #[test]
-    fn test_sub_resource_update() {
-        let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value", "h_value");
+    #[rstest]
+    #[case::err([SubStringLoader::no_update("subvalue")], ["value-subvalue"])]
+    #[case::ok([SubStringLoader::new("subvalue")], ["new_value-subvalue"])]
+    #[case::mixed(
+        [SubStringLoader::no_update("subvalue1"), SubStringLoader::new("subvalue2")],
+        ["value-subvalue1", "new_value-subvalue2"],
+    )]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_sub_resource_update(
+        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        #[case] sub_loaders: impl IntoIterator<Item=SubStringLoader>,
+        #[case] expected_sub_values: impl IntoIterator<Item=&str>,
+    ) {
+        data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
-        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
-            .expect("Resource should load for 'key'");
+        let resource = manager.get_with_loader("key", TestResLoader::new("key")).await
+            .expect("Resource should load");
 
-        let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
-            .expect("Sub-resource should load");
-        assert_eq!(*sub_value.read(), "value-subvalue".to_owned());
+        let mut sub_resources = Vec::new();
+        for sub_loader in sub_loaders {
+            let sub_resource = resource.attach_sub_resource(sub_loader).await
+                .expect("Sub-resource should load");
+            sub_resources.push(sub_resource);
+        }
 
-        data_maps[0].insert("key", b"new_value", "h_new_value");
-        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
-        assert_eq!(*sub_value.read(), "new_value-subvalue");
+        data_maps[0].lock().insert("key", b"new_value", "h_new_value");
+        timeout(
+            manager.test_ctx().sync_update.wait_count(1),
+            Duration::from_millis(200),
+        ).await;
+
+        let expected_sub_values = expected_sub_values.into_iter().collect::<Vec<_>>();
+        assert_eq!(expected_sub_values.len(), sub_resources.len());
+        for (idx, expected_sub_value) in expected_sub_values.into_iter().enumerate() {
+            assert_eq!(&*sub_resources[idx].read(), expected_sub_value);
+        }
     }
 
-    #[test]
-    fn test_multi_sub_resource() {
-        let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value", "h_value");
+    #[rstest]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_chained_sub_resource(
+        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+    ) {
+        data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
-        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
-            .expect("Resource should load for 'key'");
+        let resource = manager.get_with_loader("key", TestResLoader::new("key")).await
+            .expect("Resource should load");
 
-        let sub_value_1 = value.attach_sub_resource_blocking(SubStringLoader::no_update("subvalue1"))
+        let sub_resource = resource.attach_sub_resource(SubStringLoader::new("subvalue")).await
             .expect("Sub-resource should load");
-        let sub_value_2 = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue2"))
-            .expect("Sub-resource should load");
-        assert_eq!(*sub_value_1.read(), "value-subvalue1".to_owned());
-        assert_eq!(*sub_value_2.read(), "value-subvalue2".to_owned());
-
-        // sub_value_1 should fail an update, but that shouldn't prevent sub_value_2 from updating
-        data_maps[0].insert("key", b"new_value", "h_new_value");
-        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
-        assert_eq!(*sub_value_1.read(), "value-subvalue1".to_owned());
-        assert_eq!(*sub_value_2.read(), "new_value-subvalue2".to_owned());
-    }
-
-    #[test]
-    fn test_chained_sub_resource() {
-        let (manager, data_maps) = create_resource_manager::<1>();
-        data_maps[0].insert("key", b"value", "h_value");
-
-        let fut = manager.get_with_loader("key", TestResourceLoader::new("key"));
-        let value = future::block_on(timeout(fut, Duration::from_secs(1)))
-            .expect("Resource should load for 'key'");
-
-        let sub_value = value.attach_sub_resource_blocking(SubStringLoader::new("subvalue"))
-            .expect("Sub-resource should load");
-        let sub_sub_value = sub_value.attach_sub_resource_blocking(SubStringLoader::new("subsubvalue"))
+        let sub_sub_resource = sub_resource.attach_sub_resource(SubStringLoader::new("subsubvalue")).await
             .expect("Sub-sub-resource should load");
-        assert_eq!(*sub_sub_value.read(), "value-subvalue-subsubvalue".to_owned());
+        assert_eq!(&*sub_sub_resource.read(), "value-subvalue-subsubvalue");
 
-        data_maps[0].insert("key", b"new_value", "h_new_value");
-        future::block_on(timeout(manager.test_ctx().sync_update.wait_count(1), Duration::from_secs(1)));
-        assert_eq!(*sub_sub_value.read(), "new_value-subvalue-subsubvalue");
+        data_maps[0].lock().insert("key", b"new_value", "h_new_value");
+        timeout(
+            manager.test_ctx().sync_update.wait_count(1),
+            Duration::from_millis(200)
+        ).await;
+        assert_eq!(&*sub_sub_resource.read(), "new_value-subvalue-subsubvalue");
     }
 }

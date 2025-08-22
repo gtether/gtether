@@ -177,7 +177,7 @@ impl DirectionalRendererBootstrap {
     }
 
     pub fn bootstrap(self: &Arc<DirectionalRendererBootstrap>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DirectionalRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DirectionalRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             DirectionalRenderer::new(renderer, subpass, self_clone.lights.clone())

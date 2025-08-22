@@ -26,6 +26,7 @@
 //! # use gtether::resource::manager::ResourceManager;
 //! use gtether::resource::manager::LoadPriority;
 //! #
+//! # async fn wrapper() {
 //! # let resource_manager: Arc<ResourceManager> = return;
 //! # let renderer: &Arc<Renderer> = return;
 //! # let subpass: &Subpass = return;
@@ -35,7 +36,7 @@
 //! let font = resource_manager.get_with_loader(
 //!     "my_font",
 //!     GlyphFontLoader::new(renderer.clone()),
-//! ).wait().unwrap();
+//! ).await.unwrap();
 //!
 //! let font_sheet = FontSheet::from_font(
 //!     &font,
@@ -51,6 +52,7 @@
 //!         font_sheet.clone(),
 //!     ),
 //! );
+//! # }
 //! ```
 //!
 //! Render a [TextLayout][tl] (generally done as part of a parent render handler)

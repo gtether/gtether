@@ -8,11 +8,6 @@ use std::thread::JoinHandle;
 use strum::EnumCount;
 use tracing::warn;
 
-use crate::resource::id::ResourceId;
-use crate::resource::manager::LoadPriority;
-use crate::resource::source::SourceIndex;
-use crate::resource::{Resource, ResourceLoadError, ResourceLoader};
-
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, EnumCount)]
 pub enum TaskPriority {
@@ -27,16 +22,6 @@ impl Display for TaskPriority {
             Self::Immediate => f.write_str("Immediate"),
             Self::Delayed => f.write_str("Delayed"),
             Self::Update => f.write_str("Update"),
-        }
-    }
-}
-
-impl From<LoadPriority> for TaskPriority {
-    #[inline]
-    fn from(value: LoadPriority) -> Self {
-        match value {
-            LoadPriority::Immediate => Self::Immediate,
-            LoadPriority::Delayed => Self::Delayed,
         }
     }
 }
@@ -64,12 +49,12 @@ impl ManagerExecutor {
                             let t1 = worker_execs[TaskPriority::Delayed as usize].tick();
                             let t2 = worker_execs[TaskPriority::Update as usize].tick();
 
-                            // Wait until one of the ticks completes, trying them in order from highest
-                            // priority to lowest priority
+                            // Wait until one of the ticks completes, trying them in order from
+                            // the highest priority to the lowest priority
                             t0.or(t1).or(t2).await;
                         }
 
-                        // Yield every now and then
+                        // Yield occasionally
                         future::yield_now().await;
                     }
                 };
@@ -83,12 +68,19 @@ impl ManagerExecutor {
         }
     }
 
+    #[inline]
     pub fn spawn<T: Send + 'static>(
         &self,
         priority: TaskPriority,
         future: impl Future<Output = T> + Send + 'static,
     ) -> ManagerTask<T> {
         self.execs[priority as usize].spawn(future)
+    }
+
+    #[allow(unused)] // Used in e.g. tests
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.execs.iter().all(|exec| exec.is_empty())
     }
 }
 
@@ -105,13 +97,4 @@ impl Drop for ManagerExecutor {
             warn!("ResourceManager executor join handle already taken");
         }
     }
-}
-
-pub type ManagerLoadTask<T> = ManagerTask<ResourceTaskData<T>>;
-
-pub struct ResourceTaskData<T: ?Sized + Send + Sync + 'static> {
-    pub id: ResourceId,
-    pub result: Result<(Arc<Resource<T>>, String), ResourceLoadError>,
-    pub source_idx: SourceIndex,
-    pub loader: Arc<dyn ResourceLoader<T>>,
 }

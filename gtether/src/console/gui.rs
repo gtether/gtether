@@ -447,7 +447,7 @@ impl ConsoleGui {
     ///
     /// [rpb]: crate::render::render_pass::EngineRenderPassBuilder
     pub fn bootstrap_renderer(self: &Arc<Self>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> ConsoleRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> ConsoleRenderer + use<> {
         let self_clone = self.clone();
         |renderer, subpass| {
             ConsoleRenderer::new(renderer, subpass, self_clone)

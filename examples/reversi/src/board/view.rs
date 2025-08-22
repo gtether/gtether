@@ -231,7 +231,7 @@ impl BoardView {
         self: &Arc<Self>,
         model_tile: Arc<Resource<Model<ModelVertexNormal>>>,
         model_piece: Arc<Resource<Model<ModelVertexNormal>>>,
-    ) -> impl FnOnce(&Arc<Renderer>, &Subpass) -> BoardRenderer {
+    ) -> impl FnOnce(&Arc<Renderer>, &Subpass) -> BoardRenderer + use<> {
         let board_view = self.clone();
         let transform = self.transform.clone();
         let camera = self.camera.clone();
@@ -251,7 +251,7 @@ impl BoardView {
     pub fn bootstrap_text_renderer(
         self: &Arc<Self>,
         font: Arc<Resource<dyn Font>>,
-    ) -> impl FnOnce(&Arc<Renderer>, &Subpass) -> BoardTextRenderer {
+    ) -> impl FnOnce(&Arc<Renderer>, &Subpass) -> BoardTextRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             BoardTextRenderer::new(

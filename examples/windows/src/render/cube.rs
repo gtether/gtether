@@ -242,7 +242,7 @@ impl CubeRendererBootstrap {
     }
 
     pub fn bootstrap(self: &Arc<CubeRendererBootstrap>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> CubeRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> CubeRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             CubeRenderer::new(renderer, subpass, self_clone.mn.clone(), self_clone.vp.clone())

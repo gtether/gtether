@@ -179,7 +179,7 @@ impl AmbientRendererBootstrap {
     }
 
     pub fn bootstrap(self: &Arc<AmbientRendererBootstrap>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> AmbientRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> AmbientRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             AmbientRenderer::new(renderer, subpass, self_clone.light.clone())

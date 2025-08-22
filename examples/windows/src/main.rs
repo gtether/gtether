@@ -451,8 +451,7 @@ fn main() {
 
     let resources = ResourceManager::builder()
         .source(ConstantResourceSource::builder()
-            .resource("console_font", include_bytes!("RobotoMono/RobotoMono-VariableFont_wght.ttf"))
-            .build())
+            .resource("console_font", include_bytes!("RobotoMono/RobotoMono-VariableFont_wght.ttf")))
         .build();
 
     EngineBuilder::new()

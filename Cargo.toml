@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 authors = ["James De Broeck <debroejm@gmail.com>"]
 license = "BSD-2-Clause-Patent"
 repository = "https://github.com/gtether/gtether"
@@ -31,6 +31,7 @@ crossbeam = "0.8"
 educe = "0.6"
 flagset = "0.4"
 futures-core = "0.3"
+futures-util = "0.3"
 game-networking-sockets = "0.1"
 image = "0.25"
 itertools = "0.14"
