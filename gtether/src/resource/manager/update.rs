@@ -753,7 +753,7 @@ mod tests {
             expected: ExpectedLoadResult::Ok(vec!["a:b:value"]),
         }],
         BulkUpdate::new(0, [Update::Insert(TestDataEntry::new("b", b"new_value", "h_new_value"))]),
-        1,
+        1, 3, // includes 'new_value'
         [vec!["a:b:new_value"]],
         DependencyGraph::builder().add("a", ["b"]).build(),
     )]
@@ -765,7 +765,7 @@ mod tests {
             expected: ExpectedLoadResult::Ok(vec!["a:b:value"]),
         }],
         BulkUpdate::new(0, [Update::Insert(TestDataEntry::new("a", b"c", "h_new_a_dep"))]),
-        1,
+        1, 3, // includes 'new_value'
         [vec!["a:c:other_value"]],
         DependencyGraph::builder().add("a", ["c"]).build(),
     )]
@@ -777,7 +777,7 @@ mod tests {
             expected: ExpectedLoadResult::Ok(vec!["a:b:c:value"]),
         }],
         BulkUpdate::new(0, [Update::Insert(TestDataEntry::new("c", b"new_value", "h_new_value"))]),
-        1,
+        1, 4, // includes 'new_value'
         [vec!["a:b:c:new_value"]],
         DependencyGraph::builder().add("a", ["b"]).add("b", ["c"]).build(),
     )]
@@ -813,7 +813,7 @@ mod tests {
             Update::Insert(TestDataEntry::new("c2", b"new_value2", "h_new_c2")),
             Update::Insert(TestDataEntry::new("c3", b"new_value3", "h_new_c3")),
         ]),
-        2,
+        2, 12, // includes 'value#'
         [
             vec!["a1:b1:c1:value1", "a1:b1:c2:new_value2"],
             vec![
@@ -826,6 +826,32 @@ mod tests {
             .add("b1", ["c1", "c2"]).add("b2", ["c1", "c2", "c3"])
             .build(),
     )]
+    #[case::diamond(
+        DependencyGraph::builder()
+            .add("a", ["b1", "b2", "b3"])
+            .add("b1", ["c"]).add("b2", ["c"]).add("b3", ["c"])
+            .build(),
+        [TestDataEntry::new("c", b"value", "h_c")],
+        [ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("a", TestResChainLoader::default()),
+            expected: ExpectedLoadResult::Ok(vec![
+                "a:b1:c:value",
+                "a:b2:c:value",
+                "a:b3:c:value",
+            ]),
+        }],
+        BulkUpdate::new(0, [Update::Insert(TestDataEntry::new("c", b"new_value", "h_new_c"))]),
+        1, 6, // includes 'new_value'
+        [vec![
+            "a:b1:c:new_value",
+            "a:b2:c:new_value",
+            "a:b3:c:new_value",
+        ]],
+        DependencyGraph::builder()
+            .add("a", ["b1", "b2", "b3"])
+            .add("b1", ["c"]).add("b2", ["c"]).add("b3", ["c"])
+            .build(),
+    )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_update_dependencies<L>(
         #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
@@ -834,6 +860,7 @@ mod tests {
         #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<Vec<String>, L, Vec<&'static str>>>,
         #[case] update: BulkUpdate,
         #[case] wait_update_count: usize,
+        #[case] expected_update_load_count: usize,
         #[case] expected_values: impl IntoIterator<Item=Vec<&'static str>>,
         #[case] expected_graph: DependencyGraph,
     )
@@ -859,12 +886,15 @@ mod tests {
             values.push(value);
         }
 
+        // Reset load counts so we can assert on just the ones resulting from updates
+        manager.test_ctx().sync_load.clear();
         update.apply(&data_maps);
 
         timeout(
             manager.test_ctx().sync_update.wait_count(wait_update_count),
             Duration::from_millis(500),
         ).await;
+        manager.test_ctx().sync_load.assert_count(expected_update_load_count);
 
         for (idx, expected_value) in expected_values.into_iter().enumerate() {
             assert_eq!(&expected_value, &*values[idx].read());

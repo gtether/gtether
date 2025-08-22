@@ -83,7 +83,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-
+use ahash::HashMap;
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::DependencyGraph;
 use crate::resource::manager::executor::ManagerExecutor;
@@ -205,6 +205,7 @@ impl<'ctx, T: ?Sized + Send + Sync + 'static> Future for ResourceFuture<'ctx, T>
             if let Ok(resource) = &result {
                 if let Some(ctx) = self.ctx {
                     ctx.add_dependency(resource.id().clone());
+                    ctx.cache_resource(resource.clone());
                 }
             }
         }
@@ -349,6 +350,7 @@ impl ResourceManager {
                 loader: Arc::new(loader),
                 priority: load_priority.into(),
                 parents: vec![],
+                resource_cache: Arc::new(RwLock::new(HashMap::default())),
                 operation: ResourceLoadOperation::Load,
             },
         );

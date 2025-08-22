@@ -56,6 +56,10 @@ impl From<LoadPriority> for TaskPriority {
     }
 }
 
+// This exists primarily to keep duplicate loads from expiring during complex
+// load dependency trees
+pub type ResourceLoadContextCache = HashMap<ResourceId, Arc<dyn Any + Send + Sync + 'static>>;
+
 /// Contextual data for loading [Resources](Resource).
 ///
 /// This is created by the [ResourceManager], and passed to resource
@@ -66,6 +70,7 @@ pub struct ResourceLoadContext {
     id: ResourceId,
     priority: TaskPriority,
     dependencies: RwLock<DependencyGraphLayer>,
+    resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
 }
 
 impl ResourceLoadContext {
@@ -74,6 +79,7 @@ impl ResourceLoadContext {
         id: ResourceId,
         priority: TaskPriority,
         parents: impl IntoIterator<Item=ResourceId>,
+        resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
     ) -> Self {
         let dependencies = DependencyGraphLayer::new(id.clone(), parents);
         Self {
@@ -81,6 +87,7 @@ impl ResourceLoadContext {
             id,
             priority,
             dependencies: RwLock::new(dependencies),
+            resource_cache,
         }
     }
 
@@ -97,6 +104,17 @@ impl ResourceLoadContext {
     #[inline]
     pub fn add_dependency(&self, id: impl Into<ResourceId>) {
         self.dependencies.write().insert(id.into());
+    }
+
+    #[inline]
+    pub(in crate::resource) fn cache_resource<T>(&self, resource: Arc<Resource<T>>)
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        self.resource_cache.write().insert(
+            resource.id().clone(),
+            resource as Arc<dyn Any + Send + Sync + 'static>,
+        );
     }
 
     /// Spawn a new async task on the ResourceManager's executor.
@@ -163,6 +181,7 @@ impl ResourceLoadContext {
                     loader: Arc::new(loader),
                     priority: self.priority,
                     parents,
+                    resource_cache: self.resource_cache.clone(),
                     operation: ResourceLoadOperation::Load,
                 }
             );
@@ -177,6 +196,7 @@ pub struct ResourceLoadParams<T: ?Sized + Send + Sync + 'static> {
     pub loader: Arc<dyn ResourceLoader<T>>,
     pub priority: TaskPriority,
     pub parents: Vec<ResourceId>,
+    pub resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
     pub operation: ResourceLoadOperation,
 }
 
@@ -515,6 +535,7 @@ impl CacheEntry {
                     loader: loader.clone(),
                     priority: TaskPriority::Update,
                     parents: vec![], // TODO: Do parents need to be set for updates?
+                    resource_cache: Arc::new(RwLock::new(HashMap::default())),
                     operation: ResourceLoadOperation::Update,
                 },
                 None,
@@ -851,6 +872,7 @@ impl Cache {
                         id.clone(),
                         load_params.priority,
                         load_params.parents,
+                        load_params.resource_cache.clone(),
                     );
 
                     match load_params.loader.load(data.data, &ctx).await {
@@ -1115,6 +1137,7 @@ mod tests {
             load_info: TestLoadInfo::new("a", TestRefLoader::new(TestResLoader::new("b"))),
             expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec!["value"])),
         }],
+        2,
     )]
     #[case::linear(
         DependencyGraph::builder().add("a", ["b"]).add("b", ["c"]).build(),
@@ -1128,6 +1151,7 @@ mod tests {
                 ExpectedResourceRef::new(vec!["value"]),
             ])),
         }],
+        3,
     )]
     #[case::tree(
         DependencyGraph::builder()
@@ -1161,6 +1185,23 @@ mod tests {
                 ])),
             },
         ],
+        7,
+    )]
+    #[case::diamond(
+        DependencyGraph::builder()
+            .add("a", ["b1", "b2", "b3"])
+            .add("b1", ["c"]).add("b2", ["c"]).add("b3", ["c"])
+            .build(),
+        [TestDataEntry::new("c", b"value", "h_c")],
+        [ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("a", TestResChainLoader::default()),
+            expected: ExpectedLoadResult::Ok(vec![
+                "a:b1:c:value",
+                "a:b2:c:value",
+                "a:b3:c:value",
+            ]),
+        }],
+        6, // TestResChainLoader attempts to load 'value' as well, generating an extra load count
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_dependencies<T, L, A>(
@@ -1168,6 +1209,7 @@ mod tests {
         #[case] expected_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
         #[case] expected_entries: impl IntoIterator<Item=ExpectedLoadInfo<T, L, A>>,
+        #[case] expected_load_count: usize,
     )
     where
         T: Debug + Send + Sync + 'static,
@@ -1190,6 +1232,7 @@ mod tests {
             ).await;
             values.push(entry.expected.assert_matches(result));
         }
+        manager.test_ctx().sync_load.assert_count(expected_load_count);
 
         assert_eq!(&*manager.dependencies.read(), &expected_graph);
 
