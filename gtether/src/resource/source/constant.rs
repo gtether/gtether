@@ -2,11 +2,18 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use ahash::HashSet;
+use parking_lot::Mutex;
 
 use crate::resource::id::ResourceId;
-use crate::resource::source::{ResourceData, ResourceDataSource, ResourceSourceBuilder, ResourceUpdater};
+use crate::resource::source::{NoOpResourceUpdater, ResourceData, ResourceDataSource, ResourceUpdate, ResourceUpdater};
 use crate::resource::source::{ResourceDataResult, ResourceSource, SourceIndex};
 use crate::resource::ResourceLoadError;
+
+struct State {
+    updater: Box<dyn ResourceUpdater>,
+    watches: HashSet<ResourceId>,
+}
 
 /// [ResourceSource][rs] that contains static global data.
 ///
@@ -17,6 +24,7 @@ use crate::resource::ResourceLoadError;
 /// [rs]: ResourceSource
 pub struct ConstantResourceSource {
     raw: HashMap<ResourceId, (&'static [u8], String)>,
+    state: Mutex<State>,
 }
 
 impl ConstantResourceSource {
@@ -30,7 +38,13 @@ impl ConstantResourceSource {
     /// [smod]: super#data-hashing
     #[inline]
     pub fn new(raw: HashMap<ResourceId, (&'static [u8], String)>) -> Self {
-        Self { raw }
+        Self {
+            raw,
+            state: Mutex::new(State {
+                updater: NoOpResourceUpdater::new(),
+                watches: HashSet::default(),
+            }),
+        }
     }
 
     /// Create a ConstantResourceSourceBuilder, used to build a ConstantResourceSource.
@@ -60,12 +74,38 @@ impl ResourceSource for ConstantResourceSource {
         }
     }
 
-    fn watch(&self, _id: ResourceId, _sub_idx: Option<SourceIndex>) {
-        // Noop because constant data can't change
+    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
+        let mut state = self.state.lock();
+
+        let mut update = HashMap::default();
+        for id in &state.watches {
+            if self.raw.contains_key(id) {
+                update.insert(id.clone(), ResourceUpdate::Removed);
+            }
+        }
+        if !update.is_empty() {
+            state.updater.notify_update(update.into());
+        }
+
+        state.updater = updater;
+        state.watches = watches;
+        let mut update = HashMap::default();
+        for id in &state.watches {
+            if let Some((_, hash)) = self.raw.get(id) {
+                update.insert(id.clone(), ResourceUpdate::Added(hash.clone()));
+            }
+        }
+        if !update.is_empty() {
+            state.updater.notify_update(update.into());
+        }
     }
 
-    fn unwatch(&self, _id: &ResourceId) {
-        // Noop because constant data can't change
+    fn watch(&self, id: ResourceId, _sub_idx: Option<SourceIndex>) {
+        self.state.lock().watches.insert(id);
+    }
+
+    fn unwatch(&self, id: &ResourceId) {
+        self.state.lock().watches.remove(id);
     }
 }
 
@@ -97,11 +137,9 @@ impl ConstantResourceSourceBuilder {
         self.raw.insert(id.into(), (data, hash));
         self
     }
-}
 
-impl ResourceSourceBuilder for ConstantResourceSourceBuilder {
-    fn build(self: Box<Self>, _updater: Box<dyn ResourceUpdater>) -> Box<dyn ResourceSource> {
-        // Constant data can't change
-        Box::new(ConstantResourceSource::new(self.raw))
+    #[inline]
+    pub fn build(self) -> ConstantResourceSource {
+        ConstantResourceSource::new(self.raw)
     }
 }

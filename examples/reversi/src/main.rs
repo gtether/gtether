@@ -40,7 +40,8 @@ fn main() {
         .source(ConstantResourceSource::builder()
             .resource("console_font", include_bytes!("../assets/RobotoMono/RobotoMono-VariableFont_wght.ttf"))
             .resource("tile.obj", include_bytes!("../assets/tile.obj"))
-            .resource("piece.obj", include_bytes!("../assets/piece.obj")))
+            .resource("piece.obj", include_bytes!("../assets/piece.obj"))
+            .build())
         .build();
 
     EngineBuilder::new()

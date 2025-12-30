@@ -1,0 +1,562 @@
+//! [ResourceSource] that dynamically wraps a changing set of sub-sources.
+//!
+//! The [ResourceSourceDynamic] found in this module allows dynamically changing the set of resource
+//! sources at runtime. This is useful for when e.g. a user connects to a server that provides its
+//! own resources, or otherwise interacts in a way that changes the set of resource sources.
+//!
+//! Mutating the sources of a [ResourceSourceDynamic] occurs through the cheaply cloneable [handle]
+//! that can be [retrieved from a dynamic source](ResourceSourceDynamic::handle).
+
+use ahash::HashSet;
+use async_trait::async_trait;
+use educe::Educe;
+use parking_lot::RwLock;
+use std::iter::FusedIterator;
+use std::ops::Deref;
+use std::sync::Arc;
+
+use crate::resource::id::ResourceId;
+use crate::resource::source::{NoOpResourceUpdater, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdater, SourceIndex};
+use crate::resource::ResourceLoadError;
+
+/// Iterator over the sources in [ResourceSourceDynamicState].
+#[derive(Educe)]
+#[educe(Clone)]
+pub struct Iter<'a, S: ResourceSource> {
+    inner: std::slice::Iter<'a, (S, HashSet<ResourceId>)>,
+}
+
+impl<'a, S: ResourceSource> Iterator for Iter<'a, S> {
+    type Item = &'a S;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|v| &v.0)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, S: ResourceSource> DoubleEndedIterator for Iter<'a, S> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|v| &v.0)
+    }
+}
+
+impl<'a, S: ResourceSource> ExactSizeIterator for Iter<'a, S> {}
+impl<'a, S: ResourceSource> FusedIterator for Iter<'a, S> {}
+
+/// Mutable state of a [ResourceSourceDynamic].
+///
+/// This is where direct mutation of the sources used in a [ResourceSourceDynamic] occurs.
+pub struct ResourceSourceDynamicState<S: ResourceSource> {
+    sources: Vec<(S, HashSet<ResourceId>)>,
+    updater: Box<dyn ResourceUpdater>,
+}
+
+impl<S: ResourceSource> ResourceSourceDynamicState<S> {
+    fn adjust_updaters(&mut self, start_idx: usize) {
+        for idx in start_idx..self.sources.len() {
+            self.sources[idx].0.set_updater(
+                self.updater.clone_with_sub_index(idx.into()),
+                self.sources[idx].1.clone(),
+            );
+        }
+    }
+
+    /// Returns the number of sources in the collection.
+    ///
+    /// See also: [`Vec::len()`].
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Returns an iterator over the sources.
+    ///
+    /// See also: [`Vec::iter()`].
+    #[inline]
+    pub fn iter(&self) -> Iter<'_, S> {
+        Iter {
+            inner: self.sources.iter(),
+        }
+    }
+
+    /// Inserts a source at position `idx`, shifting all sources after it to the right.
+    ///
+    /// See also: [`Vec::insert()`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` > `len`.
+    #[inline]
+    pub fn insert(&mut self, idx: usize, source: S) {
+        let new_watches = match self.sources.get(idx) {
+            // Inserted sources should copy the watches of the next lowest priority
+            Some((_, watches)) => watches.clone(),
+            None => HashSet::default(),
+        };
+        self.sources.insert(idx, (source, new_watches));
+        self.adjust_updaters(idx);
+    }
+
+    /// Appends a source to the back of the collection.
+    ///
+    /// See also: [`Vec::push()`].
+    #[inline]
+    pub fn push(&mut self, source: S) {
+        self.sources.push((source, HashSet::default()));
+        self.adjust_updaters(self.sources.len() - 1);
+    }
+
+    /// Removes the source at position `idx`, shifting all sources after it to the left.
+    ///
+    /// See also: [`Vec::remove()`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of bounds.
+    #[inline]
+    pub fn remove(&mut self, idx: usize) -> S {
+        let (source, _) = self.sources.remove(idx);
+        source.set_updater(NoOpResourceUpdater::new(), HashSet::default());
+        if idx < self.sources.len() {
+            self.adjust_updaters(idx);
+        }
+        source
+    }
+}
+
+impl ResourceSourceDynamicState<Box<dyn ResourceSource>> {
+    /// Inserts a source dynamically.
+    ///
+    /// See [`Self::insert()`] for more.
+    #[inline]
+    pub fn insert_dyn(&mut self, idx: usize, source: impl ResourceSource) {
+        self.insert(idx, Box::new(source))
+    }
+
+    /// Appends a source dynamically.
+    ///
+    /// See [`Self::push()`] for more.
+    #[inline]
+    pub fn push_dyn(&mut self, source: impl ResourceSource) {
+        self.push(Box::new(source))
+    }
+}
+
+/// Handle to a [ResourceSourceDynamic] that allows modification of the underlying resource sources.
+///
+/// This dereferences to a `RwLock` around [ResourceSourceDynamicState], so see that struct for more
+/// information.
+///
+/// This handle is cheaply cloneable (it just clones the `Arc<>` it wraps).
+#[derive(Educe)]
+#[educe(Clone)]
+pub struct ResourceSourceDynamicHandle<S: ResourceSource>(Arc<RwLock<ResourceSourceDynamicState<S>>>);
+
+impl<S: ResourceSource> Deref for ResourceSourceDynamicHandle<S> {
+    type Target = RwLock<ResourceSourceDynamicState<S>>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// [ResourceSource] that contains a dynamic sub-set of resource sources.
+///
+/// See [module-level](super::dynamic) documentation for more.
+pub struct ResourceSourceDynamic<S: ResourceSource = Box<dyn ResourceSource>> {
+    state: Arc<RwLock<ResourceSourceDynamicState<S>>>,
+}
+
+impl<S: ResourceSource> Default for ResourceSourceDynamic<S> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(ResourceSourceDynamicState {
+                sources: Vec::new(),
+                updater: NoOpResourceUpdater::new(),
+            }))
+        }
+    }
+}
+
+impl<S: ResourceSource> ResourceSourceDynamic<S> {
+    /// Get a reference to the [handle](ResourceSourceDynamicHandle) that allows modifying the
+    /// underlying resource sources.
+    #[inline]
+    pub fn handle(&self) -> ResourceSourceDynamicHandle<S> {
+        ResourceSourceDynamicHandle(self.state.clone())
+    }
+}
+
+#[async_trait]
+impl<S: ResourceSource> ResourceSource for ResourceSourceDynamic<S> {
+    fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
+        let state = self.state.read();
+        for (idx, (source, _)) in state.sources.iter().enumerate() {
+            match source.hash(id) {
+                Some(s) => return Some(s.wrap(idx)),
+                None => continue,
+            }
+        }
+        None
+    }
+
+    async fn load(&self, id: &ResourceId) -> ResourceDataResult {
+        let state = self.state.read();
+        for (idx, (source, _)) in state.sources.iter().enumerate() {
+            match source.load(id).await {
+                Ok(data) => return Ok(data.wrap(idx)),
+                Err(ResourceLoadError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ResourceLoadError::NotFound(id.clone()))
+    }
+
+    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, new_watches: HashSet<ResourceId>) {
+        let mut state = self.state.write();
+        for (idx, (source, watches)) in state.sources.iter_mut().enumerate() {
+            *watches = new_watches.clone();
+            source.set_updater(updater.clone_with_sub_index(idx.into()), watches.clone());
+        }
+        state.updater = updater;
+    }
+
+    fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
+        let mut state = self.state.write();
+        let sub_idx = sub_idx.unwrap_or(SourceIndex::new(state.sources.len()));
+        for (idx, (source, watches)) in state.sources.iter_mut().enumerate() {
+            if idx <= sub_idx.idx() {
+                watches.insert(id.clone());
+                source.watch(id.clone(), sub_idx.sub_idx().cloned());
+            } else {
+                watches.remove(&id);
+                source.unwatch(&id);
+            }
+        }
+    }
+
+    fn unwatch(&self, id: &ResourceId) {
+        let mut state = self.state.write();
+        for (source, watches) in &mut state.sources {
+            watches.remove(id);
+            source.unwatch(id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use macro_rules_attribute::apply;
+    use rstest::{fixture, rstest};
+    use smol_macros::test as smol_test;
+    use test_log::test as test_log;
+
+    use crate::resource::manager::tests::{timeout, ExpectedDataEntry, ExpectedLoadResult, TestDataEntry, TestResLoader, TestResourceSource};
+    use crate::resource::manager::ResourceManager;
+
+    #[fixture]
+    fn dynamic_resource_manager<S: ResourceSource>() -> (
+        Arc<ResourceManager>,
+        ResourceSourceDynamicHandle<S>,
+    ) {
+        let source = ResourceSourceDynamic::default();
+        let handle = source.handle();
+
+        let manager = ResourceManager::builder()
+            .source(source)
+            .build();
+
+        (manager, handle)
+    }
+
+    async fn assert_manager_load(
+        manager: &Arc<ResourceManager>,
+        key: &str,
+        expected_load_result: ExpectedLoadResult<String>,
+        load_count: usize,
+    ) {
+        let fut = {
+            let _lock = manager.test_ctx().sync_load.block().await;
+            let fut = manager.get_with_loader(key, TestResLoader::new(key));
+            fut.check().expect_err("Resource should not be loaded yet")
+        };
+
+        let result = fut.await;
+        // Hold a reference to keep possibly loaded values from expiring
+        let _maybe_value = expected_load_result.assert_matches(result);
+        manager.test_ctx().sync_load.assert_count(load_count);
+
+        let result = manager.get_with_loader(key, TestResLoader::new(key))
+            .check()
+            .expect("Result should be cached and pollable");
+        expected_load_result.assert_matches(result);
+        // No extra loads should have been made
+        manager.test_ctx().sync_load.assert_count(load_count);
+    }
+
+    #[rstest]
+    #[case::not_found("key", ExpectedLoadResult::NotFound(ResourceId::from("key")))]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_dynamic_load_no_sources(
+        #[from(dynamic_resource_manager)] (manager, _handle): (
+            Arc<ResourceManager>,
+            ResourceSourceDynamicHandle<Box<dyn ResourceSource>>,
+        ),
+        #[case] key: &str,
+        #[case] expected_load_result: ExpectedLoadResult<String>,
+    ) {
+        assert_manager_load(&manager, key, expected_load_result, 1).await;
+    }
+
+    #[rstest]
+    #[case::not_found("key", None, ExpectedLoadResult::NotFound(ResourceId::from("key")))]
+    #[case::ok("key", Some(TestDataEntry::new("key", b"value", "h_value")), ExpectedLoadResult::Ok("value".to_string()))]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_dynamic_load_insert_source_then_data(
+        #[from(dynamic_resource_manager)] (manager, handle): (
+            Arc<ResourceManager>,
+            ResourceSourceDynamicHandle<Box<dyn ResourceSource>>,
+        ),
+        #[case] key: &str,
+        #[case] start_data: Option<TestDataEntry>,
+        #[case] expected_load_result: ExpectedLoadResult<String>,
+    ) {
+        let (source, data_map) = TestResourceSource::new();
+        handle.write().push_dyn(source);
+
+        if let Some(start_data) = start_data {
+            data_map.lock().insert(start_data.id, start_data.data, start_data.hash);
+        }
+
+        assert_manager_load(&manager, key, expected_load_result, 1).await;
+    }
+
+    #[rstest]
+    #[case::not_found("key", None, ExpectedLoadResult::NotFound(ResourceId::from("key")))]
+    #[case::ok("key", Some(TestDataEntry::new("key", b"value", "h_value")), ExpectedLoadResult::Ok("value".to_string()))]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_dynamic_load_insert_data_then_source(
+        #[from(dynamic_resource_manager)] (manager, handle): (
+            Arc<ResourceManager>,
+            ResourceSourceDynamicHandle<Box<dyn ResourceSource>>,
+        ),
+        #[case] key: &str,
+        #[case] start_data: Option<TestDataEntry>,
+        #[case] expected_load_result: ExpectedLoadResult<String>,
+    ) {
+        let (source, data_map) = TestResourceSource::new();
+
+        if let Some(start_data) = start_data {
+            data_map.lock().insert(start_data.id, start_data.data, start_data.hash);
+        }
+
+        handle.write().push_dyn(source);
+
+        assert_manager_load(&manager, key, expected_load_result, 1).await;
+    }
+
+    #[rstest]
+    #[case::lower_priority_value_to_value(
+        false, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::ok_new("key")),
+    )]
+    #[case::lower_priority_value_to_error(
+        false, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::read_error_new("key")),
+    )]
+    #[case::lower_priority_value_to_none(
+        false, ExpectedDataEntry::ok("key"), None,
+    )]
+    #[case::lower_priority_error_to_value(
+        false, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::ok_new("key")),
+    )]
+    #[case::lower_priority_error_to_error(
+        false, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::read_error_new("key")),
+    )]
+    #[case::lower_priority_error_to_none(
+        false, ExpectedDataEntry::read_error("key"), None,
+    )]
+    #[case::higher_priority_value_to_value(
+        true, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::ok_new("key")),
+    )]
+    #[case::higher_priority_value_to_error(
+        true, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::read_error_new("key")),
+    )]
+    #[case::higher_priority_value_to_none(
+        true, ExpectedDataEntry::ok("key"), None,
+    )]
+    #[case::higher_priority_error_to_value(
+        true, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::ok_new("key")),
+    )]
+    #[case::higher_priority_error_to_error(
+        true, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::read_error_new("key")),
+    )]
+    #[case::higher_priority_error_to_none(
+        true, ExpectedDataEntry::read_error("key"), None,
+    )]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_dynamic_update_insert(
+        #[from(dynamic_resource_manager)] (manager, handle): (
+            Arc<ResourceManager>,
+            ResourceSourceDynamicHandle<Box<dyn ResourceSource>>,
+        ),
+        #[case] insert_before: bool,
+        #[case] start: ExpectedDataEntry<String>,
+        #[case] end: Option<ExpectedDataEntry<String>>,
+    ) {
+        let (main_source, main_data_map) = TestResourceSource::new();
+        main_data_map.lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
+        handle.write().push_dyn(main_source);
+
+        let (new_source, new_data_map) = TestResourceSource::new();
+        let end = end.map(|end| {
+            new_data_map.lock().insert(end.entry.id.clone(), end.entry.data, end.entry.hash);
+            (end.entry.id, end.expected)
+        });
+
+        main_data_map.assert_watch(start.entry.id.clone(), false);
+        let result = manager.get_with_loader(
+            start.entry.id.clone(),
+            TestResLoader::new(start.entry.id.clone()),
+        ).await;
+        let value = start.expected.assert_matches(result);
+        main_data_map.assert_watch(start.entry.id.clone(), true);
+        manager.test_ctx().sync_update.assert_count(0);
+
+        {
+            let _lock = manager.test_ctx().sync_update.block().await;
+            if insert_before {
+                handle.write().insert_dyn(0, new_source);
+            } else {
+                handle.write().push_dyn(new_source);
+            }
+            if let ExpectedLoadResult::Ok(expected_value) = &start.expected {
+                let value = value.as_ref().unwrap();
+                assert_eq!(&*value.read(), expected_value);
+            }
+        }
+
+        if insert_before {
+            timeout(
+                manager.test_ctx().sync_update.wait_attempts(1),
+                Duration::from_millis(500),
+            ).await;
+
+            if let Some((end_id, end_expected)) = end {
+                match end_expected {
+                    ExpectedLoadResult::Ok(expected_value) => {
+                        match value {
+                            Some(value) => {
+                                manager.test_ctx().sync_update.assert_count(1);
+                                assert_eq!(*value.read(), expected_value.to_owned());
+                            },
+                            None => {
+                                manager.test_ctx().sync_update.assert_count(0);
+                                let value = manager.get_with_loader(
+                                    end_id.clone(),
+                                    TestResLoader::new(end_id.clone()),
+                                ).await.expect(&format!("Resource should load for '{:#?}'", &end_id));
+                                assert_eq!(*value.read(), expected_value.to_owned());
+                            },
+                        }
+                        new_data_map.assert_watch(end_id.clone(), true);
+                        main_data_map.assert_watch(end_id.clone(), false);
+                    },
+                    ExpectedLoadResult::NotFound(_) => unimplemented!(),
+                    ExpectedLoadResult::ReadErr => {
+                        match start.expected {
+                            ExpectedLoadResult::Ok(expected_value) => {
+                                manager.test_ctx().sync_update.assert_count(1);
+                                let value = value.as_ref().unwrap();
+                                assert_eq!(*value.read(), expected_value);
+                                new_data_map.assert_watch(end_id.clone(), true);
+                                main_data_map.assert_watch(end_id.clone(), true);
+                            },
+                            ExpectedLoadResult::NotFound(_) => unimplemented!(),
+                            ExpectedLoadResult::ReadErr => {
+                                manager.test_ctx().sync_update.assert_count(0);
+                                manager.get_with_loader(
+                                    end_id.clone(),
+                                    TestResLoader::new(end_id.clone()),
+                                ).await.expect_err(&format!("Resource should fail to load for '{:#?}'", &end_id));
+                                new_data_map.assert_watch(end_id.clone(), true);
+                                main_data_map.assert_watch(end_id.clone(), false);
+                            },
+                        }
+                    },
+                }
+            } else {
+                match start.expected {
+                    // An update is still triggered because the original data moved source indices
+                    ExpectedLoadResult::Ok(_) => manager.test_ctx().sync_update.assert_count(1),
+                    _ => manager.test_ctx().sync_update.assert_count(0),
+                }
+                new_data_map.assert_watch(start.entry.id.clone(), true);
+                main_data_map.assert_watch(start.entry.id.clone(), true);
+            }
+        } else {
+            // Nothing to await on
+            manager.test_ctx().sync_update.assert_count(0);
+            new_data_map.assert_watch(start.entry.id.clone(), false);
+            main_data_map.assert_watch(start.entry.id.clone(), true);
+        }
+    }
+
+    #[rstest]
+    #[case::source_0(0, "value_1", 1, 1, [None, Some(true), Some(false), Some(false)])]
+    #[case::source_1(1, "value_2", 1, 1, [Some(true), None, Some(true), Some(false)])]
+    #[case::source_2(2, "value_1", 0, 0, [Some(true), Some(true), None, Some(false)])]
+    #[case::source_3(3, "value_1", 0, 0, [Some(true), Some(true), Some(false), None])]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_dynamic_update_remove(
+        #[from(dynamic_resource_manager)] (manager, handle): (
+            Arc<ResourceManager>,
+            ResourceSourceDynamicHandle<Box<dyn ResourceSource>>,
+        ),
+        #[case] remove_idx: usize,
+        #[case] expected_value: &str,
+        #[case] wait_update_attempts: usize,
+        #[case] expected_update_count: usize,
+        #[case] expected_watches: [Option<bool>; 4],
+    ) {
+        let data_maps = core::array::from_fn::<_, 4, _>(|_| {
+            let (source, data_map) = TestResourceSource::new();
+            handle.write().push_dyn(source);
+            data_map
+        });
+
+        data_maps[1].lock().insert("key", b"value_1", "h_value_1");
+        data_maps[2].lock().insert("key", b"value_2", "h_value_2");
+
+        let value = manager.get_with_loader("key", TestResLoader::new("key")).await
+            .expect("resource should load");
+        assert_eq!(*value.read(), "value_1".to_owned());
+        manager.test_ctx().sync_update.assert_count(0);
+
+        handle.write().remove(remove_idx);
+
+        timeout(
+            manager.test_ctx().sync_update.wait_attempts(wait_update_attempts),
+            Duration::from_millis(500),
+        ).await;
+        manager.test_ctx().sync_update.assert_count(expected_update_count);
+
+        assert_eq!(*value.read(), expected_value.to_owned());
+
+        for (idx, expected_watch) in expected_watches.into_iter().enumerate() {
+            if let Some(expected_watch) = expected_watch {
+                data_maps[idx].assert_watch("key", expected_watch);
+            }
+        }
+    }
+}

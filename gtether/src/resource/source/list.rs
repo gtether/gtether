@@ -1,8 +1,9 @@
+use ahash::HashSet;
 use async_trait::async_trait;
 
 use crate::resource::id::ResourceId;
 use crate::resource::source::{ResourceDataResult, ResourceSource, SourceIndex};
-use crate::resource::source::{ResourceDataSource, ResourceSourceBuilder, ResourceUpdater};
+use crate::resource::source::{ResourceDataSource, ResourceUpdater};
 use crate::resource::ResourceLoadError;
 
 /// [ResourceSource][rs] that wraps multiple sub-sources.
@@ -11,20 +12,20 @@ use crate::resource::ResourceLoadError;
 /// top-layer source, which can be useful for structuring many nested layers of sources and adapters.
 ///
 /// [rs]: ResourceSource
-pub struct ResourceSourceList {
-    sources: Vec<Box<dyn ResourceSource>>,
+pub struct ResourceSourceList<S: ResourceSource> {
+    sources: Vec<S>,
 }
 
-impl ResourceSourceList {
-    /// Create a new ResourceSourceList builder.
-    #[inline]
-    pub fn builder() -> ResourceSourceListBuilder {
-        ResourceSourceListBuilder::default()
+impl<S: ResourceSource> FromIterator<S> for ResourceSourceList<S> {
+    fn from_iter<T: IntoIterator<Item=S>>(iter: T) -> Self {
+        Self {
+            sources: iter.into_iter().collect(),
+        }
     }
 }
 
 #[async_trait]
-impl ResourceSource for ResourceSourceList {
+impl<S: ResourceSource> ResourceSource for ResourceSourceList<S> {
     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
         for (idx, source) in self.sources.iter().enumerate() {
             match source.hash(id) {
@@ -57,6 +58,12 @@ impl ResourceSource for ResourceSourceList {
         }
     }
 
+    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
+        for (idx, source) in self.sources.iter().enumerate() {
+            source.set_updater(updater.clone_with_sub_index(idx.into()), watches.clone());
+        }
+    }
+
     fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
         let sub_idx = sub_idx.unwrap_or(SourceIndex::new(self.sources.len()));
         for (idx, source) in self.sources.iter().enumerate() {
@@ -78,50 +85,11 @@ impl ResourceSource for ResourceSourceList {
     }
 }
 
-#[derive(Default)]
-pub struct ResourceSourceListBuilder {
-    builders: Vec<Box<dyn ResourceSourceBuilder>>,
-}
-
-impl ResourceSourceListBuilder {
-    #[inline]
-    pub fn source(mut self, source: impl ResourceSourceBuilder) -> Self {
-        self.builders.push(Box::new(source));
-        self
-    }
-}
-
-impl<II> From<II> for ResourceSourceListBuilder
-where
-    II: IntoIterator<Item=Box<dyn ResourceSourceBuilder>>,
-{
-    #[inline]
-    fn from(value: II) -> Self {
-        Self {
-            builders: value.into_iter().collect(),
-        }
-    }
-}
-
-impl ResourceSourceBuilder for ResourceSourceListBuilder {
-    fn build(self: Box<Self>, updater: Box<dyn ResourceUpdater>) -> Box<dyn ResourceSource> {
-        let sources = self.builders.into_iter().enumerate()
-            .map(|(idx, builder)| {
-                builder.build(updater.clone_with_sub_index(idx.into()))
-            })
-            .collect();
-        Box::new(ResourceSourceList {
-            sources,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use macro_rules_attribute::apply;
-    use parking_lot::Mutex;
     use rstest::{fixture, rstest};
     use smol_macros::test as smol_test;
     use std::sync::Arc;
@@ -133,22 +101,14 @@ mod tests {
 
     #[fixture]
     fn list_resource_manager<const N: usize>() -> (Arc<ResourceManager>, [Arc<ResourceDataMap>; N]) {
-        let data_maps = core::array::from_fn::<_, N, _>(|_| Arc::new(Mutex::new(None)));
+        let tuples = core::array::from_fn::<_, N, _>(|_| TestResourceSource::new());
+        let data_maps = core::array::from_fn::<_, N, _>(|idx| tuples[idx].1.clone());
 
-        let mut builder = ResourceSourceList::builder();
-        for data_map_lock in &data_maps {
-            let data_map_lock = data_map_lock.clone();
-            builder = builder.source(move |updater| {
-                let (source, data_map) = TestResourceSource::new(updater);
-                *data_map_lock.lock() = Some(data_map);
-                source
-            });
-        }
+        let source = ResourceSourceList::from_iter(tuples.into_iter().map(|t| t.0));
+
         let manager = ResourceManager::builder()
-            .source(builder)
+            .source(source)
             .build();
-
-        let data_maps = data_maps.map(|lock| lock.lock().take().unwrap());
 
         (manager, data_maps)
     }
