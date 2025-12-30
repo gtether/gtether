@@ -215,7 +215,7 @@ impl fmt::Debug for InputDelegate {
 impl InputDelegate {
     /// Get an iterator for all [InputDelegateEvent]s that have happened since events were last
     /// polled.
-    pub fn events(&self) -> InputDelegateIter {
+    pub fn events(&self) -> InputDelegateIter<'_> {
         InputDelegateIter {
             inner: self
         }

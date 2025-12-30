@@ -140,7 +140,7 @@ impl ResourceLoadContext {
     pub fn get<T>(
         &self,
         id: impl Into<ResourceId>,
-    ) -> ResourceFuture<T>
+    ) -> ResourceFuture<'_, T>
     where
         T: ResourceDefaultLoader,
     {
@@ -156,7 +156,7 @@ impl ResourceLoadContext {
         &self,
         id: impl Into<ResourceId>,
         loader: impl ResourceLoader<T>,
-    ) -> ResourceFuture<T>
+    ) -> ResourceFuture<'_, T>
     where
         T: ?Sized + Send + Sync + 'static,
     {

@@ -130,7 +130,7 @@ impl DependencyGraph {
     /// assert_eq!(graph.get(&id_b).unwrap().id(), &id_b);
     /// assert_eq!(graph.get(&id_c), None);
     /// ```
-    pub fn get(&self, id: &ResourceId) -> Option<DependencyNode> {
+    pub fn get(&self, id: &ResourceId) -> Option<DependencyNode<'_>> {
         if let Some((id, _)) = self.dependencies.get_key_value(id) {
             Some(DependencyNode {
                 graph: self,
@@ -167,7 +167,7 @@ impl DependencyGraph {
     /// assert_eq!(ids, expected_ids);
     /// ```
     #[inline]
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Iter<'_> {
         Iter {
             graph: self,
             inner: self.dependencies.keys(),

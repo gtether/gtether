@@ -432,7 +432,7 @@ impl ResourceManager {
     ///
     /// See the [dependency module](dependency) for more.
     #[inline]
-    pub fn dependencies(&self) -> RwLockReadGuard<DependencyGraph> {
+    pub fn dependencies(&self) -> RwLockReadGuard<'_, DependencyGraph> {
         self.dependencies.read()
     }
 

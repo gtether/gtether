@@ -99,7 +99,7 @@ impl BoardController {
     }
 
     #[inline]
-    pub fn board(&self) -> MappedRwLockReadGuard<BoardState> {
+    pub fn board(&self) -> MappedRwLockReadGuard<'_, BoardState> {
         RwLockReadGuard::map(
             self.state.read(),
             |state| &state.board
