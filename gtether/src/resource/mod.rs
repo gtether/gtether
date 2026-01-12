@@ -239,7 +239,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     ) -> ResourceLoadResult<S> {
         let sub_value = loader.load(&self.read()).await?;
         let mut sub_resources = self.sub_resources.lock().await;
-        let sub_id = self.id.join(format!("<sub-{}>", sub_resources.len()));
+        let sub_id = format!("{}/<sub-{}>", self.id, sub_resources.len()).into();
         let sub_resource = Arc::new(Resource::new(sub_id, sub_value));
         sub_resources.push(SubResourceRef::from_sub_resource(&sub_resource, Arc::new(loader)));
         Ok(sub_resource)
