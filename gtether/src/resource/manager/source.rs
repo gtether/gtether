@@ -17,12 +17,9 @@ impl Sources {
     pub fn watch_n(&self, id: &ResourceId, source_idx: &SourceIndex) {
         for (idx, source) in self.inner.iter().enumerate() {
             if idx <= source_idx.idx() {
-                source.watch(
-                    id.clone(),
-                    source_idx.sub_idx().cloned(),
-                );
+                source.watcher().watch(id.clone(), source_idx.sub_idx().cloned());
             } else {
-                source.unwatch(id);
+                source.watcher().unwatch(id);
             }
         }
     }

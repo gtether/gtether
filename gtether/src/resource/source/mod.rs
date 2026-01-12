@@ -25,17 +25,20 @@
 //! If a given source does not have data for a given [id][rp], it is expected to output an `Err`
 //! wrapping [ResourceLoadError::NotFound].
 //!
+//! All resource sources should also maintain a [ResourceWatcher], and provide a reference to said
+//! watcher. This is used to keep track of what resources are currently requested from the source.
+//! See the [`watcher`](crate::resource::watcher) module for more.
+//!
 //! An example of a bare minimum source that simply yields the given id as raw bytes:
 //! ```
-//! use ahash::HashSet;
 //! use async_trait::async_trait;
-//! use parking_lot::Mutex;
-//! use smol::io::Cursor;
 //! use gtether::resource::id::ResourceId;
-//! use gtether::resource::source::{ResourceSource, ResourceDataResult, SourceIndex, ResourceData, ResourceDataSource, ResourceUpdater, ResourceUpdate};
+//! use gtether::resource::source::{ResourceData, ResourceDataResult , ResourceDataSource, ResourceSource};
+//! use gtether::resource::watcher::ResourceWatcher;
+//! use smol::io::Cursor;
 //!
 //! struct ReflectingSource {
-//!     updater: Mutex<Option<Box<dyn ResourceUpdater>>>,
+//!     watcher: ResourceWatcher,
 //! }
 //!
 //! #[async_trait]
@@ -55,28 +58,9 @@
 //!         ))
 //!     }
 //!
-//!     fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
-//!         // A reflecting source has all possible requested watches, so notify immediately
-//!         updater.notify_update(watches.into_iter()
-//!             .map(|id| {
-//!                 // The hash can simply be the ID, since the value won't change for the same ID
-//!                 let hash = id.to_string();
-//!                 (id, ResourceUpdate::Added(hash))
-//!             })
-//!             .collect());
-//!         *self.updater.lock() = Some(updater);
+//!     fn watcher(&self) -> &ResourceWatcher {
+//!         &self.watcher
 //!     }
-//!
-//!     fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
-//!         if let Some(updater) = &*self.updater.lock() {
-//!             // The hash can simply be the ID, since the value won't change for the same ID
-//!             let hash = id.to_string();
-//!             // A reflecting source has all possible requested watches, so notify immediately
-//!             updater.notify_update((id, ResourceUpdate::Added(hash)).into())
-//!         }
-//!     }
-//!
-//!     fn unwatch(&self, id: &ResourceId) { /* noop */ }
 //! }
 //! ```
 //!
@@ -87,78 +71,38 @@
 //!
 //! </div>
 //!
-//! Sources that use constant data, such as the above example, do not need to worry about
-//! [watch()][rsw]/[unwatch()][rsu], and can leave them as noop implementations. However, if your
-//! source yields data that can change (i.e. from a file that can be modified), then your source
-//! should implement [watch()][rsw]/[unwatch()][rsu], and store watch state as such. This involves
-//! building your source with a [ResourceUpdater] (see [ResourceSourceBuilder]), which is used to
-//! notify when your source has data updates.
-//!
-//! Example implementing [watch()][rsw]/[unwatch()][rsu]:
-//! ```
-//! use ahash::HashSet;
-//! use async_trait::async_trait;
-//! use std::sync::Mutex;
-//! use gtether::resource::id::ResourceId;
-//! use gtether::resource::source::{ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdater, SourceIndex};
-//!
-//! struct ChangingSource {
-//!     updater: Mutex<Option<Box<dyn ResourceUpdater>>>,
-//!     watches: Mutex<HashSet<ResourceId>>,
-//! }
-//!
-//! impl ChangingSource {
-//!     // call ResourceUpdater::notify_update() when the data changes for an id
-//! }
-//!
-//! #[async_trait]
-//! impl ResourceSource for ChangingSource {
-//!     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
-//!         unimplemented!("Some custom hash retrieval")
-//!     }
-//!
-//!     async fn load(&self, id: &ResourceId) -> ResourceDataResult {
-//!         unimplemented!("Some custom load operation")
-//!     }
-//!
-//!     fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
-//!         // Send ResourceUpdate::Removed notifications for all resources this source can provide
-//!         // that are currently _watched_, to the _old_ updater.
-//!         *self.updater.lock().unwrap() = Some(updater);
-//!         // Send ResourceUpdate::Added notifications for all resources this source can provide
-//!         // that are in the new `watches` collection.
-//!     }
-//!
-//!     fn watch(&self, id: ResourceId, _sub_idx: Option<SourceIndex>) {
-//!         // _sub_idx can be ignored for this implementation
-//!         self.watches.lock().unwrap().insert(id);
-//!     }
-//!
-//!     fn unwatch(&self, id: &ResourceId) {
-//!         self.watches.lock().unwrap().remove(id);
-//!     }
-//! }
-//! ```
-//!
 //! # Implementing a middleware source
 //!
 //! Sometimes it may be useful to implement a middleware source, e.g. when extending the behavior of
-//! another source. In this case, some extra logic may need to be implemented, such as propagating
-//! [watch()][rsw]/[unwatch()][rsu] calls to any sub-sources. Note that all methods should be
-//! passed to sub-sources, including [ResourceSource::sub_load()], even if it's not directly used
-//! by the wrapping source. This ensures any sub-sources can make use of
-//! [ResourceSource::sub_load()], since its default implementation is to defer to
-//! [ResourceSource::load()].
+//! another source. In this case, some extra logic may need to be implemented, such as maintaining
+//! the child watchers for the middleware's watcher. Note that all methods should be passed to
+//! sub-sources, including [ResourceSource::sub_load()], even if it's not directly used by the
+//! wrapping source. This ensures any sub-sources can make use of [ResourceSource::sub_load()],
+//! since its default implementation is to defer to [ResourceSource::load()].
 //!
 //! Example wrapping a single sub-source:
 //! ```
 //! use ahash::HashSet;
 //! use async_trait::async_trait;
 //! use gtether::resource::id::ResourceId;
-//! use gtether::resource::source::{ResourceSource, ResourceDataResult, SourceIndex, ResourceDataSource, ResourceUpdater};
+//! use gtether::resource::source::{ResourceSource, ResourceDataResult, SourceIndex, ResourceDataSource};
+//! use gtether::resource::watcher::ResourceWatcher;
 //!
 //! struct WrapperSource<S: ResourceSource> {
+//!     watcher: ResourceWatcher,
 //!     inner: S,
+//! }
+//!
+//! impl<S: ResourceSource> WrapperSource<S> {
+//!     fn new(source: S) -> Self {
+//!         let watcher = ResourceWatcher::new(());
+//!         // The wrapped source's watcher needs to be added to this source's watcher
+//!         watcher.push_child(source.watcher());
+//!         Self {
+//!             watcher,
+//!             inner: source,
+//!         }
+//!     }
 //! }
 //!
 //! #[async_trait]
@@ -184,16 +128,8 @@
 //!         result
 //!     }
 //!
-//!     fn set_updater(&self, updater: Box<dyn ResourceUpdater>, new_watches: HashSet<ResourceId>) {
-//!         self.inner.set_updater(updater, new_watches)
-//!     }
-//!
-//!     fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
-//!         self.inner.watch(id, sub_idx)
-//!     }
-//!
-//!     fn unwatch(&self, id: &ResourceId) {
-//!         self.inner.unwatch(id)
+//!     fn watcher(&self) -> &ResourceWatcher {
+//!         &self.watcher
 //!     }
 //! }
 //! ```
@@ -208,18 +144,26 @@
 //! use async_trait::async_trait;
 //! use gtether::resource::id::ResourceId;
 //! use gtether::resource::ResourceLoadError;
-//! use gtether::resource::source::{ResourceSource, ResourceData, ResourceDataResult, SourceIndex, ResourceDataSource, ResourceUpdater};
+//! use gtether::resource::source::{ResourceSource, ResourceData, ResourceDataResult, SourceIndex, ResourceDataSource};
+//! use gtether::resource::watcher::ResourceWatcher;
 //!
-//! struct MultiSource { /* inner bits */ }
+//! struct MultiSource<S: ResourceSource> {
+//!     watcher: ResourceWatcher,
+//!     sub_sources: Vec<S>,
+//! }
 //!
-//! impl MultiSource {
-//!     fn sub_sources(&self) -> impl Iterator<Item=(usize, &dyn ResourceSource)> {
-//!         unimplemented!("Iterate over sub-sources");
-//!         # std::iter::empty()
-//!     }
-//!
-//!     fn get_sub_source(&self, sub_idx: &SourceIndex) -> Result<&dyn ResourceSource, ResourceLoadError> {
-//!         unimplemented!("Yield a sub-source")
+//! impl<S: ResourceSource> MultiSource<S> {
+//!     fn new(sub_sources: impl IntoIterator<Item=S>) -> Self {
+//!         let watcher = ResourceWatcher::new(());
+//!         let sub_sources = sub_sources.into_iter().collect::<Vec<_>>();
+//!         for sub_source in &sub_sources {
+//!             // All sub-source watchers need to be added to this source's watcher
+//!             watcher.push_child(sub_source.watcher());
+//!         }
+//!         Self {
+//!             watcher,
+//!             sub_sources,
+//!         }
 //!     }
 //!
 //!     fn find_sub_hash(&self, id: &ResourceId) -> Option<(usize, ResourceDataSource)> {
@@ -232,7 +176,7 @@
 //! }
 //!
 //! #[async_trait]
-//! impl ResourceSource for MultiSource {
+//! impl<S: ResourceSource> ResourceSource for MultiSource<S> {
 //!     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
 //!         let (idx, hash) = self.find_sub_hash(id)?;
 //!         // The inner sub-hash must be wrapped with its sub-sources index
@@ -246,38 +190,16 @@
 //!     }
 //!
 //!     async fn sub_load(&self, id: &ResourceId, sub_idx: &SourceIndex) -> ResourceDataResult {
-//!         let source = self.get_sub_source(sub_idx)?;
+//!         let source = self.sub_sources.get(sub_idx.idx())
+//!             .ok_or(ResourceLoadError::NotFound(id.clone()))?;
 //!         match sub_idx.sub_idx() {
 //!             Some(sub_idx) => source.sub_load(id, sub_idx).await,
 //!             None => source.load(id).await,
 //!         }
 //!     }
 //!
-//!     fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
-//!         for (idx, source) in self.sub_sources() {
-//!             source.set_updater(updater.clone_with_sub_index(idx.into()), watches.clone());
-//!         }
-//!     }
-//!
-//!     fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
-//!         let sub_idx = sub_idx.unwrap_or(SourceIndex::max());
-//!         for (idx, source) in self.sub_sources() {
-//!             if idx <= sub_idx.idx() {
-//!                 // Clone the watcher with relevant sub-indices for each sub-source
-//!                 source.watch(
-//!                     id.clone(),
-//!                     sub_idx.sub_idx().map(|inner| inner.clone()),
-//!                 );
-//!             } else {
-//!                 source.unwatch(&id);
-//!             }
-//!         }
-//!     }
-//!
-//!     fn unwatch(&self, id: &ResourceId) {
-//!         for (_, source) in self.sub_sources() {
-//!             source.unwatch(id);
-//!         }
+//!     fn watcher(&self) -> &ResourceWatcher {
+//!         &self.watcher
 //!     }
 //! }
 //! ```
@@ -306,8 +228,9 @@
 //! [rd]: ResourceReadData
 //! [rp]: ResourceId
 //! [si]: SourceIndex
-//! [rw]: ResourceUpdater
-use ahash::{HashMap, HashSet};
+//! [rw]: ResourceUpdaterTrait
+
+use ahash::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use smol::io::AsyncRead;
@@ -315,6 +238,7 @@ use std::cmp::Ordering;
 use std::fmt::{Debug, Display, Formatter};
 
 use crate::resource::id::ResourceId;
+use crate::resource::watcher::ResourceWatcher;
 use crate::resource::{ResourceLoadError, ResourceReadData};
 
 pub mod constant;
@@ -357,7 +281,7 @@ enum SubIndex {
 /// ```
 ///
 /// [rs]: ResourceSource
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SourceIndex {
     idx: usize,
     sub_idx: SubIndex,
@@ -433,9 +357,38 @@ impl Display for SourceIndex {
     }
 }
 
+impl Debug for SourceIndex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SourceIndex(")?;
+        Display::fmt(self, f)?;
+        write!(f, ")")
+    }
+}
+
 impl From<usize> for SourceIndex {
+    #[inline]
     fn from(value: usize) -> Self {
         Self::new(value)
+    }
+}
+
+impl FromIterator<usize> for SourceIndex {
+    fn from_iter<T: IntoIterator<Item=usize>>(iter: T) -> Self {
+        // need to collect into a vec first so we can reverse it
+        let mut indices = iter.into_iter().collect::<Vec<_>>().into_iter().rev();
+        let first_idx = indices.next().unwrap();
+        let mut src_idx = Self::new(first_idx);
+        for idx in indices {
+            src_idx = Self::new(idx).with_sub_idx(Some(src_idx));
+        }
+        src_idx
+    }
+}
+
+impl<const N: usize> From<[usize; N]> for SourceIndex {
+    #[inline]
+    fn from(value: [usize; N]) -> Self {
+        value.into_iter().collect()
     }
 }
 
@@ -580,7 +533,7 @@ impl ResourceData {
 pub type ResourceDataResult = Result<ResourceData, ResourceLoadError>;
 pub(in crate::resource) type SealedResourceDataResult = Result<SealedResourceData, ResourceLoadError>;
 
-/// Update type for [ResourceUpdaters](ResourceUpdater).
+/// Update type for [ResourceUpdaters](ResourceUpdaterTrait).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceUpdate {
     /// A resource was added with the specified [hash](super::source#data-hashing).
@@ -591,6 +544,10 @@ pub enum ResourceUpdate {
 
     /// A resource was removed, and is no longer available.
     Removed,
+
+    /// A resource moved from the specified [SourceIndex] to the new one specified by
+    /// [BulkResourceUpdate].
+    MovedSourceIndex(SourceIndex),
 }
 
 /// Bulk collection of updates for a single update timestamp.
@@ -636,59 +593,6 @@ impl FromIterator<(ResourceId, ResourceUpdate)> for BulkResourceUpdate {
     }
 }
 
-/// Updater context to notify upstream managers of [raw data][rd] changes.
-///
-/// This context is passed to [ResourceSources][rs] so that they can notify upstream managers when
-/// their data changes for specific [ids][rp]. This exists as a trait instead of a struct so that
-/// sources can create their own middleware ResourceUpdaters that can intercept update notifications
-/// if they so desire.
-///
-/// [rd]: ResourceReadData
-/// [rs]: ResourceSource
-/// [rp]: ResourceId
-pub trait ResourceUpdater: Debug + Send + Sync + 'static {
-    /// [ResourceSources](ResourceSource) call this when their data changes.
-    ///
-    /// See [module-level documentation][mod] for more information on the expected hashes.
-    ///
-    /// [mod]: super::source#data-hashing
-    fn notify_update(&self, bulk_update: BulkResourceUpdate);
-
-    /// Clone this ResourceUpdater with the context of a specific sub-index.
-    ///
-    /// This specialized version of clone is intended to allow [ResourceSources][rs] to pass out
-    /// modified watchers to sub-sources with the additional context of their sub-indices, so that
-    /// when they notify upstream of updates, they can know their exact sub-index.
-    ///
-    /// [rs]: ResourceSource
-    fn clone_with_sub_index(&self, sub_idx: SourceIndex) -> Box<dyn ResourceUpdater>;
-}
-
-/// NoOp Updater context that does nothing when it receives updates.
-///
-/// This context is useful for testing or situations where a "default" needs to be set.
-#[derive(Default, Debug, Clone, Copy)]
-pub struct NoOpResourceUpdater {}
-
-impl NoOpResourceUpdater {
-    #[inline]
-    pub fn new() -> Box<dyn ResourceUpdater> {
-        Box::new(Self::default())
-    }
-}
-
-impl ResourceUpdater for NoOpResourceUpdater {
-    #[inline]
-    fn notify_update(&self, _bulk_update: BulkResourceUpdate) {
-        /* noop */
-    }
-
-    #[inline]
-    fn clone_with_sub_index(&self, _sub_idx: SourceIndex) -> Box<dyn ResourceUpdater> {
-        Box::new(self.clone()) as Box<dyn ResourceUpdater>
-    }
-}
-
 /// User-defined source of [raw resource data][rd].
 ///
 /// See [module-level][mod] docs for more details.
@@ -726,49 +630,7 @@ pub trait ResourceSource: Send + Sync + 'static {
         self.load(id).await
     }
 
-    /// Set the currently used [ResourceUpdater] for this source.
-    ///
-    /// The updater will always be set once after a source is e.g. added to the [ResourceManager],
-    /// but may be replaced later in the manager's lifecycle if the source is a part of a dynamic
-    /// collection, where it's [SourceIndex] may change.
-    ///
-    /// The last updater that is set is expected to be used to report updates for watched resources.
-    ///
-    /// # Watches
-    ///
-    /// When a new updater is set, the resource source should first notify any existing updater that
-    /// all of it's currently watched [ResourceIds](ResourceId) _that it can provide_ are being
-    /// [removed](ResourceUpdate::Removed) (don't send notifications for IDs that are watched but
-    /// this source doesn't have data for). This will invalidate any active watches for the previous
-    /// updater.
-    ///
-    /// Additionally, the `watches` field may also be populated with a set of new
-    /// [ResourceIds](ResourceId) that should be watched. The source should replace any old watches
-    /// with this new set, and if the source can provide data for any of the new IDs, it should
-    /// immediately notify the new updater that those IDs are [added](ResourceUpdate::Added).
-    ///
-    /// See also: [`Self::watch()`]/[`Self::unwatch()`].
-    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>);
-
-    /// Watch a given [id][rp] for data changes.
-    ///
-    /// For [sources][rs] that use sub-indices, a [sub-index][si] may also be given. If the
-    /// sub-index is Some, then any sources that belong to lesser than or equal sub-indices are
-    /// expected to be watched, and any sources that belong to greater sub-indices are expected to
-    /// be [unwatched](Self::unwatch()).
-    ///
-    /// [rp]: ResourceId
-    /// [rs]: ResourceSource
-    /// [si]: SourceIndex
-    fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>);
-
-    /// Unwatch a given [id][rp] for data changes.
-    ///
-    /// An [id][rp] that is unwatched is expected to no longer report data changes, and any relevant
-    /// watchers that have been stored for said [id][rp] are expected to be purged.
-    ///
-    /// [rp]: ResourceId
-    fn unwatch(&self, id: &ResourceId);
+    fn watcher(&self) -> &ResourceWatcher;
 }
 
 #[async_trait]
@@ -789,18 +651,8 @@ impl<S: ResourceSource + ?Sized> ResourceSource for Box<S> {
     }
 
     #[inline]
-    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
-        (**self).set_updater(updater, watches)
-    }
-
-    #[inline]
-    fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
-        (**self).watch(id, sub_idx)
-    }
-
-    #[inline]
-    fn unwatch(&self, id: &ResourceId) {
-        (**self).unwatch(id)
+    fn watcher(&self) -> &ResourceWatcher {
+        (**self).watcher()
     }
 }
 

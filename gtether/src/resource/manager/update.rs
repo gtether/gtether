@@ -16,7 +16,8 @@ use crate::resource::manager::dependency::DependencyGraph;
 use crate::resource::manager::load::{Cache, CacheEntryMetadata, UpdateParams};
 use crate::resource::manager::source::Sources;
 use crate::resource::manager::ResourceFutureInner;
-use crate::resource::source::{BulkResourceUpdate, ResourceUpdate, ResourceUpdater, SourceIndex};
+use crate::resource::source::{ResourceUpdate, SourceIndex};
+use crate::resource::watcher::{ResourceWatcherReceiver, ResourceWatcherSender, UpdateMsg};
 use crate::resource::{ResourceLoadError, ResourceLoadResult};
 use crate::util::waker::MultiWaker;
 
@@ -168,17 +169,10 @@ impl Updates {
     }
 }
 
-enum Msg {
-    Update{
-        src_idx: SourceIndex,
-        bulk_update: BulkResourceUpdate,
-    },
-    Close,
-}
-
 enum State {
     Init {
-        receiver: sc::Receiver<Msg>,
+        receiver: ResourceWatcherReceiver,
+        stop_recv: sc::Receiver<()>,
     },
     Started {
         join_handle: JoinHandle<()>,
@@ -187,18 +181,21 @@ enum State {
 }
 
 pub struct UpdateManager {
-    sender: sc::Sender<Msg>,
+    sender: ResourceWatcherSender,
+    stop_send: sc::Sender<()>,
     updates: Arc<Updates>,
     state: State,
 }
 
 impl UpdateManager {
     pub fn new() -> Self {
-        let (sender, receiver) = sc::unbounded();
+        let (sender, receiver) = crate::resource::watcher::update_channel();
+        let (stop_send, stop_recv) = sc::unbounded();
         Self {
             sender,
+            stop_send,
             updates: Updates::new(),
-            state: State::Init { receiver },
+            state: State::Init { receiver, stop_recv },
         }
     }
 
@@ -210,14 +207,16 @@ impl UpdateManager {
         #[cfg(test)]
         sync_update: Arc<super::tests::SyncContext>,
     ) {
-        match &self.state {
-            State::Init { receiver } => {
-                let receiver = receiver.clone();
+        let mut state = State::Stopped;
+        std::mem::swap(&mut state, &mut self.state);
+        match state {
+            State::Init { receiver, stop_recv } => {
                 let updates = self.updates.clone();
                 let join_handle = std::thread::Builder::new()
                     .name("resource-update-manager".to_string())
                     .spawn(move || UpdateManagerThread::new(
                         receiver,
+                        stop_recv,
                         updates,
                         sources,
                         cache,
@@ -238,7 +237,7 @@ impl UpdateManager {
         match state {
             State::Started { join_handle } => {
                 // If it's already closed, that's fine
-                let _ = self.sender.send_blocking(Msg::Close);
+                let _ = self.stop_send.send_blocking(());
                 join_handle.join().unwrap();
             },
             _ => {},
@@ -251,11 +250,8 @@ impl UpdateManager {
     }
 
     #[inline]
-    pub fn create_watcher(&self, source_idx: SourceIndex) -> Box<dyn ResourceUpdater> {
-        Box::new(UpdateManagerResourceWatcher {
-            sender: self.sender.clone(),
-            idx: source_idx,
-        })
+    pub fn watcher_sender(&self) -> &ResourceWatcherSender {
+        &self.sender
     }
 }
 
@@ -265,33 +261,9 @@ impl Drop for UpdateManager {
     }
 }
 
-#[derive(Debug, Clone)]
-struct UpdateManagerResourceWatcher {
-    sender: sc::Sender<Msg>,
-    idx: SourceIndex,
-}
-
-impl ResourceUpdater for UpdateManagerResourceWatcher {
-    #[inline]
-    fn notify_update(&self, bulk_update: BulkResourceUpdate) {
-        // Silently ignore if the channel is closed
-        let _ = self.sender.send_blocking(Msg::Update {
-            src_idx: self.idx.clone(),
-            bulk_update,
-        });
-    }
-
-    #[inline]
-    fn clone_with_sub_index(&self, sub_idx: SourceIndex) -> Box<dyn ResourceUpdater> {
-        Box::new(Self {
-            sender: self.sender.clone(),
-            idx: self.idx.clone().with_sub_idx(Some(sub_idx)),
-        })
-    }
-}
-
 struct UpdateManagerThread {
-    receiver: sc::Receiver<Msg>,
+    receiver: ResourceWatcherReceiver,
+    stop_recv: sc::Receiver<()>,
     exec: Executor<'static>,
     updates: Arc<Updates>,
     sources: Arc<Sources>,
@@ -303,7 +275,8 @@ struct UpdateManagerThread {
 
 impl UpdateManagerThread {
     fn new(
-        receiver: sc::Receiver<Msg>,
+        receiver: ResourceWatcherReceiver,
+        stop_recv: sc::Receiver<()>,
         updates: Arc<Updates>,
         sources: Arc<Sources>,
         cache: Arc<Cache>,
@@ -313,6 +286,7 @@ impl UpdateManagerThread {
     ) -> Self {
         Self {
             receiver,
+            stop_recv,
             exec: Executor::<'static>::new(),
             updates,
             sources,
@@ -324,7 +298,11 @@ impl UpdateManagerThread {
     }
 
     fn run(self) {
-        future::block_on(self.loop_receive().or(self.loop_exec()));
+        future::block_on(
+            self.loop_stop()
+                .or(self.loop_receive())
+                .or(self.loop_exec())
+        );
     }
 
     fn create_update_task(
@@ -354,173 +332,182 @@ impl UpdateManagerThread {
         (task, output)
     }
 
+    async fn loop_stop(&self) {
+        // If we get any response, either from an error from the sender being dropped or an actual
+        // message, then it's time to stop/exit
+        let _ = self.stop_recv.recv().await;
+    }
+
     async fn loop_receive(&self) {
         'exit: loop {
             if let Ok(msg) = self.receiver.recv().await {
-                match msg {
-                    Msg::Update{ src_idx: source_idx, bulk_update } => {
-                        let mut queued_updates = self.updates.inner.write().await;
+                let UpdateMsg {
+                    src_idx: source_idx,
+                    bulk_update,
+                } = msg;
+                let mut queued_updates = self.updates.inner.write().await;
 
-                        let mut dependent_update_ids = HashSet::default();
-                        let mut queued_update_ids = HashSet::default();
-                        'updates: for (id, update) in bulk_update.updates {
-                            trace!(%id, %source_idx, ?update, "Processing update");
+                let mut dependent_update_ids = HashSet::default();
+                let mut queued_update_ids = HashSet::default();
+                'updates: for (id, update) in bulk_update.updates {
+                    trace!(%id, %source_idx, ?update, "Processing update");
 
-                            {
-                                let dependency_graph = self.dependencies.read();
-                                if let Some(node) = dependency_graph.get(&id) {
-                                    for parent in node.dependents().recursive() {
-                                        dependent_update_ids.insert(parent.id().clone());
-                                    }
-                                }
+                    {
+                        let dependency_graph = self.dependencies.read();
+                        if let Some(node) = dependency_graph.get(&id) {
+                            for parent in node.dependents().recursive() {
+                                dependent_update_ids.insert(parent.id().clone());
+                            }
+                        }
+                    }
+
+                    let metadata = match self.cache.metadata(&id) {
+                        Some(metadata) => metadata,
+                        // No entry in the cache, this update will be ignored
+                        None => {
+                            trace!(%id, "Clearing expired cache entry");
+                            self.cache.remove(&id);
+                            #[cfg(test)]
+                            self.sync_update.mark_attempt();
+                            continue 'updates
+                        },
+                    };
+
+                    let (hash, source_idx) = match update {
+                        ResourceUpdate::Added(hash) | ResourceUpdate::Modified(hash) => {
+                            if !metadata.valid_for_update(&hash, &source_idx) {
+                                #[cfg(test)]
+                                self.sync_update.mark_attempt();
+                                continue 'updates
                             }
 
-                            let metadata = match self.cache.metadata(&id) {
-                                Some(metadata) => metadata,
-                                // No entry in the cache, this update will be ignored
+                            (hash.clone(), source_idx.clone())
+                        },
+                        ResourceUpdate::Removed => {
+                            let new_source = match self.sources.find_hash(&id) {
+                                Some(new_source) => new_source,
+                                // Data was removed, but there isn't a backup. Leave existing
+                                // entry alone for now
                                 None => {
-                                    trace!(%id, "Clearing expired cache entry");
-                                    self.cache.remove(&id);
+                                    warn!(%id, "All valid data sources have been removed for active resource");
                                     #[cfg(test)]
                                     self.sync_update.mark_attempt();
                                     continue 'updates
                                 },
                             };
 
-                            let (hash, source_idx) = match update {
-                                ResourceUpdate::Added(hash) | ResourceUpdate::Modified(hash) => {
-                                    if !metadata.valid_for_update(&hash, &source_idx) {
-                                        #[cfg(test)]
-                                        self.sync_update.mark_attempt();
-                                        continue 'updates
-                                    }
+                            (new_source.hash, new_source.idx)
+                        },
+                        ResourceUpdate::MovedSourceIndex(old_source_idx) => {
+                            if *metadata.source_idx() == old_source_idx {
+                                self.cache.move_source_index(&id, source_idx.clone());
+                            }
+                            #[cfg(test)]
+                            self.sync_update.mark_attempt();
+                            continue 'updates
+                        },
+                    };
 
-                                    (hash.clone(), source_idx.clone())
-                                },
-                                ResourceUpdate::Removed => {
-                                    let new_source = match self.sources.find_hash(&id) {
-                                        Some(new_source) => new_source,
-                                        // Data was removed, but there isn't a backup. Leave existing
-                                        // entry alone for now
-                                        None => {
-                                            warn!(%id, "All valid data sources have been removed for active resource");
-                                            #[cfg(test)]
-                                            self.sync_update.mark_attempt();
-                                            continue 'updates
-                                        },
-                                    };
+                    let prev_task = if let Some(queued_update) = queued_updates.get(&id) {
+                        if queued_update.is_stale() {
+                            // House-cleaning
+                            queued_updates.remove(&id);
+                            None
+                        } else {
+                            if !queued_update.valid_for_update(&hash, &source_idx, bulk_update.timestamp) {
+                                // There's an existing update that has priority
+                                debug!(
+                                    %id,
+                                    %source_idx,
+                                    existing_source_idx = %queued_update.source_idx,
+                                    ?hash,
+                                    existing_hash = ?queued_update.hash,
+                                    "Higher priority update already exists",
+                                );
+                                #[cfg(test)]
+                                self.sync_update.mark_attempt();
+                                continue 'updates
+                            }
 
-                                    (new_source.hash, new_source.idx)
-                                }
-                            };
-
-                            let prev_task = if let Some(queued_update) = queued_updates.get(&id) {
-                                if queued_update.is_stale() {
-                                    // House-cleaning
-                                    queued_updates.remove(&id);
-                                    None
-                                } else {
-                                    if !queued_update.valid_for_update(&hash, &source_idx, bulk_update.timestamp) {
-                                        // There's an existing update that has priority
-                                        debug!(
-                                            %id,
-                                            %source_idx,
-                                            existing_source_idx = %queued_update.source_idx,
-                                            ?hash,
-                                            existing_hash = ?queued_update.hash,
-                                            "Higher priority update already exists",
-                                        );
-                                        #[cfg(test)]
-                                        self.sync_update.mark_attempt();
-                                        continue 'updates
-                                    }
-
-                                    let queued_update = queued_updates.remove(&id).unwrap();
-                                    Some(queued_update)
-                                }
-                            } else {
-                                None
-                            };
-
-                            queued_update_ids.insert(id.clone());
-
-                            trace!(%id, %source_idx, ?hash, "Creating queued update");
-                            let (task, output) = self.create_update_task(
-                                &metadata,
-                                prev_task,
-                            );
-
-                            queued_updates.insert(id, UpdateTask {
-                                hash: hash.clone(),
-                                source_idx: source_idx.clone(),
-                                timestamp: bulk_update.timestamp.clone(),
-                                task,
-                                output,
-                            });
+                            let queued_update = queued_updates.remove(&id).unwrap();
+                            Some(queued_update)
                         }
+                    } else {
+                        None
+                    };
 
-                        'updates: for id in dependent_update_ids.difference(&queued_update_ids) {
-                            trace!(%id, %source_idx, "Processing triggered dependent update");
-                            let metadata = match self.cache.metadata(id) {
-                                Some(metadata) => metadata,
-                                // No entry in the cache, this update will be ignored
-                                None => {
-                                    trace!(%id, "Clearing expired cache entry");
-                                    self.cache.remove(id);
-                                    #[cfg(test)]
-                                    self.sync_update.mark_attempt();
-                                    continue 'updates
-                                },
-                            };
+                    queued_update_ids.insert(id.clone());
 
-                            let hash = match metadata.hash() {
-                                Some(hash) => hash.to_string(),
-                                None => {
-                                    warn!(%id, "Dependent update triggered before load could determine hash; cannot update. Resource may be out-of-sync");
-                                    #[cfg(test)]
-                                    self.sync_update.mark_attempt();
-                                    continue 'updates
-                                }
-                            };
-                            let source_idx = metadata.source_idx().clone();
+                    trace!(%id, %source_idx, ?hash, "Creating queued update");
+                    let (task, output) = self.create_update_task(
+                        &metadata,
+                        prev_task,
+                    );
 
-                            let prev_task = if let Some(queued_update) = queued_updates.get(id) {
-                                if queued_update.is_stale() {
-                                    // House-cleaning
-                                    queued_updates.remove(id);
-                                    None
-                                } else {
-                                    debug!(
-                                        %id, %source_idx, ?hash,
-                                        "Re-queueing existing dependent update",
-                                    );
-                                    let queued_update = queued_updates.remove(id).unwrap();
-                                    Some(queued_update)
-                                }
-                            } else {
-                                None
-                            };
+                    queued_updates.insert(id, UpdateTask {
+                        hash: hash.clone(),
+                        source_idx: source_idx.clone(),
+                        timestamp: bulk_update.timestamp.clone(),
+                        task,
+                        output,
+                    });
+                }
 
-                            trace!(%id, %source_idx, ?hash, "Creating queued dependent update");
-                            let (task, output) = self.create_update_task(
-                                &metadata,
-                                prev_task,
-                            );
+                'updates: for id in dependent_update_ids.difference(&queued_update_ids) {
+                    trace!(%id, %source_idx, "Processing triggered dependent update");
+                    let metadata = match self.cache.metadata(id) {
+                        Some(metadata) => metadata,
+                        // No entry in the cache, this update will be ignored
+                        None => {
+                            trace!(%id, "Clearing expired cache entry");
+                            self.cache.remove(id);
+                            #[cfg(test)]
+                            self.sync_update.mark_attempt();
+                            continue 'updates
+                        },
+                    };
 
-                            queued_updates.insert(id.clone(), UpdateTask {
-                                hash,
-                                source_idx: metadata.source_idx().clone(),
-                                timestamp: Utc::now(),
-                                task,
-                                output,
-                            });
+                    let hash = match metadata.hash() {
+                        Some(hash) => hash.to_string(),
+                        None => {
+                            warn!(%id, "Dependent update triggered before load could determine hash; cannot update. Resource may be out-of-sync");
+                            #[cfg(test)]
+                            self.sync_update.mark_attempt();
+                            continue 'updates
                         }
+                    };
+                    let source_idx = metadata.source_idx().clone();
 
-                    }
-                    Msg::Close => {
-                        // Start exiting
-                        break 'exit
-                    }
+                    let prev_task = if let Some(queued_update) = queued_updates.get(id) {
+                        if queued_update.is_stale() {
+                            // House-cleaning
+                            queued_updates.remove(id);
+                            None
+                        } else {
+                            debug!(
+                                %id, %source_idx, ?hash,
+                                "Re-queueing existing dependent update",
+                            );
+                            let queued_update = queued_updates.remove(id).unwrap();
+                            Some(queued_update)
+                        }
+                    } else {
+                        None
+                    };
+
+                    trace!(%id, %source_idx, ?hash, "Creating queued dependent update");
+                    let (task, output) = self.create_update_task(
+                        &metadata,
+                        prev_task,
+                    );
+
+                    queued_updates.insert(id.clone(), UpdateTask {
+                        hash,
+                        source_idx: metadata.source_idx().clone(),
+                        timestamp: Utc::now(),
+                        task,
+                        output,
+                    });
                 }
             } else {
                 // Sender is closed, so this thread is abandoned. Start exiting

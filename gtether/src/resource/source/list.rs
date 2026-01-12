@@ -1,9 +1,9 @@
-use ahash::HashSet;
 use async_trait::async_trait;
 
 use crate::resource::id::ResourceId;
 use crate::resource::source::{ResourceDataResult, ResourceSource, SourceIndex};
-use crate::resource::source::{ResourceDataSource, ResourceUpdater};
+use crate::resource::source::ResourceDataSource;
+use crate::resource::watcher::ResourceWatcher;
 use crate::resource::ResourceLoadError;
 
 /// [ResourceSource][rs] that wraps multiple sub-sources.
@@ -14,12 +14,20 @@ use crate::resource::ResourceLoadError;
 /// [rs]: ResourceSource
 pub struct ResourceSourceList<S: ResourceSource> {
     sources: Vec<S>,
+    watcher: ResourceWatcher,
 }
 
 impl<S: ResourceSource> FromIterator<S> for ResourceSourceList<S> {
     fn from_iter<T: IntoIterator<Item=S>>(iter: T) -> Self {
+        let sources = iter.into_iter().collect::<Vec<_>>();
+        let watcher = ResourceWatcher::with_children(
+            (),
+            sources.iter().map(ResourceSource::watcher),
+        );
+
         Self {
-            sources: iter.into_iter().collect(),
+            sources,
+            watcher,
         }
     }
 }
@@ -58,30 +66,9 @@ impl<S: ResourceSource> ResourceSource for ResourceSourceList<S> {
         }
     }
 
-    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, watches: HashSet<ResourceId>) {
-        for (idx, source) in self.sources.iter().enumerate() {
-            source.set_updater(updater.clone_with_sub_index(idx.into()), watches.clone());
-        }
-    }
-
-    fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
-        let sub_idx = sub_idx.unwrap_or(SourceIndex::new(self.sources.len()));
-        for (idx, source) in self.sources.iter().enumerate() {
-            if idx <= sub_idx.idx() {
-                source.watch(
-                    id.clone(),
-                    sub_idx.sub_idx().map(|inner| inner.clone())
-                );
-            } else {
-                source.unwatch(&id);
-            }
-        }
-    }
-
-    fn unwatch(&self, id: &ResourceId) {
-        for source in &self.sources {
-            source.unwatch(id);
-        }
+    #[inline]
+    fn watcher(&self) -> &ResourceWatcher {
+        &self.watcher
     }
 }
 

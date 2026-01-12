@@ -136,7 +136,7 @@
 //! [res]: Resource
 //! [rp]: ResourceId
 //! [rf]: ResourceFutureOld
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use educe::Educe;
 use parking_lot::{RwLock, RwLockReadGuard};
 use smol::prelude::*;
@@ -166,6 +166,7 @@ pub use load::{
     LoadPriority,
     ResourceLoadContext,
 };
+use crate::resource::watcher::ResourceWatcherConfig;
 
 enum ResourceFutureInner<T: ?Sized + Send + Sync + 'static> {
     Cached(ResourceLoadResult<T>),
@@ -551,7 +552,10 @@ impl ResourceManagerBuilder {
         let mut update_manager = UpdateManager::new();
         let mut sources = self.sources;
         for (idx, source) in sources.iter_mut().enumerate() {
-            source.set_updater(update_manager.create_watcher(idx.into()), HashSet::default());
+            source.watcher().configure(ResourceWatcherConfig {
+                src_idx: idx.into(),
+                sender: update_manager.watcher_sender().clone(),
+            });
         }
         let sources = Arc::new(Sources::new(sources));
         let dependencies = Arc::new(RwLock::new(DependencyGraph::default()));
@@ -593,11 +597,11 @@ impl ResourceManagerBuilder {
 pub mod tests {
     use super::*;
 
-    use ahash::{HashMap, HashSet};
+    use ahash::HashMap;
     use async_trait::async_trait;
     use itertools::Itertools;
     use macro_rules_attribute::apply;
-    use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+    use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
     use rstest::{fixture, rstest};
     use smol::Timer;
     use smol_macros::test as smol_test;
@@ -605,8 +609,9 @@ pub mod tests {
     use std::time::Duration;
     use test_log::test as test_log;
 
-    use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdate, ResourceUpdater, SourceIndex};
+    use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdate};
     use crate::resource::{Resource, ResourceReadData};
+    use crate::resource::watcher::{ResourceHashProvider, ResourceWatcher};
 
     pub(in crate::resource) async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -940,19 +945,30 @@ pub mod tests {
         }
     }
 
+    #[derive(Educe)]
+    #[educe(Deref, DerefMut, Default)]
+    struct ResourceDataMapRaw(HashMap<ResourceId, (Vec<u8>, String)>);
+
+    impl ResourceHashProvider for ResourceDataMapRaw {
+        #[inline]
+        fn hash(&self, id: &ResourceId) -> Option<String> {
+            self.0.get(id).map(|(_, hash)| hash.clone())
+        }
+    }
+
     /// Underlying raw data for [TestResourceSource].
     pub struct ResourceDataMap {
-        raw: RwLock<HashMap<ResourceId, (Vec<u8>, String)>>,
-        updater: RwLock<Option<Box<dyn ResourceUpdater>>>,
-        watch_list: RwLock<HashSet<ResourceId>>,
+        raw: Arc<RwLock<ResourceDataMapRaw>>,
+        watcher: ResourceWatcher,
     }
 
     impl ResourceDataMap {
         fn new() -> Self {
+            let raw = Arc::new(RwLock::new(ResourceDataMapRaw::default()));
+            let watcher = ResourceWatcher::new(raw.clone());
             Self {
-                raw: Default::default(),
-                updater: Default::default(),
-                watch_list: Default::default(),
+                raw,
+                watcher,
             }
         }
 
@@ -967,41 +983,32 @@ pub mod tests {
         /// any changes that were made.
         pub fn lock(&self) -> ResourceDataMapLock<'_> {
             let raw = self.raw.write();
-            let watch_list = self.watch_list.read();
             ResourceDataMapLock {
                 raw,
-                watch_list,
-                updater: &self.updater,
+                watcher: &self.watcher,
                 updates: HashMap::default(),
             }
         }
 
-        fn watch(&self, id: ResourceId) {
-            self.watch_list.write().insert(id);
-        }
-
-        fn unwatch(&self, id: &ResourceId) {
-            self.watch_list.write().remove(id);
-        }
-
         /// Assert that a given [ResourceId] is being watched or not.
         pub fn assert_watch(&self, id: impl Into<ResourceId>, should_watch: bool) {
+            let m = match should_watch {
+                true => "",
+                false => "NOT ",
+            };
             let id = id.into();
-            let watch_list = self.watch_list.read();
-            match (watch_list.get(&id), should_watch) {
-                (Some(_), false) => panic!("Watcher found for {id} when there should be none"),
-                (None, true) => panic!("No watcher found for {id}"),
-                (Some(_), true) => {},
-                (None, false) => {},
-            }
+            assert_eq!(
+                self.watcher.is_watched(&id),
+                should_watch,
+                "Resource '{id}' should {m}be watched by: {:?}", self.watcher,
+            );
         }
     }
 
     /// Mutable lock on a [ResourceDataMap].
     pub struct ResourceDataMapLock<'a> {
-        raw: RwLockWriteGuard<'a, HashMap<ResourceId, (Vec<u8>, String)>>,
-        watch_list: RwLockReadGuard<'a, HashSet<ResourceId>>,
-        updater: &'a RwLock<Option<Box<dyn ResourceUpdater>>>,
+        raw: RwLockWriteGuard<'a, ResourceDataMapRaw>,
+        watcher: &'a ResourceWatcher,
         updates: HashMap<ResourceId, ResourceUpdate>,
     }
 
@@ -1019,7 +1026,7 @@ pub mod tests {
                 true => ResourceUpdate::Modified(hash),
                 false => ResourceUpdate::Added(hash),
             };
-            if self.watch_list.contains(&id) {
+            if self.watcher.is_watched(&id) {
                 self.updates.insert(id, update);
             }
         }
@@ -1028,7 +1035,7 @@ pub mod tests {
         pub fn remove(&mut self, id: impl Into<ResourceId>) {
             let id = id.into();
             if self.raw.remove(&id).is_some() {
-                if self.watch_list.contains(&id) {
+                if self.watcher.is_watched(&id) {
                     self.updates.insert(id, ResourceUpdate::Removed);
                 }
             }
@@ -1039,10 +1046,7 @@ pub mod tests {
         fn drop(&mut self) {
             let mut updates = HashMap::default();
             std::mem::swap(&mut updates, &mut self.updates);
-            let updater = self.updater.read();
-            if let Some(updater) = &*updater {
-                updater.notify_update(updates.into());
-            }
+            self.watcher.notify_update(updates.into());
         }
     }
 
@@ -1057,7 +1061,7 @@ pub mod tests {
         pub fn new() -> (Self, Arc<ResourceDataMap>) {
             let data_map = Arc::new(ResourceDataMap::new());
             let source = Self {
-                inner: data_map.clone()
+                inner: data_map.clone(),
             };
             (source, data_map)
         }
@@ -1081,36 +1085,8 @@ pub mod tests {
             }
         }
 
-        fn set_updater(&self, new_updater: Box<dyn ResourceUpdater>, new_watches: HashSet<ResourceId>) {
-            let mut watches = self.inner.watch_list.write();
-            let mut updater = self.inner.updater.write();
-            let data = self.inner.raw.read();
-
-            if let Some(updater) = &*updater {
-                let update = watches.drain()
-                    .map(|id| (id, ResourceUpdate::Removed))
-                    .collect::<HashMap<_, _>>()
-                    .into();
-                updater.notify_update(update);
-            }
-
-            *watches = new_watches;
-            let mut update = HashMap::default();
-            for watch in &*watches {
-                if let Some((_, hash)) = data.get(watch) {
-                    update.insert(watch.clone(), ResourceUpdate::Added(hash.clone()));
-                }
-            }
-            new_updater.notify_update(update.into());
-            *updater = Some(new_updater);
-        }
-
-        fn watch(&self, id: ResourceId, _sub_idx: Option<SourceIndex>) {
-            self.inner.watch(id);
-        }
-
-        fn unwatch(&self, id: &ResourceId) {
-            self.inner.unwatch(id);
+        fn watcher(&self) -> &ResourceWatcher {
+            &self.inner.watcher
         }
     }
 

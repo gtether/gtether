@@ -38,6 +38,7 @@ use crate::resource::manager::ResourceLoadContext;
 pub mod manager;
 pub mod id;
 pub mod source;
+pub mod watcher;
 
 struct SubResourceRef<P: ?Sized + Send + Sync + 'static> {
     type_id: Option<TypeId>,

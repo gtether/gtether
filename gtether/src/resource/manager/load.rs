@@ -731,6 +731,21 @@ impl CacheEntry {
             CacheEntryInner::Error(_) => None,
         }
     }
+
+    fn move_source_index(&mut self, new_source_index: SourceIndex) -> bool {
+        match &mut self.inner {
+            CacheEntryInner::Loading { hash_source_idx, .. } => {
+                hash_source_idx.lock().1 = new_source_index;
+                true
+            },
+            CacheEntryInner::Loaded { source_idx, .. } |
+            CacheEntryInner::Value { source_idx, .. } => {
+                *source_idx = new_source_index;
+                true
+            },
+            _ => false,
+        }
+    }
 }
 
 pub struct Cache {
@@ -950,6 +965,14 @@ impl Cache {
     #[inline]
     pub fn metadata(&self, id: &ResourceId) -> Option<CacheEntryMetadata> {
         self.entries.read().get(id).and_then(CacheEntry::metadata)
+    }
+
+    pub fn move_source_index(&self, id: &ResourceId, new_source_idx: SourceIndex) -> bool {
+        if let Some(entry) = self.entries.write().get_mut(id) {
+            entry.move_source_index(new_source_idx)
+        } else {
+            false
+        }
     }
 
     #[inline]

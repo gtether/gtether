@@ -7,83 +7,38 @@
 //! Mutating the sources of a [ResourceSourceDynamic] occurs through the cheaply cloneable [handle]
 //! that can be [retrieved from a dynamic source](ResourceSourceDynamic::handle).
 
-use ahash::HashSet;
 use async_trait::async_trait;
 use educe::Educe;
-use parking_lot::RwLock;
-use std::iter::FusedIterator;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::resource::id::ResourceId;
-use crate::resource::source::{NoOpResourceUpdater, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdater, SourceIndex};
+use crate::resource::source::{ResourceDataResult, ResourceDataSource, ResourceSource};
+use crate::resource::watcher::ResourceWatcher;
 use crate::resource::ResourceLoadError;
-
-/// Iterator over the sources in [ResourceSourceDynamicState].
-#[derive(Educe)]
-#[educe(Clone)]
-pub struct Iter<'a, S: ResourceSource> {
-    inner: std::slice::Iter<'a, (S, HashSet<ResourceId>)>,
-}
-
-impl<'a, S: ResourceSource> Iterator for Iter<'a, S> {
-    type Item = &'a S;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|v| &v.0)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl<'a, S: ResourceSource> DoubleEndedIterator for Iter<'a, S> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|v| &v.0)
-    }
-}
-
-impl<'a, S: ResourceSource> ExactSizeIterator for Iter<'a, S> {}
-impl<'a, S: ResourceSource> FusedIterator for Iter<'a, S> {}
 
 /// Mutable state of a [ResourceSourceDynamic].
 ///
 /// This is where direct mutation of the sources used in a [ResourceSourceDynamic] occurs.
 pub struct ResourceSourceDynamicState<S: ResourceSource> {
-    sources: Vec<(S, HashSet<ResourceId>)>,
-    updater: Box<dyn ResourceUpdater>,
+    sources: RwLock<Vec<S>>,
+    watcher: ResourceWatcher,
 }
 
 impl<S: ResourceSource> ResourceSourceDynamicState<S> {
-    fn adjust_updaters(&mut self, start_idx: usize) {
-        for idx in start_idx..self.sources.len() {
-            self.sources[idx].0.set_updater(
-                self.updater.clone_with_sub_index(idx.into()),
-                self.sources[idx].1.clone(),
-            );
-        }
-    }
-
     /// Returns the number of sources in the collection.
     ///
     /// See also: [`Vec::len()`].
     #[inline]
     pub fn len(&self) -> usize {
-        self.sources.len()
+        self.sources.read().len()
     }
 
-    /// Returns an iterator over the sources.
-    ///
-    /// See also: [`Vec::iter()`].
+    /// Returns a read-locked reference to the sources in this collection.
     #[inline]
-    pub fn iter(&self) -> Iter<'_, S> {
-        Iter {
-            inner: self.sources.iter(),
-        }
+    pub fn sources(&self) -> RwLockReadGuard<'_, Vec<S>> {
+        self.sources.read()
     }
 
     /// Inserts a source at position `idx`, shifting all sources after it to the right.
@@ -94,23 +49,20 @@ impl<S: ResourceSource> ResourceSourceDynamicState<S> {
     ///
     /// Panics if `idx` > `len`.
     #[inline]
-    pub fn insert(&mut self, idx: usize, source: S) {
-        let new_watches = match self.sources.get(idx) {
-            // Inserted sources should copy the watches of the next lowest priority
-            Some((_, watches)) => watches.clone(),
-            None => HashSet::default(),
-        };
-        self.sources.insert(idx, (source, new_watches));
-        self.adjust_updaters(idx);
+    pub fn insert(&self, idx: usize, source: S) {
+        let mut sources = self.sources.write();
+        self.watcher.insert_child(idx, source.watcher());
+        sources.insert(idx, source);
     }
 
     /// Appends a source to the back of the collection.
     ///
     /// See also: [`Vec::push()`].
     #[inline]
-    pub fn push(&mut self, source: S) {
-        self.sources.push((source, HashSet::default()));
-        self.adjust_updaters(self.sources.len() - 1);
+    pub fn push(&self, source: S) {
+        let mut sources = self.sources.write();
+        self.watcher.push_child(source.watcher());
+        sources.push(source);
     }
 
     /// Removes the source at position `idx`, shifting all sources after it to the left.
@@ -121,12 +73,10 @@ impl<S: ResourceSource> ResourceSourceDynamicState<S> {
     ///
     /// Panics if `idx` is out of bounds.
     #[inline]
-    pub fn remove(&mut self, idx: usize) -> S {
-        let (source, _) = self.sources.remove(idx);
-        source.set_updater(NoOpResourceUpdater::new(), HashSet::default());
-        if idx < self.sources.len() {
-            self.adjust_updaters(idx);
-        }
+    pub fn remove(&self, idx: usize) -> S {
+        let mut sources = self.sources.write();
+        self.watcher.remove_child(idx);
+        let source = sources.remove(idx);
         source
     }
 }
@@ -136,7 +86,7 @@ impl ResourceSourceDynamicState<Box<dyn ResourceSource>> {
     ///
     /// See [`Self::insert()`] for more.
     #[inline]
-    pub fn insert_dyn(&mut self, idx: usize, source: impl ResourceSource) {
+    pub fn insert_dyn(&self, idx: usize, source: impl ResourceSource) {
         self.insert(idx, Box::new(source))
     }
 
@@ -144,23 +94,22 @@ impl ResourceSourceDynamicState<Box<dyn ResourceSource>> {
     ///
     /// See [`Self::push()`] for more.
     #[inline]
-    pub fn push_dyn(&mut self, source: impl ResourceSource) {
+    pub fn push_dyn(&self, source: impl ResourceSource) {
         self.push(Box::new(source))
     }
 }
 
 /// Handle to a [ResourceSourceDynamic] that allows modification of the underlying resource sources.
 ///
-/// This dereferences to a `RwLock` around [ResourceSourceDynamicState], so see that struct for more
-/// information.
+/// This dereferences to [ResourceSourceDynamicState], so see that struct for more information.
 ///
 /// This handle is cheaply cloneable (it just clones the `Arc<>` it wraps).
 #[derive(Educe)]
 #[educe(Clone)]
-pub struct ResourceSourceDynamicHandle<S: ResourceSource>(Arc<RwLock<ResourceSourceDynamicState<S>>>);
+pub struct ResourceSourceDynamicHandle<S: ResourceSource>(Arc<ResourceSourceDynamicState<S>>);
 
 impl<S: ResourceSource> Deref for ResourceSourceDynamicHandle<S> {
-    type Target = RwLock<ResourceSourceDynamicState<S>>;
+    type Target = ResourceSourceDynamicState<S>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -172,17 +121,17 @@ impl<S: ResourceSource> Deref for ResourceSourceDynamicHandle<S> {
 ///
 /// See [module-level](super::dynamic) documentation for more.
 pub struct ResourceSourceDynamic<S: ResourceSource = Box<dyn ResourceSource>> {
-    state: Arc<RwLock<ResourceSourceDynamicState<S>>>,
+    state: Arc<ResourceSourceDynamicState<S>>,
 }
 
 impl<S: ResourceSource> Default for ResourceSourceDynamic<S> {
     #[inline]
     fn default() -> Self {
         Self {
-            state: Arc::new(RwLock::new(ResourceSourceDynamicState {
-                sources: Vec::new(),
-                updater: NoOpResourceUpdater::new(),
-            }))
+            state: Arc::new(ResourceSourceDynamicState {
+                sources: RwLock::new(vec![]),
+                watcher: ResourceWatcher::new(()),
+            })
         }
     }
 }
@@ -199,8 +148,7 @@ impl<S: ResourceSource> ResourceSourceDynamic<S> {
 #[async_trait]
 impl<S: ResourceSource> ResourceSource for ResourceSourceDynamic<S> {
     fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
-        let state = self.state.read();
-        for (idx, (source, _)) in state.sources.iter().enumerate() {
+        for (idx, source) in self.state.sources.read().iter().enumerate() {
             match source.hash(id) {
                 Some(s) => return Some(s.wrap(idx)),
                 None => continue,
@@ -210,8 +158,7 @@ impl<S: ResourceSource> ResourceSource for ResourceSourceDynamic<S> {
     }
 
     async fn load(&self, id: &ResourceId) -> ResourceDataResult {
-        let state = self.state.read();
-        for (idx, (source, _)) in state.sources.iter().enumerate() {
+        for (idx, source) in self.state.sources.read().iter().enumerate() {
             match source.load(id).await {
                 Ok(data) => return Ok(data.wrap(idx)),
                 Err(ResourceLoadError::NotFound(_)) => continue,
@@ -221,35 +168,8 @@ impl<S: ResourceSource> ResourceSource for ResourceSourceDynamic<S> {
         Err(ResourceLoadError::NotFound(id.clone()))
     }
 
-    fn set_updater(&self, updater: Box<dyn ResourceUpdater>, new_watches: HashSet<ResourceId>) {
-        let mut state = self.state.write();
-        for (idx, (source, watches)) in state.sources.iter_mut().enumerate() {
-            *watches = new_watches.clone();
-            source.set_updater(updater.clone_with_sub_index(idx.into()), watches.clone());
-        }
-        state.updater = updater;
-    }
-
-    fn watch(&self, id: ResourceId, sub_idx: Option<SourceIndex>) {
-        let mut state = self.state.write();
-        let sub_idx = sub_idx.unwrap_or(SourceIndex::new(state.sources.len()));
-        for (idx, (source, watches)) in state.sources.iter_mut().enumerate() {
-            if idx <= sub_idx.idx() {
-                watches.insert(id.clone());
-                source.watch(id.clone(), sub_idx.sub_idx().cloned());
-            } else {
-                watches.remove(&id);
-                source.unwatch(&id);
-            }
-        }
-    }
-
-    fn unwatch(&self, id: &ResourceId) {
-        let mut state = self.state.write();
-        for (source, watches) in &mut state.sources {
-            watches.remove(id);
-            source.unwatch(id);
-        }
+    fn watcher(&self) -> &ResourceWatcher {
+        &self.state.watcher
     }
 }
 
@@ -334,7 +254,7 @@ mod tests {
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         let (source, data_map) = TestResourceSource::new();
-        handle.write().push_dyn(source);
+        handle.push_dyn(source);
 
         if let Some(start_data) = start_data {
             data_map.lock().insert(start_data.id, start_data.data, start_data.hash);
@@ -362,7 +282,7 @@ mod tests {
             data_map.lock().insert(start_data.id, start_data.data, start_data.hash);
         }
 
-        handle.write().push_dyn(source);
+        handle.push_dyn(source);
 
         assert_manager_load(&manager, key, expected_load_result, 1).await;
     }
@@ -416,7 +336,7 @@ mod tests {
     ) {
         let (main_source, main_data_map) = TestResourceSource::new();
         main_data_map.lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
-        handle.write().push_dyn(main_source);
+        handle.push_dyn(main_source);
 
         let (new_source, new_data_map) = TestResourceSource::new();
         let end = end.map(|end| {
@@ -436,9 +356,9 @@ mod tests {
         {
             let _lock = manager.test_ctx().sync_update.block().await;
             if insert_before {
-                handle.write().insert_dyn(0, new_source);
+                handle.insert_dyn(0, new_source);
             } else {
-                handle.write().push_dyn(new_source);
+                handle.push_dyn(new_source);
             }
             if let ExpectedLoadResult::Ok(expected_value) = &start.expected {
                 let value = value.as_ref().unwrap();
@@ -496,11 +416,7 @@ mod tests {
                     },
                 }
             } else {
-                match start.expected {
-                    // An update is still triggered because the original data moved source indices
-                    ExpectedLoadResult::Ok(_) => manager.test_ctx().sync_update.assert_count(1),
-                    _ => manager.test_ctx().sync_update.assert_count(0),
-                }
+                manager.test_ctx().sync_update.assert_count(0);
                 new_data_map.assert_watch(start.entry.id.clone(), true);
                 main_data_map.assert_watch(start.entry.id.clone(), true);
             }
@@ -513,7 +429,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::source_0(0, "value_1", 1, 1, [None, Some(true), Some(false), Some(false)])]
+    #[case::source_0(0, "value_1", 1, 0, [None, Some(true), Some(false), Some(false)])]
     #[case::source_1(1, "value_2", 1, 1, [Some(true), None, Some(true), Some(false)])]
     #[case::source_2(2, "value_1", 0, 0, [Some(true), Some(true), None, Some(false)])]
     #[case::source_3(3, "value_1", 0, 0, [Some(true), Some(true), Some(false), None])]
@@ -531,7 +447,7 @@ mod tests {
     ) {
         let data_maps = core::array::from_fn::<_, 4, _>(|_| {
             let (source, data_map) = TestResourceSource::new();
-            handle.write().push_dyn(source);
+            handle.push_dyn(source);
             data_map
         });
 
@@ -543,7 +459,7 @@ mod tests {
         assert_eq!(*value.read(), "value_1".to_owned());
         manager.test_ctx().sync_update.assert_count(0);
 
-        handle.write().remove(remove_idx);
+        handle.remove(remove_idx);
 
         timeout(
             manager.test_ctx().sync_update.wait_attempts(wait_update_attempts),
