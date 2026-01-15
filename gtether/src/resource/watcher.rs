@@ -172,6 +172,24 @@ where
     }
 }
 
+impl<T> ResourceHashProvider for smol::lock::RwLock<T>
+where
+    T: ResourceHashProvider + ?Sized,
+{
+    #[inline]
+    fn hash(&self, id: &ResourceId) -> Option<String> {
+        self.read_blocking().hash(id)
+    }
+
+    #[inline]
+    fn hashes(&self, ids: HashSet<ResourceId>) -> HashMap<ResourceId, String> {
+        let lock = self.read_blocking();
+        ids.into_iter()
+            .filter_map(|id| lock.hash(&id).map(|hash| (id, hash)))
+            .collect()
+    }
+}
+
 impl ResourceHashProvider for () {
     #[inline]
     fn hash(&self, _id: &ResourceId) -> Option<String> {
