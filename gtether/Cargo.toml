@@ -46,6 +46,8 @@ gtether_derive = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 itertools = { workspace = true }
 nalgebra-glm = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
 ouroboros = { workspace = true }
 papaya = { workspace = true }
 parking_lot = { workspace = true }

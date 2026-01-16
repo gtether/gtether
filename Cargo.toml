@@ -37,6 +37,8 @@ game-networking-sockets = "0.1"
 image = "0.25"
 itertools = "0.14"
 nalgebra-glm = { version = "0.19.0", features = ["convert-bytemuck"]}
+notify = "8.2"
+notify-debouncer-full = "0.6"
 ouroboros = "0.18.5"
 papaya = "0.2.3"
 parking_lot = { version = "0.12", features = ["send_guard"] }

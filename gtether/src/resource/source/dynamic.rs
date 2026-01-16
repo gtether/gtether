@@ -23,6 +23,9 @@ struct ResourceSourceDynamicState<S: ResourceSource> {
     watcher: ResourceWatcher,
 }
 
+/// Read guard for [ResourceSourceDynamic].
+///
+/// Provides a read-only dereference to the `Vec<>` of children sources.
 pub struct ResourceSourceDynamicReadGuard<'a, S: ResourceSource>(RwLockReadGuard<'a, Vec<S>>);
 
 impl<'a, S: ResourceSource> Deref for ResourceSourceDynamicReadGuard<'a, S> {
@@ -126,6 +129,8 @@ impl<S: ResourceSource> ResourceSourceDynamicHandle<S> {
     }
 
     /// Get write access to the children resource sources.
+    ///
+    /// See [ResourceSourceDynamicWriteGuard] for specialized insert/push/remove methods.
     #[inline]
     pub fn write(&self) -> ResourceSourceDynamicWriteGuard<'_, S> {
         ResourceSourceDynamicWriteGuard {
@@ -138,6 +143,12 @@ impl<S: ResourceSource> ResourceSourceDynamicHandle<S> {
 /// [ResourceSource] that contains a dynamic sub-set of resource sources.
 ///
 /// See [module-level](super::dynamic) documentation for more.
+///
+/// ```
+/// use gtether::resource::source::dynamic::ResourceSourceDynamic;
+///
+/// let sources: ResourceSourceDynamic = Default::default();
+/// ```
 pub struct ResourceSourceDynamic<S: ResourceSource = Box<dyn ResourceSource>> {
     state: Arc<ResourceSourceDynamicState<S>>,
 }
@@ -155,8 +166,8 @@ impl<S: ResourceSource> Default for ResourceSourceDynamic<S> {
 }
 
 impl<S: ResourceSource> ResourceSourceDynamic<S> {
-    /// Get a reference to the [handle](ResourceSourceDynamicHandle) that allows modifying the
-    /// underlying resource sources.
+    /// Get a [handle](ResourceSourceDynamicHandle) that allows modifying the children resource
+    /// sources.
     #[inline]
     pub fn handle(&self) -> ResourceSourceDynamicHandle<S> {
         ResourceSourceDynamicHandle(self.state.clone())

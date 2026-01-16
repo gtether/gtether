@@ -243,6 +243,7 @@ use crate::resource::{ResourceLoadError, ResourceReadData};
 
 pub mod constant;
 pub mod dynamic;
+pub mod fs;
 pub mod list;
 
 #[derive(Debug, Clone)]
