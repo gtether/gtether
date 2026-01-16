@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use educe::Educe;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -18,29 +18,41 @@ use crate::resource::source::{ResourceDataResult, ResourceDataSource, ResourceSo
 use crate::resource::watcher::ResourceWatcher;
 use crate::resource::ResourceLoadError;
 
-/// Mutable state of a [ResourceSourceDynamic].
-///
-/// This is where direct mutation of the sources used in a [ResourceSourceDynamic] occurs.
-pub struct ResourceSourceDynamicState<S: ResourceSource> {
+struct ResourceSourceDynamicState<S: ResourceSource> {
     sources: RwLock<Vec<S>>,
     watcher: ResourceWatcher,
 }
 
-impl<S: ResourceSource> ResourceSourceDynamicState<S> {
-    /// Returns the number of sources in the collection.
-    ///
-    /// See also: [`Vec::len()`].
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.sources.read().len()
-    }
+pub struct ResourceSourceDynamicReadGuard<'a, S: ResourceSource>(RwLockReadGuard<'a, Vec<S>>);
 
-    /// Returns a read-locked reference to the sources in this collection.
-    #[inline]
-    pub fn sources(&self) -> RwLockReadGuard<'_, Vec<S>> {
-        self.sources.read()
-    }
+impl<'a, S: ResourceSource> Deref for ResourceSourceDynamicReadGuard<'a, S> {
+    type Target = Vec<S>;
 
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+/// Write guard for [ResourceSourceDynamic].
+///
+/// In addition to providing a read-only dereference to the `Vec<>` of children sources, this guard
+/// also provides specific `mut` methods for inserting, pushing, and removing children.
+pub struct ResourceSourceDynamicWriteGuard<'a, S: ResourceSource> {
+    guard: RwLockWriteGuard<'a, Vec<S>>,
+    watcher: &'a ResourceWatcher,
+}
+
+impl<'a, S: ResourceSource> Deref for ResourceSourceDynamicWriteGuard<'a, S> {
+    type Target = Vec<S>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+impl<'a, S: ResourceSource> ResourceSourceDynamicWriteGuard<'a, S> {
     /// Inserts a source at position `idx`, shifting all sources after it to the right.
     ///
     /// See also: [`Vec::insert()`].
@@ -49,20 +61,18 @@ impl<S: ResourceSource> ResourceSourceDynamicState<S> {
     ///
     /// Panics if `idx` > `len`.
     #[inline]
-    pub fn insert(&self, idx: usize, source: S) {
-        let mut sources = self.sources.write();
+    pub fn insert(&mut self, idx: usize, source: S) {
         self.watcher.insert_child(idx, source.watcher());
-        sources.insert(idx, source);
+        self.guard.insert(idx, source);
     }
 
     /// Appends a source to the back of the collection.
     ///
     /// See also: [`Vec::push()`].
     #[inline]
-    pub fn push(&self, source: S) {
-        let mut sources = self.sources.write();
+    pub fn push(&mut self, source: S) {
         self.watcher.push_child(source.watcher());
-        sources.push(source);
+        self.guard.push(source);
     }
 
     /// Removes the source at position `idx`, shifting all sources after it to the left.
@@ -73,20 +83,18 @@ impl<S: ResourceSource> ResourceSourceDynamicState<S> {
     ///
     /// Panics if `idx` is out of bounds.
     #[inline]
-    pub fn remove(&self, idx: usize) -> S {
-        let mut sources = self.sources.write();
+    pub fn remove(&mut self, idx: usize) -> S {
         self.watcher.remove_child(idx);
-        let source = sources.remove(idx);
-        source
+        self.guard.remove(idx)
     }
 }
 
-impl ResourceSourceDynamicState<Box<dyn ResourceSource>> {
+impl<'a> ResourceSourceDynamicWriteGuard<'a, Box<dyn ResourceSource>> {
     /// Inserts a source dynamically.
     ///
     /// See [`Self::insert()`] for more.
     #[inline]
-    pub fn insert_dyn(&self, idx: usize, source: impl ResourceSource) {
+    pub fn insert_dyn(&mut self, idx: usize, source: impl ResourceSource) {
         self.insert(idx, Box::new(source))
     }
 
@@ -94,26 +102,36 @@ impl ResourceSourceDynamicState<Box<dyn ResourceSource>> {
     ///
     /// See [`Self::push()`] for more.
     #[inline]
-    pub fn push_dyn(&self, source: impl ResourceSource) {
+    pub fn push_dyn(&mut self, source: impl ResourceSource) {
         self.push(Box::new(source))
     }
 }
 
-/// Handle to a [ResourceSourceDynamic] that allows modification of the underlying resource sources.
+/// Handle to a [ResourceSourceDynamic] that allows modification of the children resource sources.
 ///
-/// This dereferences to [ResourceSourceDynamicState], so see that struct for more information.
+/// Use the
+/// [`read()`](ResourceSourceDynamicHandle::read)/[`write()`](ResourceSourceDynamicHandle::write)
+/// methods to get actual access to the resource sources.
 ///
 /// This handle is cheaply cloneable (it just clones the `Arc<>` it wraps).
 #[derive(Educe)]
 #[educe(Clone)]
 pub struct ResourceSourceDynamicHandle<S: ResourceSource>(Arc<ResourceSourceDynamicState<S>>);
 
-impl<S: ResourceSource> Deref for ResourceSourceDynamicHandle<S> {
-    type Target = ResourceSourceDynamicState<S>;
-
+impl<S: ResourceSource> ResourceSourceDynamicHandle<S> {
+    /// Get read access to the children resource sources.
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn read(&self) -> ResourceSourceDynamicReadGuard<'_, S> {
+        ResourceSourceDynamicReadGuard(self.0.sources.read())
+    }
+
+    /// Get write access to the children resource sources.
+    #[inline]
+    pub fn write(&self) -> ResourceSourceDynamicWriteGuard<'_, S> {
+        ResourceSourceDynamicWriteGuard {
+            guard: self.0.sources.write(),
+            watcher: &self.0.watcher,
+        }
     }
 }
 
@@ -254,7 +272,7 @@ mod tests {
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         let (source, data_map) = TestResourceSource::new();
-        handle.push_dyn(source);
+        handle.write().push_dyn(source);
 
         if let Some(start_data) = start_data {
             data_map.lock().insert(start_data.id, start_data.data, start_data.hash);
@@ -282,7 +300,7 @@ mod tests {
             data_map.lock().insert(start_data.id, start_data.data, start_data.hash);
         }
 
-        handle.push_dyn(source);
+        handle.write().push_dyn(source);
 
         assert_manager_load(&manager, key, expected_load_result, 1).await;
     }
@@ -336,7 +354,7 @@ mod tests {
     ) {
         let (main_source, main_data_map) = TestResourceSource::new();
         main_data_map.lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
-        handle.push_dyn(main_source);
+        handle.write().push_dyn(main_source);
 
         let (new_source, new_data_map) = TestResourceSource::new();
         let end = end.map(|end| {
@@ -356,9 +374,9 @@ mod tests {
         {
             let _lock = manager.test_ctx().sync_update.block().await;
             if insert_before {
-                handle.insert_dyn(0, new_source);
+                handle.write().insert_dyn(0, new_source);
             } else {
-                handle.push_dyn(new_source);
+                handle.write().push_dyn(new_source);
             }
             if let ExpectedLoadResult::Ok(expected_value) = &start.expected {
                 let value = value.as_ref().unwrap();
@@ -447,7 +465,7 @@ mod tests {
     ) {
         let data_maps = core::array::from_fn::<_, 4, _>(|_| {
             let (source, data_map) = TestResourceSource::new();
-            handle.push_dyn(source);
+            handle.write().push_dyn(source);
             data_map
         });
 
@@ -459,7 +477,7 @@ mod tests {
         assert_eq!(*value.read(), "value_1".to_owned());
         manager.test_ctx().sync_update.assert_count(0);
 
-        handle.remove(remove_idx);
+        handle.write().remove(remove_idx);
 
         timeout(
             manager.test_ctx().sync_update.wait_attempts(wait_update_attempts),
