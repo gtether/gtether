@@ -9,6 +9,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[package.metadata.release]
+shared-version = true
+
 [lib]
 proc-macro = true
 

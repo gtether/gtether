@@ -3,6 +3,9 @@ name = "reversi"
 version = "0.1.0"
 edition.workspace = true
 
+[package.metadata.release]
+release = false
+
 [dependencies]
 async-trait = { workspace = true }
 bitcode = { workspace = true }

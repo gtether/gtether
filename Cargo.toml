@@ -16,6 +16,9 @@ repository = "https://github.com/gtether/gtether"
 keywords = ["gamedev", "multiplayer"]
 categories = ["game-engines"]
 
+[workspace.metadata.release]
+pre-release-commit-message = "chore: Release {{version}}"
+
 [workspace.dependencies]
 ab_glyph = "0.2"
 ahash = "0.8"
