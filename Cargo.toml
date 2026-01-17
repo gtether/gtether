@@ -63,9 +63,9 @@ vulkano-shaders = "0.34"
 winit = { version = "0.30", features = ["x11", "rwh_05"] }
 
 [workspace.dependencies.gtether]
-version = "0.1"
+version = "0.2"
 path = "gtether"
 
 [workspace.dependencies.gtether_derive]
-version = "0.1"
+version = "0.2"
 path = "gtether_derive"
