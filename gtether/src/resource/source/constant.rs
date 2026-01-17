@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use crate::resource::path::ResourcePath;
-use crate::resource::source::{ResourceData, ResourceWatcher};
-use crate::resource::source::{ResourceSource, ResourceDataResult, SourceIndex};
+
+use crate::resource::id::ResourceId;
+use crate::resource::source::{ResourceData, ResourceDataSource};
+use crate::resource::source::{ResourceDataResult, ResourceSource};
+use crate::resource::watcher::ResourceWatcher;
 use crate::resource::ResourceLoadError;
 
 /// [ResourceSource][rs] that contains static global data.
@@ -15,7 +17,8 @@ use crate::resource::ResourceLoadError;
 ///
 /// [rs]: ResourceSource
 pub struct ConstantResourceSource {
-    raw: HashMap<ResourcePath, (&'static [u8], String)>,
+    raw: HashMap<ResourceId, (&'static [u8], String)>,
+    watcher: ResourceWatcher,
 }
 
 impl ConstantResourceSource {
@@ -28,8 +31,15 @@ impl ConstantResourceSource {
     ///
     /// [smod]: super#data-hashing
     #[inline]
-    pub fn new(raw: HashMap<ResourcePath, (&'static [u8], String)>) -> Self {
-        Self { raw }
+    pub fn new(raw: HashMap<ResourceId, (&'static [u8], String)>) -> Self {
+        let hashes = raw.iter()
+            .map(|(id, (_, hash))| (id.clone(), hash.clone()))
+            .collect::<HashMap<_, _>>();
+        let watcher = ResourceWatcher::new(hashes);
+        Self {
+            raw,
+            watcher,
+        }
     }
 
     /// Create a ConstantResourceSourceBuilder, used to build a ConstantResourceSource.
@@ -43,7 +53,15 @@ impl ConstantResourceSource {
 
 #[async_trait]
 impl ResourceSource for ConstantResourceSource {
-    async fn load(&self, id: &ResourcePath) -> ResourceDataResult {
+    fn hash(&self, id: &ResourceId) -> Option<ResourceDataSource> {
+        if let Some((_, hash)) = self.raw.get(id) {
+            Some(ResourceDataSource::new(hash.clone()))
+        } else {
+            None
+        }
+    }
+
+    async fn load(&self, id: &ResourceId) -> ResourceDataResult {
         if let Some((data, hash)) = self.raw.get(id) {
             Ok(ResourceData::new(Box::new(*data), hash.clone()))
         } else {
@@ -51,12 +69,9 @@ impl ResourceSource for ConstantResourceSource {
         }
     }
 
-    fn watch(&self, _id: ResourcePath, _watcher: Box<dyn ResourceWatcher>, _sub_idx: Option<SourceIndex>) {
-        // Noop because constant data can't change
-    }
-
-    fn unwatch(&self, _id: &ResourcePath) {
-        // Noop because constant data can't change
+    #[inline]
+    fn watcher(&self) -> &ResourceWatcher {
+        &self.watcher
     }
 }
 
@@ -67,7 +82,7 @@ impl ResourceSource for ConstantResourceSource {
 ///
 /// [crs]: ConstantResourceSource
 pub struct ConstantResourceSourceBuilder {
-    raw: HashMap<ResourcePath, (&'static [u8], String)>,
+    raw: HashMap<ResourceId, (&'static [u8], String)>,
 }
 
 impl ConstantResourceSourceBuilder {
@@ -83,13 +98,12 @@ impl ConstantResourceSourceBuilder {
 
     /// Define an individual resource's static data.
     #[inline]
-    pub fn resource(mut self, id: impl Into<ResourcePath>, data: &'static [u8]) -> Self {
+    pub fn resource(mut self, id: impl Into<ResourceId>, data: &'static [u8]) -> Self {
         let hash = STANDARD.encode(&Sha256::digest(data));
         self.raw.insert(id.into(), (data, hash));
         self
     }
 
-    /// Build the [ConstantResourceSource].
     #[inline]
     pub fn build(self) -> ConstantResourceSource {
         ConstantResourceSource::new(self.raw)

@@ -311,25 +311,25 @@ impl EngineRenderHandler for DeferredLightingRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let ambient_graphics = self.ambient_graphics.vk_graphics();
         let directional_graphics = self.directional_graphics.vk_graphics();
 
-        builder.bind_vertex_buffers(0, self.screen_buffer.clone())?;
+        builder.bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap();
 
         builder
-            .bind_pipeline_graphics(ambient_graphics.clone())?
+            .bind_pipeline_graphics(ambient_graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 self.pipeline_layout.clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?
-            .draw(self.screen_buffer.len() as u32, 1, 0, 0)?;
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
+            .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
 
-        builder.bind_pipeline_graphics(directional_graphics.clone())?;
+        builder.bind_pipeline_graphics(directional_graphics.clone()).unwrap();
         let descriptor_sets = self.descriptor_set
-            .descriptor_set_with_offsets().map_err(VulkanoError::from_validated)?;
+            .descriptor_set_with_offsets().map_err(Validated::unwrap)?;
         for descriptor_set in descriptor_sets {
             builder
                 .bind_descriptor_sets(
@@ -337,8 +337,8 @@ impl EngineRenderHandler for DeferredLightingRenderer {
                     self.pipeline_layout.clone(),
                     0,
                     descriptor_set,
-                )?
-                .draw(self.screen_buffer.len() as u32, 1, 0, 0)?;
+                ).unwrap()
+                .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
         }
 
         Ok(())
@@ -369,7 +369,7 @@ impl DeferredLightingRendererBootstrap {
     }
 
     pub fn bootstrap(self: &Arc<Self>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DeferredLightingRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DeferredLightingRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             DeferredLightingRenderer::new(

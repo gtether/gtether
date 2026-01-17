@@ -139,7 +139,7 @@ impl ConsoleLog {
     /// is needed to perform the iteration.
     ///
     /// [record]: ConsoleLogRecord
-    pub fn iter(&self) -> ConsoleLogIter {
+    pub fn iter(&self) -> ConsoleLogIter<'_> {
         let lock = self.buffer.read();
         ConsoleLogIter {
             index_front: 0,

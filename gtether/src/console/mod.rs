@@ -54,7 +54,7 @@ impl Console {
     /// command input while it is active.
     ///
     /// See [ConsoleCommandRegistry] for more.
-    pub fn registry(&self) -> ConsoleCommandRegistry {
+    pub fn registry(&self) -> ConsoleCommandRegistry<'_> {
         ConsoleCommandRegistry {
             inner: self.commands.write(),
         }

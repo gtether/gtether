@@ -7,6 +7,7 @@ use std::thread;
 use tracing::{event, Level};
 use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
+use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -33,10 +34,11 @@ use crate::render::font::Font;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::render_pass::EngineRenderHandler;
 use crate::render::uniform::Uniform;
-use crate::render::{FlatVertex, RenderTarget, Renderer, RendererStaleEvent, VulkanoError};
+use crate::render::{FlatVertex, RenderTarget, Renderer, RendererStaleEvent, TexturedFlatVertex, VulkanoError};
 use crate::resource::{Resource, ResourceLoadError};
 use crate::NonExhaustive;
 use crate::render::descriptor_set::EngineDescriptorSet;
+use crate::render::image::{EngineImageViewSampler, VKImageViewSource};
 
 /// General alignment configuration for a [ConsoleGui] section.
 #[derive(Debug, Clone)]
@@ -117,6 +119,23 @@ impl ConsoleGuiLayout {
             max.y * 2.0 - 1.0,
         ))
     }
+
+    /// Calculate the (x,y) min and max bounds for the uv coords for rendering images on the
+    /// [ConsoleGui].
+    ///
+    /// Bounds are between 0.0 and 1.0, inclusive.
+    pub fn uv_bounds(&self) -> (glm::TVec2<f32>, glm::TVec2<f32>) {
+        match self.alignment {
+            ConsoleGuiAlignment::Top => (
+                glm::vec2(0.0, 1.0 - self.size),
+                glm::vec2(1.0, 1.0),
+            ),
+            ConsoleGuiAlignment::Bottom => (
+                glm::vec2(0.0, 0.0),
+                glm::vec2(1.0, self.size),
+            )
+        }
+    }
 }
 
 /// [ConsoleGui] background configuration for a solid background color.
@@ -143,12 +162,41 @@ impl Default for BackgroundSolid {
     }
 }
 
+/// [ConsoleGui] background configuration for a textured image.
+#[derive(Debug, Clone)]
+pub struct BackgroundImage {
+    /// [ImageView] [source](VKImageViewSource) to retrieve the background image from.
+    pub image: Arc<Resource<dyn VKImageViewSource>>,
+
+    /// Base solid color + alpha.
+    ///
+    /// The color will be multiplied by the image pixel color, which can be used to create a darker
+    /// image. The alpha will be directly applied.
+    pub base: BackgroundSolid,
+}
+
+impl BackgroundImage {
+    /// Create a BackgroundImage configuration for an ImageView source.
+    ///
+    /// Will use a color of (0.5, 0.5, 0.5), making the image half dark, and an alpha of 0.8.
+    pub fn from_image(image: Arc<Resource<dyn VKImageViewSource>>) -> Self {
+        Self {
+            image,
+            base: BackgroundSolid {
+                color: glm::vec3(0.5, 0.5, 0.5),
+                alpha: 0.8,
+            }
+        }
+    }
+}
+
 /// [ConsoleGui] background configuration.
 #[derive(Debug, Clone)]
 pub enum ConsoleGuiBackground {
     /// A solid background color with transparency.
     Solid(BackgroundSolid),
-    // TODO: Add an image background option
+    /// A textured image with transparency.
+    Image(BackgroundImage),
 }
 
 impl Default for ConsoleGuiBackground {
@@ -399,7 +447,7 @@ impl ConsoleGui {
     ///
     /// [rpb]: crate::render::render_pass::EngineRenderPassBuilder
     pub fn bootstrap_renderer(self: &Arc<Self>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> ConsoleRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> ConsoleRenderer + use<> {
         let self_clone = self.clone();
         |renderer, subpass| {
             ConsoleRenderer::new(renderer, subpass, self_clone)
@@ -550,30 +598,206 @@ impl ConsoleBackgroundSolidRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?
-            .bind_vertex_buffers(0, self.buffer.clone())?
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
+            .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
             .draw(
                 self.buffer.len() as u32,
                 1,
                 0,
                 0,
-            )?;
+            ).unwrap();
+        Ok(())
+    }
+}
+
+mod background_image_vert {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        src: r"
+            #version 460
+
+            layout(location = 0) in vec2 position;
+            layout(location = 1) in vec2 uv;
+            layout(location = 0) out vec2 tex_coords;
+
+            void main() {
+                gl_Position = vec4(position, 0.0, 1.0);
+                tex_coords = uv;
+            }
+        ",
+    }
+}
+
+mod background_image_frag {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: r"
+            #version 460
+
+            layout(location = 0) in vec2 tex_coords;
+            layout(location = 0) out vec4 f_color;
+
+            layout(set = 0, binding = 0) uniform sampler2D s;
+            layout(set = 0, binding = 1) uniform ColorData {
+                vec3 color;
+                float alpha;
+            } color;
+
+            void main() {
+                f_color = texture(s, tex_coords, 1.0) * vec4(color.color, color.alpha);
+            }
+        ",
+    }
+}
+
+struct ConsoleBackgroundImageRenderer {
+    graphics: Arc<EngineGraphicsPipeline>,
+    buffer: Subbuffer<[TexturedFlatVertex]>,
+    descriptor_set: EngineDescriptorSet,
+}
+
+impl ConsoleBackgroundImageRenderer {
+    fn new(
+        renderer: &Arc<Renderer>,
+        subpass: &Subpass,
+        gui: &Arc<ConsoleGui>,
+        image: &BackgroundImage,
+    ) -> Self {
+        let (pos_min, pos_max) = gui.layout.screen_bounds();
+        let (uv_min, uv_max) = gui.layout.uv_bounds();
+        let buffer = TexturedFlatVertex::buffer(
+            renderer.device().memory_allocator().clone(),
+            pos_min, pos_max,
+            uv_min, uv_max,
+        );
+
+        let background_vert = background_image_vert::load(renderer.device().vk_device().clone())
+            .expect("Failed to create vertex shader module")
+            .entry_point("main").unwrap();
+
+        let background_frag = background_image_frag::load(renderer.device().vk_device().clone())
+            .expect("Failed to create fragment shader module")
+            .entry_point("main").unwrap();
+
+        let vertex_input_state = Some(TexturedFlatVertex::per_vertex()
+            .definition(&background_vert.info().input_interface)
+            .unwrap());
+
+        let stages = [
+            PipelineShaderStageCreateInfo::new(background_vert),
+            PipelineShaderStageCreateInfo::new(background_frag),
+        ];
+
+        let layout = PipelineLayout::new(
+            renderer.device().vk_device().clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(renderer.device().vk_device().clone())
+                .unwrap(),
+        ).unwrap();
+        let descriptor_layout = layout.set_layouts().get(0).unwrap().clone();
+
+        let create_info = GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state,
+            subpass: Some(subpass.clone().into()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend::alpha()),
+                    ..Default::default()
+                },
+            )),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        };
+
+        let graphics = EngineGraphicsPipeline::new(
+            renderer,
+            create_info,
+            ViewportType::TopLeft,
+        );
+
+        let sampler = Arc::new(EngineImageViewSampler::new(
+            image.image.read().image_view().clone(),
+            Sampler::new(
+                renderer.device().vk_device().clone(),
+                SamplerCreateInfo {
+                    mag_filter: Filter::Linear,
+                    min_filter: Filter::Linear,
+                    ..Default::default()
+                }
+            ).unwrap(),
+        ));
+        let cb_sampler = sampler.clone();
+        image.image.attach_update_callback_blocking(move |image| {
+            let cb_sampler = cb_sampler.clone();
+            async move {
+                cb_sampler.set_image_view(image.read().image_view().clone());
+            }
+        });
+
+        let alpha = Arc::new(Uniform::new(
+            renderer.device().clone(),
+            renderer.frame_manager(),
+            image.base.clone(),
+        ).unwrap());
+
+        let descriptor_set = EngineDescriptorSet::builder(renderer.clone())
+            .layout(descriptor_layout)
+            .descriptor_source(0, sampler)
+            .descriptor_source(1, alpha)
+            .build();
+
+        Self {
+            graphics,
+            buffer,
+            descriptor_set,
+        }
+    }
+
+    fn build_commands(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    ) -> Result<(), VulkanoError> {
+        let graphics = self.graphics.vk_graphics();
+
+        builder
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                graphics.layout().clone(),
+                0,
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
+            .bind_vertex_buffers(0, self.buffer.clone()).unwrap()
+            .draw(
+                self.buffer.len() as u32,
+                1,
+                0,
+                0,
+            ).unwrap();
         Ok(())
     }
 }
 
 enum ConsoleBackgroundRenderer {
     Solid(ConsoleBackgroundSolidRenderer),
+    Image(ConsoleBackgroundImageRenderer),
 }
 
 impl ConsoleBackgroundRenderer {
@@ -582,15 +806,20 @@ impl ConsoleBackgroundRenderer {
             ConsoleGuiBackground::Solid(bg) => ConsoleBackgroundRenderer::Solid(
                 ConsoleBackgroundSolidRenderer::new(renderer, subpass, gui, bg.clone())
             ),
+            ConsoleGuiBackground::Image(image) => ConsoleBackgroundRenderer::Image(
+                ConsoleBackgroundImageRenderer::new(renderer, subpass, gui, image)
+            )
         }
     }
 
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         match self {
             ConsoleBackgroundRenderer::Solid(renderer)
+                => renderer.build_commands(builder),
+            ConsoleBackgroundRenderer::Image(renderer)
                 => renderer.build_commands(builder),
         }
     }
@@ -655,7 +884,7 @@ impl EngineRenderHandler for ConsoleRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         if !self.gui.visible.load(Ordering::Relaxed) {
             // Nothing to draw
             return Ok(());

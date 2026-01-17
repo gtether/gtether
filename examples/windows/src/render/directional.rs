@@ -136,16 +136,16 @@ impl EngineRenderHandler for DirectionalRenderer {
     fn build_commands(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
-            .bind_vertex_buffers(0, self.screen_buffer.clone())?;
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
+            .bind_vertex_buffers(0, self.screen_buffer.clone()).unwrap();
 
         let descriptor_sets = self.descriptor_set
             .descriptor_set_with_offsets()
-            .map_err(VulkanoError::from_validated)?;
+            .map_err(Validated::unwrap)?;
         for descriptor_set in descriptor_sets {
             builder
                 .bind_descriptor_sets(
@@ -153,8 +153,8 @@ impl EngineRenderHandler for DirectionalRenderer {
                     graphics.layout().clone(),
                     0,
                     descriptor_set,
-                )?
-                .draw(self.screen_buffer.len() as u32, 1, 0, 0)?;
+                ).unwrap()
+                .draw(self.screen_buffer.len() as u32, 1, 0, 0).unwrap();
         }
         Ok(())
     }
@@ -177,7 +177,7 @@ impl DirectionalRendererBootstrap {
     }
 
     pub fn bootstrap(self: &Arc<DirectionalRendererBootstrap>)
-            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DirectionalRenderer {
+            -> impl FnOnce(&Arc<Renderer>, &Subpass) -> DirectionalRenderer + use<> {
         let self_clone = self.clone();
         move |renderer, subpass| {
             DirectionalRenderer::new(renderer, subpass, self_clone.lights.clone())

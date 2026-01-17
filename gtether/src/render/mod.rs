@@ -10,7 +10,7 @@ use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, Standar
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Features, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
 use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
@@ -194,11 +194,15 @@ impl EngineDevice {
     ///
     /// This generally only needs to be used if you are implementing a custom RenderTarget, as
     /// otherwise device creation is handled by the engine.
-    pub fn for_surface(instance: Arc<Instance>, surface: Arc<Surface>) -> Self {
-        // TODO: does this need to be configurable?
+    pub fn for_surface(
+        instance: Arc<Instance>,
+        device_extensions: DeviceExtensions,
+        device_features: Features,
+        surface: Arc<Surface>,
+    ) -> Self {
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
-            ..DeviceExtensions::empty()
+            ..device_extensions
         };
 
         let (physical_device, queue_family_index) = instance
@@ -228,6 +232,7 @@ impl EngineDevice {
                     ..Default::default()
                 }],
                 enabled_extensions: device_extensions,
+                enabled_features: device_features,
                 ..Default::default()
             },
         ).expect("Failed to create device");
@@ -714,5 +719,64 @@ impl FlatVertex {
     #[inline]
     pub fn screen_buffer(alloc: Arc<dyn MemoryAllocator>) -> Subbuffer<[Self]> {
         Self::buffer(alloc, glm::vec2(-1.0, -1.0), glm::vec2(1.0, 1.0))
+    }
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct TexturedFlatVertex {
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
+    #[format(R32G32_SFLOAT)]
+    uv: [f32; 2],
+}
+
+impl TexturedFlatVertex {
+    pub fn rect(
+        pos_min: glm::TVec2<f32>,
+        pos_max: glm::TVec2<f32>,
+        uv_min: glm::TVec2<f32>,
+        uv_max: glm::TVec2<f32>,
+    ) -> [TexturedFlatVertex; 6] {
+        [
+            TexturedFlatVertex { position: [ pos_min.x, pos_min.y ], uv: [ uv_min.x, uv_min.y ]},
+            TexturedFlatVertex { position: [ pos_min.x, pos_max.y ], uv: [ uv_min.x, uv_max.y ]},
+            TexturedFlatVertex { position: [ pos_max.x, pos_max.y ], uv: [ uv_max.x, uv_max.y ]},
+            TexturedFlatVertex { position: [ pos_min.x, pos_min.y ], uv: [ uv_min.x, uv_min.y ]},
+            TexturedFlatVertex { position: [ pos_max.x, pos_max.y ], uv: [ uv_max.x, uv_max.y ]},
+            TexturedFlatVertex { position: [ pos_max.x, pos_min.y ], uv: [ uv_max.x, uv_min.y ]},
+        ]
+    }
+
+    pub fn buffer(
+        alloc: Arc<dyn MemoryAllocator>,
+        pos_min: glm::TVec2<f32>,
+        pos_max: glm::TVec2<f32>,
+        uv_min: glm::TVec2<f32>,
+        uv_max: glm::TVec2<f32>,
+    ) -> Subbuffer<[Self]> {
+        Buffer::from_iter(
+            alloc,
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            Self::rect(pos_min, pos_max, uv_min, uv_max),
+        ).unwrap()
+    }
+
+    #[inline]
+    pub fn screen_buffer(alloc: Arc<dyn MemoryAllocator>) -> Subbuffer<[Self]> {
+        Self::buffer(
+            alloc,
+            glm::vec2(-1.0, -1.0),
+            glm::vec2(1.0, 1.0),
+            glm::vec2(0.0, 0.0),
+            glm::vec2(1.0, 1.0),
+        )
     }
 }

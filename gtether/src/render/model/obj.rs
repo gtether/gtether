@@ -9,9 +9,8 @@ use vulkano::Validated;
 
 use crate::render::model::{Model, ModelVertex, ModelVertexNormal, ModelVertexNormalColor, ModelVertexNormalTex};
 use crate::render::EngineDevice;
-use crate::resource::manager::ResourceManager;
-use crate::resource::path::ResourcePath;
 use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+use crate::resource::manager::ResourceLoadContext;
 
 pub struct ModelObjLoader<V: Vertex> {
     device: Arc<EngineDevice>,
@@ -94,9 +93,8 @@ impl<V: Vertex> ModelObjLoader<V> {
 impl ResourceLoader<Model<ModelVertex>> for ModelObjLoader<ModelVertex> {
     async fn load(
         &self,
-        _manager: &Arc<ResourceManager>,
-        _id: ResourcePath,
         data: ResourceReadData,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertex>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
 
@@ -115,9 +113,8 @@ impl ResourceLoader<Model<ModelVertex>> for ModelObjLoader<ModelVertex> {
 impl ResourceLoader<Model<ModelVertexNormal>> for ModelObjLoader<ModelVertexNormal> {
     async fn load(
         &self,
-        _manager: &Arc<ResourceManager>,
-        _id: ResourcePath,
         data: ResourceReadData,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertexNormal>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
         Self::check_obj_normals(&model)?;
@@ -141,9 +138,8 @@ impl ResourceLoader<Model<ModelVertexNormal>> for ModelObjLoader<ModelVertexNorm
 impl ResourceLoader<Model<ModelVertexNormalColor>> for ModelObjLoader<ModelVertexNormalColor> {
     async fn load(
         &self,
-        _manager: &Arc<ResourceManager>,
-        _id: ResourcePath,
         data: ResourceReadData,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertexNormalColor>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
         Self::check_obj_normals(&model)?;
@@ -170,9 +166,8 @@ impl ResourceLoader<Model<ModelVertexNormalColor>> for ModelObjLoader<ModelVerte
 impl ResourceLoader<Model<ModelVertexNormalTex>> for ModelObjLoader<ModelVertexNormalTex> {
     async fn load(
         &self,
-        _manager: &Arc<ResourceManager>,
-        _id: ResourcePath,
         data: ResourceReadData,
+        _ctx: &ResourceLoadContext,
     ) -> Result<Box<Model<ModelVertexNormalTex>>, ResourceLoadError> {
         let model = Self::load_obj_model(data).await?;
         Self::check_obj_normals(&model)?;

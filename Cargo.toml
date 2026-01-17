@@ -9,12 +9,15 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 authors = ["James De Broeck <debroejm@gmail.com>"]
 license = "BSD-2-Clause-Patent"
 repository = "https://github.com/gtether/gtether"
 keywords = ["gamedev", "multiplayer"]
 categories = ["game-engines"]
+
+[workspace.metadata.release]
+pre-release-commit-message = "chore: Release {{version}}"
 
 [workspace.dependencies]
 ab_glyph = "0.2"
@@ -25,15 +28,22 @@ async-trait = "0.1"
 base64 = "0.22"
 bimap = "0.6"
 bitcode = "0.6"
+boxcar = "0.2.14"
 bytemuck = "1.21"
 chrono = "0.4"
 crossbeam = "0.8"
 educe = "0.6"
 flagset = "0.4"
+futures-core = "0.3"
+futures-util = "0.3"
 game-networking-sockets = "0.1"
 image = "0.25"
 itertools = "0.14"
 nalgebra-glm = { version = "0.19.0", features = ["convert-bytemuck"]}
+notify = "8.2"
+notify-debouncer-full = "0.6"
+ouroboros = "0.18.5"
+papaya = "0.2.3"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 parry3d = "0.18"
 regex = "1.11"

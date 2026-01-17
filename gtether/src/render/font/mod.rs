@@ -26,17 +26,17 @@
 //! # use gtether::resource::manager::ResourceManager;
 //! use gtether::resource::manager::LoadPriority;
 //! #
+//! # async fn wrapper() {
 //! # let resource_manager: Arc<ResourceManager> = return;
 //! # let renderer: &Arc<Renderer> = return;
 //! # let subpass: &Subpass = return;
 //! # let render_target: Arc<dyn RenderTarget> = return;
 //! # let font_data: Vec<u8> = return;
 //!
-//! let font = resource_manager.get_or_load(
+//! let font = resource_manager.get_with_loader(
 //!     "my_font",
 //!     GlyphFontLoader::new(renderer.clone()),
-//!     LoadPriority::Immediate
-//! ).wait().unwrap();
+//! ).await.unwrap();
 //!
 //! let font_sheet = FontSheet::from_font(
 //!     &font,
@@ -52,6 +52,7 @@
 //!         font_sheet.clone(),
 //!     ),
 //! );
+//! # }
 //! ```
 //!
 //! Render a [TextLayout][tl] (generally done as part of a parent render handler)
@@ -73,7 +74,7 @@
 //!     fn build_commands(
 //!         &self,
 //!         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-//!     ) -> Result<(), Validated<VulkanoError>> {
+//!     ) -> Result<(), VulkanoError> {
 //!         let layout = self.layout.lock().unwrap();
 //!         let mut font_pass = self.compositor.begin_pass(builder);
 //!         font_pass.layout(&layout);

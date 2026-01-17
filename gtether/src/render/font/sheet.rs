@@ -32,12 +32,11 @@ use crate::render::font::compositor::FontRenderer;
 use crate::render::font::layout::PositionedChar;
 use crate::render::font::size::FontSizer;
 use crate::render::font::Font;
-use crate::render::image::ImageSampler;
+use crate::render::image::EngineImageViewSampler;
 use crate::render::pipeline::{EngineGraphicsPipeline, VKGraphicsPipelineSource, ViewportType};
 use crate::render::{EngineDevice, FlatVertex, RenderTarget, Renderer, RendererPostEvent, VulkanoError};
 use crate::render::descriptor_set::EngineDescriptorSet;
-use crate::resource::manager::ResourceLoadResult;
-use crate::resource::{Resource, ResourceLoadError, ResourceMut, SubResourceLoader};
+use crate::resource::{Resource, ResourceLoadError, ResourceLoadResult, ResourceMut, SubResourceLoader};
 
 /// Starting character code (inclusive) of the Unicode Latin chart
 pub const UNICODE_LATIN_START: u32 = 0x20;
@@ -381,7 +380,7 @@ impl FontSheetRenderer {
             ViewportType::TopLeft,
         );
 
-        let font_sampler = Arc::new(ImageSampler::new(
+        let font_sampler = Arc::new(EngineImageViewSampler::new(
             font_sheet.read().image_view().clone(),
             Sampler::new(
                 renderer.device().vk_device().clone(),
@@ -427,7 +426,7 @@ impl FontRenderer for FontSheetRenderer {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         buffer: Vec<PositionedChar>,
-    ) -> Result<(), Validated<VulkanoError>> {
+    ) -> Result<(), VulkanoError> {
         let graphics = self.graphics.vk_graphics();
 
         let font_sheet = self.font_sheet.read();
@@ -479,27 +478,27 @@ impl FontRenderer for FontSheetRenderer {
                 ..Default::default()
             },
             glyphs,
-        ).map_err(VulkanoError::from_validated)?;
+        ).map_err(Validated::unwrap)?;
         let instance_buffer_len = instance_buffer.len() as u32;
 
         builder
-            .bind_pipeline_graphics(graphics.clone())?
+            .bind_pipeline_graphics(graphics.clone()).unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 graphics.layout().clone(),
                 0,
-                self.descriptor_set.descriptor_set().map_err(VulkanoError::from_validated)?,
-            )?
+                self.descriptor_set.descriptor_set().map_err(Validated::unwrap)?,
+            ).unwrap()
             .bind_vertex_buffers(0, (
                 self.glyph_buffer.clone(),
                 instance_buffer,
-            ))?
+            )).unwrap()
             .draw(
                 self.glyph_buffer.len() as u32,
                 instance_buffer_len,
                 0,
                 0,
-            )?;
+            ).unwrap();
         Ok(())
     }
 }

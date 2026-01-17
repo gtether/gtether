@@ -529,7 +529,7 @@ where
 
     /// Acquire a lock on the current [Frame].
     #[inline]
-    pub fn current(&self) -> MappedMutexGuard<Frame<T>> {
+    pub fn current(&self) -> MappedMutexGuard<'_, Frame<T>> {
         let current_frame_idx = self.manager.current_idx();
         MutexGuard::map(self.frames.lock(), |frames| {
             &mut frames.as_mut().unwrap()[current_frame_idx]
@@ -546,7 +546,7 @@ where
     ///
     /// Yields `None` if the given `frame_idx` is out of bounds.
     #[inline]
-    pub fn get(&self, frame_idx: usize) -> Option<MappedMutexGuard<Frame<T>>> {
+    pub fn get(&self, frame_idx: usize) -> Option<MappedMutexGuard<'_, Frame<T>>> {
         let guard = self.frames.lock();
         if frame_idx < guard.as_ref().unwrap().len() {
             Some(MutexGuard::map(guard, |frames| {
