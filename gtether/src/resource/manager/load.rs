@@ -13,10 +13,10 @@ use tracing::{debug, error, info_span, trace, warn, Instrument};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::{DependencyGraph, DependencyGraphLayer};
-use crate::resource::manager::executor::{ManagerExecutor, ManagerTask, TaskPriority};
 use crate::resource::manager::source::Sources;
+use crate::resource::manager::task::{ManagerExecutor, TaskPriority};
 use crate::resource::manager::update::{UpdateOutput, UpdateOutputUntyped, Updates};
-use crate::resource::manager::{ResourceFuture, ResourceFutureInner};
+use crate::resource::manager::{ManagerTask, ResourceFuture, ResourceFutureInner};
 use crate::resource::source::SourceIndex;
 use crate::resource::{Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceMut};
 use crate::util::waker::MultiWaker;
@@ -27,21 +27,40 @@ use crate::util::waker::MultiWaker;
 #[derive(Debug, Clone, Copy)]
 pub enum LoadPriority {
     /// Load this resource as soon as possible.
-    Immediate,
+    ///
+    /// Use the `i64` value for more specific priority ordering. Higher values mean higher priority.
+    Immediate(i64),
+
     /// This resource is not needed immediately, so load it when there is time.
-    Delayed,
+    ///
+    /// use the `i64` value for more specific priority ordering. Higher values mean higher priority.
+    Delayed(i64),
+}
+
+impl LoadPriority {
+    /// [Immediate](Self::Immediate) priority with a default sub-priority of `0`.
+    #[inline]
+    pub fn immediate() -> Self {
+        Self::Immediate(0)
+    }
+
+    /// [Delayed](Self::Delayed) priority with a default sub-priority of `0`.
+    #[inline]
+    pub fn delayed() -> Self {
+        Self::Delayed(0)
+    }
 }
 
 impl Default for LoadPriority {
     #[inline]
-    fn default() -> Self { LoadPriority::Immediate }
+    fn default() -> Self { LoadPriority::immediate() }
 }
 
 impl Display for LoadPriority {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoadPriority::Immediate => f.write_str("Immediate"),
-            LoadPriority::Delayed => f.write_str("Delayed"),
+            LoadPriority::Immediate(val) => write!(f, "Immediate({val})"),
+            LoadPriority::Delayed(val) => write!(f, "Delayed({val})"),
         }
     }
 }
@@ -50,8 +69,8 @@ impl From<LoadPriority> for TaskPriority {
     #[inline]
     fn from(value: LoadPriority) -> Self {
         match value {
-            LoadPriority::Immediate => Self::Immediate,
-            LoadPriority::Delayed => Self::Delayed,
+            LoadPriority::Immediate(val) => Self::Immediate(val),
+            LoadPriority::Delayed(val) => Self::Delayed(val),
         }
     }
 }

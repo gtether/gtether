@@ -148,25 +148,26 @@ use std::task::{Context, Poll, Waker};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::DependencyGraph;
-use crate::resource::manager::executor::ManagerExecutor;
 use crate::resource::manager::load::{Cache, ResourceLoadFuture, ResourceLoadOperation, ResourceLoadParams};
 use crate::resource::manager::source::Sources;
+use crate::resource::manager::task::ManagerExecutor;
 use crate::resource::manager::update::{ResourceUpdateFuture, UpdateManager};
 use crate::resource::source::ResourceSource;
+use crate::resource::watcher::ResourceWatcherConfig;
 use crate::resource::{ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader};
+use crate::util::executor::ExecutorBuilder;
 
 pub mod dependency;
-mod executor;
 mod load;
 mod source;
+mod task;
 mod update;
 
-pub use executor::ManagerTask;
 pub use load::{
     LoadPriority,
     ResourceLoadContext,
 };
-use crate::resource::watcher::ResourceWatcherConfig;
+pub use task::ManagerTask;
 
 enum ResourceFutureInner<T: ?Sized + Send + Sync + 'static> {
     Cached(ResourceLoadResult<T>),
@@ -449,7 +450,7 @@ impl ResourceManager {
     where
         T: ResourceDefaultLoader,
     {
-        self.get_with_priority(id, LoadPriority::Immediate)
+        self.get_with_priority(id, LoadPriority::immediate())
     }
 
     /// Get/load a [Resource] with a default [ResourceLoader].
@@ -483,7 +484,7 @@ impl ResourceManager {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.get_with_loader_priority(id, loader, LoadPriority::Immediate)
+        self.get_with_loader_priority(id, loader, LoadPriority::immediate())
     }
 
     /// Get/load a [Resource].
@@ -530,6 +531,7 @@ impl Drop for ResourceManager {
 #[derive(Default)]
 pub struct ResourceManagerBuilder {
     sources: Vec<Box<dyn ResourceSource>>,
+    worker_count: Option<usize>,
 }
 
 impl ResourceManagerBuilder {
@@ -546,9 +548,26 @@ impl ResourceManagerBuilder {
         self
     }
 
+    /// Set the number of worker threads that will be spawned to handle load requests.
+    ///
+    /// Load requests are handled using an async executor, so even 1 thread can handle many load
+    /// requests.
+    ///
+    /// Default value is `1`.
+    #[inline]
+    pub fn worker_count(mut self, worker_count: usize) -> Self {
+        self.worker_count = Some(worker_count);
+        self
+    }
+
     #[inline]
     pub fn build(self) -> Arc<ResourceManager> {
-        let executor = Arc::new(ManagerExecutor::new());
+        let executor = Arc::new(
+            ExecutorBuilder::default()
+                .worker_count(self.worker_count.unwrap_or(1))
+                .static_priority()
+                .build()
+        );
         let mut update_manager = UpdateManager::new();
         let mut sources = self.sources;
         for (idx, source) in sources.iter_mut().enumerate() {
@@ -610,8 +629,8 @@ pub mod tests {
     use test_log::test as test_log;
 
     use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdate};
-    use crate::resource::{Resource, ResourceReadData};
     use crate::resource::watcher::{ResourceHashProvider, ResourceWatcher};
+    use crate::resource::{Resource, ResourceReadData};
 
     pub(in crate::resource) async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
