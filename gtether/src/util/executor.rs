@@ -10,14 +10,13 @@ use slab::Slab;
 use smol::future;
 use smol::future::FutureExt;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{atomic, Arc};
 use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
 
-use crate::util::priority::{HasDynamicPriority, HasStaticPriority};
+use crate::util::priority::{DynamicPriorityQueue, HasDynamicPriority, HasStaticPriority, PriorityQueue, StaticPriorityQueue};
 
 trait Metadata: Ord {
     fn increment_attempts(&self);
@@ -136,18 +135,20 @@ impl<M: Metadata> RunnableOrd<M> {
     }
 }
 
+impl<P: HasDynamicPriority> HasDynamicPriority for RunnableOrd<DynamicMetadata<P>> {
+    type Value = P::Value;
+
+    #[inline]
+    fn priority(&self) -> Self::Value {
+        self.0.metadata().priority()
+    }
+}
+
 trait ExecutorState: Send + Sync + 'static {
     type Metadata: Metadata;
+    type Queue: PriorityQueue<RunnableOrd<Self::Metadata>>;
 
-
-    fn push(&mut self, runnable: Runnable<Self::Metadata>);
-
-    fn pop(&mut self) -> Option<Runnable<Self::Metadata>>;
-
-    // This will be used when the logic to re-schedule a task directly to its worker thread is
-    // implemented.
-    #[allow(unused)]
-    fn swap_if_higher(&mut self, runnable: Runnable<Self::Metadata>) -> Runnable<Self::Metadata>;
+    fn queue(&mut self) -> &mut Self::Queue;
 }
 
 /// Executor state for an [Executor] using static priorities.
@@ -155,29 +156,15 @@ trait ExecutorState: Send + Sync + 'static {
 /// This type isn't publicly constructable, and is only available for naming to use as a generic for
 /// [Executor].
 pub struct StaticPriority<P: HasStaticPriority> {
-    queue: BinaryHeap<RunnableOrd<StaticMetadata<P>>>,
+    queue: StaticPriorityQueue<RunnableOrd<StaticMetadata<P>>>,
 }
 
 impl<P: HasStaticPriority + Send + Sync + 'static> ExecutorState for StaticPriority<P> {
     type Metadata = StaticMetadata<P>;
+    type Queue = StaticPriorityQueue<RunnableOrd<Self::Metadata>>;
 
-    fn push(&mut self, runnable: Runnable<Self::Metadata>) {
-        self.queue.push(RunnableOrd(runnable));
-    }
-
-    fn pop(&mut self) -> Option<Runnable<Self::Metadata>> {
-        self.queue.pop().map(RunnableOrd::into_inner)
-    }
-
-    fn swap_if_higher(&mut self, runnable: Runnable<Self::Metadata>) -> Runnable<Self::Metadata> {
-        let runnable = RunnableOrd(runnable);
-        if let Some(highest) = self.queue.peek() && highest > &runnable {
-            let new_runnable = self.queue.pop().unwrap();
-            self.queue.push(runnable);
-            new_runnable.into_inner()
-        } else {
-            runnable.into_inner()
-        }
+    fn queue(&mut self) -> &mut Self::Queue {
+        &mut self.queue
     }
 }
 
@@ -186,50 +173,15 @@ impl<P: HasStaticPriority + Send + Sync + 'static> ExecutorState for StaticPrior
 /// This type isn't publicly constructable, and is only available for naming to use as a generic for
 /// [Executor].
 pub struct DynamicPriority<P: HasDynamicPriority> {
-    queue: Vec<RunnableOrd<DynamicMetadata<P>>>,
-}
-
-fn find_highest_vec_idx<P: HasDynamicPriority>(
-    runnables: &Vec<RunnableOrd<DynamicMetadata<P>>>,
-) -> Option<(usize, &RunnableOrd<DynamicMetadata<P>>)> {
-    let mut highest: Option<(usize, &RunnableOrd<DynamicMetadata<P>>)> = None;
-    for (idx, runnable) in runnables.iter().enumerate() {
-        match highest {
-            Some((_, ref highest_priority)) => {
-                if runnable > *highest_priority {
-                    highest = Some((idx, runnable));
-                }
-            },
-            None => {
-                highest = Some((idx, runnable));
-            }
-        }
-    }
-    highest
+    queue: DynamicPriorityQueue<RunnableOrd<DynamicMetadata<P>>>,
 }
 
 impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorState for DynamicPriority<P> {
     type Metadata = DynamicMetadata<P>;
+    type Queue = DynamicPriorityQueue<RunnableOrd<Self::Metadata>>;
 
-    fn push(&mut self, runnable: Runnable<Self::Metadata>) {
-        self.queue.push(RunnableOrd(runnable));
-    }
-
-    fn pop(&mut self) -> Option<Runnable<Self::Metadata>> {
-        find_highest_vec_idx(&self.queue)
-            .map(|(idx, _)| idx)
-            .map(|idx| self.queue.swap_remove(idx).into_inner())
-    }
-
-    fn swap_if_higher(&mut self, runnable: Runnable<Self::Metadata>) -> Runnable<Self::Metadata> {
-        let runnable = RunnableOrd(runnable);
-        if let Some((idx, highest)) = find_highest_vec_idx(&self.queue) && highest > &runnable {
-            let new_runnable = self.queue.swap_remove(idx);
-            self.queue.push(runnable);
-            new_runnable.into_inner()
-        } else {
-            runnable.into_inner()
-        }
+    fn queue(&mut self) -> &mut Self::Queue {
+        &mut self.queue
     }
 }
 
@@ -353,7 +305,7 @@ impl<'a, S: ExecutorState> Executor<'a, S> {
             runnable.metadata().increment_attempts();
             let state = state.upgrade()
                 .expect("task_queue dropped before scheduled!");
-            state.lock().push(runnable);
+            state.lock().queue().push(RunnableOrd(runnable));
             for worker in &workers {
                 worker.wake();
             }
@@ -469,10 +421,17 @@ impl<S: ExecutorState> Drop for Executor<'_, S> {
         {
             // Forcibly drain the queue to clear any held cyclic Arcs
             let mut state = self.state.lock();
-            while state.pop().is_some() {}
+            let queue = state.queue();
+            while queue.pop().is_some() {}
         }
     }
 }
+
+/// Alias for an [Executor] using static priorities.
+pub type StaticPriorityExecutor<'a, P> = Executor<'a, StaticPriority<P>>;
+
+/// Alias for an [Executor] using dynamic priorities.
+pub type DynamicPriorityExecutor<'a, P> = Executor<'a, DynamicPriority<P>>;
 
 /// Builder pattern for [Executor].
 ///
@@ -710,7 +669,7 @@ impl<S: ExecutorState> Worker<S> {
     async fn runnable(&self) -> Runnable<S::Metadata> {
         future::poll_fn(|cx| {
             loop {
-                match self.state.lock().pop() {
+                match self.state.lock().queue().pop() {
                     None => {
                         if !self.sleep(cx.waker()) {
                             // Only returning this after sleeping twice and not detecting a change
@@ -722,7 +681,7 @@ impl<S: ExecutorState> Worker<S> {
                     },
                     Some(r) => {
                         self.waker.lock().take();
-                        return Poll::Ready(r)
+                        return Poll::Ready(r.into_inner())
                     },
                 }
             }
