@@ -213,14 +213,14 @@ mod tests {
     use test_log::test as test_log;
 
     use crate::resource::manager::tests::{timeout, ExpectedDataEntry, ExpectedLoadResult, TestDataEntry, TestResLoader, TestResourceSource};
-    use crate::resource::manager::ResourceManager;
+    use crate::resource::manager::{ResourceManager, ResourceManagerWorkerPriorityConfig};
     use crate::worker::WorkerPool;
 
     struct TestResourceDynamicContext<S: ResourceSource> {
         manager: Arc<ResourceManager>,
         handle: ResourceSourceDynamicHandle<S>,
         #[allow(unused)]
-        worker_pool: WorkerPool<()>,
+        worker_pool: WorkerPool<isize>,
     }
 
     #[fixture]
@@ -228,13 +228,20 @@ mod tests {
         let source = ResourceSourceDynamic::default();
         let handle = source.handle();
 
-        let worker_pool = WorkerPool::<()>::builder()
+        let worker_pool = WorkerPool::<isize>::builder()
             .worker_count(1.try_into().unwrap())
             .start();
 
         let manager = ResourceManager::builder()
             .source(source)
-            .worker_config((), &worker_pool)
+            .worker_config(
+                ResourceManagerWorkerPriorityConfig {
+                    immediate: 2,
+                    delayed: 1,
+                    update: 0,
+                },
+                &worker_pool,
+            )
             .build();
 
         TestResourceDynamicContext {

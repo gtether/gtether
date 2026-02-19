@@ -47,6 +47,7 @@ ouroboros = "0.18.5"
 papaya = "0.2.3"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 parry3d = "0.18"
+pin-project = "1.1"
 pin-project-lite = "0.2.16"
 regex = "1.11"
 ringbuf = "0.4"

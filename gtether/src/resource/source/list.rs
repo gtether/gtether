@@ -83,12 +83,12 @@ mod tests {
     use test_log::test as test_log;
 
     use crate::resource::manager::tests::*;
-    use crate::resource::manager::ResourceManager;
+    use crate::resource::manager::{ResourceManager, ResourceManagerWorkerPriorityConfig};
     use crate::worker::WorkerPool;
 
     #[fixture]
     fn test_resource_list_ctx<const N: usize>() -> TestResourceContext<N> {
-        let worker_pool = WorkerPool::<()>::builder()
+        let worker_pool = WorkerPool::<isize>::builder()
             .worker_count(1.try_into().unwrap())
             .start();
 
@@ -99,7 +99,14 @@ mod tests {
 
         let manager = ResourceManager::builder()
             .source(source)
-            .worker_config((), &worker_pool)
+            .worker_config(
+                ResourceManagerWorkerPriorityConfig {
+                    immediate: 2,
+                    delayed: 1,
+                    update: 0,
+                },
+                &worker_pool,
+            )
             .build();
 
         TestResourceContext {

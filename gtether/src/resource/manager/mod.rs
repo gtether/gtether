@@ -159,7 +159,6 @@ use crate::resource::manager::update::{ResourceUpdateFuture, UpdateManager};
 use crate::resource::source::ResourceSource;
 use crate::resource::watcher::ResourceWatcherConfig;
 use crate::resource::{ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader};
-use crate::util::executor::Executor;
 use crate::util::priority::HasStaticPriority;
 use crate::worker::WorkerPool;
 
@@ -173,7 +172,7 @@ pub use load::{
     LoadPriority,
     ResourceLoadContext,
 };
-pub use task::ManagerTask;
+pub use task::{FallibleManagerTask, ManagerTask};
 
 enum ResourceFutureInner<T: ?Sized + Send + Sync + 'static> {
     Cached(ResourceLoadResult<T>),
@@ -531,6 +530,39 @@ impl Drop for ResourceManager {
     }
 }
 
+/// Priority configuration for [ResourceManager].
+///
+/// This allows the ability to configure custom worker priorities for the various resource loading
+/// task priorities. This would allow, for example, configuring immediate load tasks to have the
+/// same priority as other core tasks, while allowing delayed and update tasks to have lower
+/// priorities than other tasks.
+#[derive(Default, Debug)]
+pub struct ResourceManagerWorkerPriorityConfig<PP: HasStaticPriority> {
+    /// Worker priority for load tasks that are considered to have "immediate" priority.
+    pub immediate: PP,
+
+    /// Worker priority for load tasks that can be delayed for some time.
+    ///
+    /// This priority should be equal to or lower than the `immediate` priority.
+    pub delayed: PP,
+
+    /// Worker priority for load tasks that are used to update existing resources in the background.
+    ///
+    /// This priority should be equal to or lower than the `delayed` priority.
+    pub update: PP,
+}
+
+impl<PP: HasStaticPriority + Clone> From<PP> for ResourceManagerWorkerPriorityConfig<PP> {
+    #[inline]
+    fn from(priority: PP) -> Self {
+        Self {
+            immediate: priority.clone(),
+            delayed: priority.clone(),
+            update: priority,
+        }
+    }
+}
+
 /// Builder pattern for [ResourceManager].
 ///
 /// Recommended way to create is via [ResourceManager::builder()].
@@ -557,19 +589,33 @@ impl<'a> ResourceManagerBuilder<'a> {
     /// Configure the workers used for internal async task execution.
     ///
     /// Load and update tasks will be executed by the worker pool with the given priority.
-    pub fn worker_config<PP>(mut self, pool_priority: PP, workers: &'a WorkerPool<PP>) -> Self
+    pub fn worker_config<PP>(
+        mut self,
+        priority_config: impl Into<ResourceManagerWorkerPriorityConfig<PP>>,
+        workers: &'a WorkerPool<PP>,
+    ) -> Self
     where
         PP: HasStaticPriority + Send + Sync + 'static,
     {
+        let priority_config = priority_config.into();
         self.executor_builder = Some(Box::new(move || {
-            Arc::new(Executor::new_static_priority(
-                pool_priority,
+            assert!(
+                priority_config.immediate >= priority_config.delayed,
+                "Immediate priority should be at least as high as Delayed priority"
+            );
+            assert!(
+                priority_config.delayed >= priority_config.update,
+                "Delayed priority should be at least as high as Update priority"
+            );
+            Arc::new(ManagerExecutor::new(
+                priority_config,
                 workers,
             ))
         }));
         self
     }
 
+    /// Build the [ResourceManager].
     #[inline]
     pub fn build(self) -> Arc<ResourceManager> {
         let executor_builder = self.executor_builder
@@ -1119,19 +1165,26 @@ pub mod tests {
     pub struct TestResourceContext<const N: usize> {
         pub manager: Arc<ResourceManager>,
         pub data_maps: [Arc<ResourceDataMap>; N],
-        pub worker_pool: WorkerPool<()>,
+        pub worker_pool: WorkerPool<isize>,
     }
 
     /// Commonly used fixture to create a [ResourceManager] and any accompanying
     /// [ResourceDataMaps](ResourceDataMap).
     #[fixture]
     pub fn test_resource_ctx<const N: usize>() -> TestResourceContext<N> {
-        let worker_pool = WorkerPool::<()>::builder()
+        let worker_pool = WorkerPool::<isize>::builder()
             .worker_count(1.try_into().unwrap())
             .start();
 
         let mut builder = ResourceManager::builder()
-            .worker_config((), &worker_pool);
+            .worker_config(
+                ResourceManagerWorkerPriorityConfig {
+                    immediate: 2,
+                    delayed: 1,
+                    update: 0,
+                },
+                &worker_pool,
+            );
         let tuples = core::array::from_fn::<_, N, _>(|_| TestResourceSource::new());
         let data_maps = core::array::from_fn::<_, N, _>(|idx| {
             tuples[idx].1.clone()

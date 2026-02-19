@@ -55,6 +55,7 @@ notify-debouncer-full = { workspace = true }
 ouroboros = { workspace = true }
 papaya = { workspace = true }
 parking_lot = { workspace = true }
+pin-project = { workspace = true }
 pin-project-lite = { workspace = true }
 ringbuf = { workspace = true }
 sha2 = { workspace = true }
