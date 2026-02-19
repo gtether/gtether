@@ -79,15 +79,19 @@ mod tests {
     use macro_rules_attribute::apply;
     use rstest::{fixture, rstest};
     use smol_macros::test as smol_test;
-    use std::sync::Arc;
     use std::time::Duration;
     use test_log::test as test_log;
 
     use crate::resource::manager::tests::*;
     use crate::resource::manager::ResourceManager;
+    use crate::worker::WorkerPool;
 
     #[fixture]
-    fn list_resource_manager<const N: usize>() -> (Arc<ResourceManager>, [Arc<ResourceDataMap>; N]) {
+    fn test_resource_list_ctx<const N: usize>() -> TestResourceContext<N> {
+        let worker_pool = WorkerPool::<()>::builder()
+            .worker_count(1.try_into().unwrap())
+            .start();
+
         let tuples = core::array::from_fn::<_, N, _>(|_| TestResourceSource::new());
         let data_maps = core::array::from_fn::<_, N, _>(|idx| tuples[idx].1.clone());
 
@@ -95,9 +99,14 @@ mod tests {
 
         let manager = ResourceManager::builder()
             .source(source)
+            .worker_config((), &worker_pool)
             .build();
 
-        (manager, data_maps)
+        TestResourceContext {
+            manager,
+            data_maps,
+            worker_pool,
+        }
     }
 
     #[rstest]
@@ -105,32 +114,32 @@ mod tests {
     #[case::ok("key", Some(TestDataEntry::new("key", b"value", "h_value")), ExpectedLoadResult::Ok("value".to_string()))]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_list_load(
-        #[from(list_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_list_ctx: TestResourceContext<1>,
         #[case] key: &str,
         #[case] start_data: Option<TestDataEntry>,
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         if let Some(start_data) = start_data {
-            data_maps[0].lock().insert(start_data.id, start_data.data, start_data.hash);
+            test_resource_list_ctx.data_maps[0].lock().insert(start_data.id, start_data.data, start_data.hash);
         }
 
         let fut = {
-            let _lock = manager.test_ctx().sync_load.block().await;
-            let fut = manager.get_with_loader(key, TestResLoader::new(key));
+            let _lock = test_resource_list_ctx.manager.test_ctx().sync_load.block().await;
+            let fut = test_resource_list_ctx.manager.get_with_loader(key, TestResLoader::new(key));
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
         let result = fut.await;
         // Hold a reference to keep possibly loaded values from expiring
         let _maybe_value = expected_load_result.assert_matches(result);
-        manager.test_ctx().sync_load.assert_count(1);
+        test_resource_list_ctx.manager.test_ctx().sync_load.assert_count(1);
 
-        let result = manager.get_with_loader(key, TestResLoader::new(key))
+        let result = test_resource_list_ctx.manager.get_with_loader(key, TestResLoader::new(key))
             .check()
             .expect("Result should be cached and pollable");
         expected_load_result.assert_matches(result);
         // No extra loads should have been made
-        manager.test_ctx().sync_load.assert_count(1);
+        test_resource_list_ctx.manager.test_ctx().sync_load.assert_count(1);
     }
 
     #[rstest]
@@ -140,24 +149,24 @@ mod tests {
     #[case::error_to_error(ExpectedDataEntry::read_error("key"), ExpectedDataEntry::read_error_new("key"))]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_list_resource_manager_update(
-        #[from(list_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_list_ctx: TestResourceContext<1>,
         #[case] start: ExpectedDataEntry<String>,
         #[case] end: ExpectedDataEntry<String>,
     ) {
-        data_maps[0].lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
+        test_resource_list_ctx.data_maps[0].lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
 
-        data_maps[0].assert_watch(start.entry.id.clone(), false);
-        let result = manager.get_with_loader(
+        test_resource_list_ctx.data_maps[0].assert_watch(start.entry.id.clone(), false);
+        let result = test_resource_list_ctx.manager.get_with_loader(
             start.entry.id.clone(),
             TestResLoader::new(start.entry.id.clone()),
         ).await;
         let value = start.expected.assert_matches(result);
-        data_maps[0].assert_watch(start.entry.id.clone(), true);
-        manager.test_ctx().sync_update.assert_count(0);
+        test_resource_list_ctx.data_maps[0].assert_watch(start.entry.id.clone(), true);
+        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(0);
 
         {
-            let _lock = manager.test_ctx().sync_update.block().await;
-            data_maps[0].lock().insert(end.entry.id.clone(), end.entry.data, end.entry.hash);
+            let _lock = test_resource_list_ctx.manager.test_ctx().sync_update.block().await;
+            test_resource_list_ctx.data_maps[0].lock().insert(end.entry.id.clone(), end.entry.data, end.entry.hash);
             if let ExpectedLoadResult::Ok(expected_value) = &start.expected {
                 let value = value.as_ref().unwrap();
                 assert_eq!(&*value.read(), expected_value);
@@ -165,19 +174,19 @@ mod tests {
         }
 
         timeout(
-            manager.test_ctx().sync_update.wait_attempts(1),
+            test_resource_list_ctx.manager.test_ctx().sync_update.wait_attempts(1),
             Duration::from_millis(500),
         ).await;
         match end.expected {
             ExpectedLoadResult::Ok(expected_value) => {
                 match value {
                     Some(value) => {
-                        manager.test_ctx().sync_update.assert_count(1);
+                        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(1);
                         assert_eq!(*value.read(), expected_value.to_owned());
                     },
                     None => {
-                        manager.test_ctx().sync_update.assert_count(0);
-                        let value = manager.get_with_loader(
+                        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(0);
+                        let value = test_resource_list_ctx.manager.get_with_loader(
                             end.entry.id.clone(),
                             TestResLoader::new(end.entry.id.clone()),
                         ).await.expect(&format!("Resource should load for '{:#?}'", &end.entry.id));
@@ -189,14 +198,14 @@ mod tests {
             ExpectedLoadResult::ReadErr => {
                 match start.expected {
                     ExpectedLoadResult::Ok(expected_value) => {
-                        manager.test_ctx().sync_update.assert_count(1);
+                        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(1);
                         let value = value.as_ref().unwrap();
                         assert_eq!(*value.read(), expected_value);
                     },
                     ExpectedLoadResult::NotFound(_) => unimplemented!(),
                     ExpectedLoadResult::ReadErr => {
-                        manager.test_ctx().sync_update.assert_count(0);
-                        manager.get_with_loader(
+                        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(0);
+                        test_resource_list_ctx.manager.get_with_loader(
                             end.entry.id.clone(),
                             TestResLoader::new(end.entry.id.clone()),
                         ).await.expect_err(&format!("Resource should fail to load for '{:#?}'", &end.entry.id));
@@ -204,7 +213,7 @@ mod tests {
                 }
             },
         }
-        data_maps[0].assert_watch(end.entry.id.clone(), true);
+        test_resource_list_ctx.data_maps[0].assert_watch(end.entry.id.clone(), true);
     }
 
     #[rstest]
@@ -240,35 +249,35 @@ mod tests {
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_source_order(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 3]),
+        test_resource_list_ctx: TestResourceContext<3>,
         #[case] update: BulkUpdate,
         #[case] expected_value: &str,
         #[case] wait_update_attempts: usize,
         #[case] expected_update_count: usize,
         #[case] expected_watches: [bool; 3],
     ) {
-        data_maps[1].lock().insert("key", b"value_1", "h_value_1");
-        data_maps[2].lock().insert("key", b"value_2", "h_value_2");
+        test_resource_list_ctx.data_maps[1].lock().insert("key", b"value_1", "h_value_1");
+        test_resource_list_ctx.data_maps[2].lock().insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
-        let value = manager.get_with_loader(
+        let value = test_resource_list_ctx.manager.get_with_loader(
             "key",
             TestResLoader::new("key"),
         ).await.expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value_1".to_owned());
-        manager.test_ctx().sync_update.assert_count(0);
+        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(0);
 
-        update.apply(&data_maps);
+        update.apply(&test_resource_list_ctx.data_maps);
         timeout(
-            manager.test_ctx().sync_update.wait_attempts(wait_update_attempts),
+            test_resource_list_ctx.manager.test_ctx().sync_update.wait_attempts(wait_update_attempts),
             Duration::from_millis(500),
         ).await;
 
-        manager.test_ctx().sync_update.assert_count(expected_update_count);
+        test_resource_list_ctx.manager.test_ctx().sync_update.assert_count(expected_update_count);
         assert_eq!(*value.read(), expected_value.to_owned());
 
         for (idx, expected_watch) in expected_watches.into_iter().enumerate() {
-            data_maps[idx].assert_watch("key", expected_watch);
+            test_resource_list_ctx.data_maps[idx].assert_watch("key", expected_watch);
         }
     }
 

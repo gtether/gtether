@@ -39,6 +39,7 @@
 //! # use smol::future;
 //! # use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
 //! # use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
+//! # use gtether::worker::WorkerPool;
 //! #
 //! # #[derive(Default)]
 //! # struct MyLoader(());
@@ -49,7 +50,8 @@
 //! #     }
 //! # }
 //! #
-//! # let manager = ResourceManager::builder().build();
+//! # let workers = WorkerPool::single().start();
+//! # let manager = ResourceManager::builder().worker_config((), &workers).build();
 //! #
 //! # future::block_on(async move {
 //! let res_a = manager.get_with_loader("a", MyLoader::default()).await;
@@ -64,6 +66,7 @@
 //! # use smol::future;
 //! # use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
 //! # use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
+//! # use gtether::worker::WorkerPool;
 //! #
 //! # #[derive(Default)]
 //! # struct MyLoader(());
@@ -74,7 +77,8 @@
 //! #     }
 //! # }
 //! #
-//! # let manager = ResourceManager::builder().build();
+//! # let workers = WorkerPool::single().start();
+//! # let manager = ResourceManager::builder().worker_config((), &workers).build();
 //! #
 //! # future::block_on(async move {
 //! let (res_a, res_b, res_c) = {
@@ -155,7 +159,9 @@ use crate::resource::manager::update::{ResourceUpdateFuture, UpdateManager};
 use crate::resource::source::ResourceSource;
 use crate::resource::watcher::ResourceWatcherConfig;
 use crate::resource::{ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader};
-use crate::util::executor::ExecutorBuilder;
+use crate::util::executor::Executor;
+use crate::util::priority::HasStaticPriority;
+use crate::worker::WorkerPool;
 
 pub mod dependency;
 mod load;
@@ -415,7 +421,7 @@ impl ResourceManager {
     ///
     /// This is the preferred way to create a ResourceManager.
     #[inline]
-    pub fn builder() -> ResourceManagerBuilder {
+    pub fn builder<'a>() -> ResourceManagerBuilder<'a> {
         ResourceManagerBuilder::default()
     }
 
@@ -529,12 +535,12 @@ impl Drop for ResourceManager {
 ///
 /// Recommended way to create is via [ResourceManager::builder()].
 #[derive(Default)]
-pub struct ResourceManagerBuilder {
+pub struct ResourceManagerBuilder<'a> {
     sources: Vec<Box<dyn ResourceSource>>,
-    worker_count: Option<usize>,
+    executor_builder: Option<Box<dyn (FnOnce() -> Arc<ManagerExecutor>) + 'a>>,
 }
 
-impl ResourceManagerBuilder {
+impl<'a> ResourceManagerBuilder<'a> {
     /// Add a [source][src].
     ///
     /// [Sources][src] added will be prioritized by the built [ResourceManager] in chronological
@@ -548,26 +554,27 @@ impl ResourceManagerBuilder {
         self
     }
 
-    /// Set the number of worker threads that will be spawned to handle load requests.
+    /// Configure the workers used for internal async task execution.
     ///
-    /// Load requests are handled using an async executor, so even 1 thread can handle many load
-    /// requests.
-    ///
-    /// Default value is `1`.
-    #[inline]
-    pub fn worker_count(mut self, worker_count: usize) -> Self {
-        self.worker_count = Some(worker_count);
+    /// Load and update tasks will be executed by the worker pool with the given priority.
+    pub fn worker_config<PP>(mut self, pool_priority: PP, workers: &'a WorkerPool<PP>) -> Self
+    where
+        PP: HasStaticPriority + Send + Sync + 'static,
+    {
+        self.executor_builder = Some(Box::new(move || {
+            Arc::new(Executor::new_static_priority(
+                pool_priority,
+                workers,
+            ))
+        }));
         self
     }
 
     #[inline]
     pub fn build(self) -> Arc<ResourceManager> {
-        let executor = Arc::new(
-            ExecutorBuilder::default()
-                .worker_count(self.worker_count.unwrap_or(1))
-                .static_priority()
-                .build()
-        );
+        let executor_builder = self.executor_builder
+            .expect(".worker_config() is required");
+        let executor = executor_builder();
         let mut update_manager = UpdateManager::new();
         let mut sources = self.sources;
         for (idx, source) in sources.iter_mut().enumerate() {
@@ -1109,11 +1116,22 @@ pub mod tests {
         }
     }
 
+    pub struct TestResourceContext<const N: usize> {
+        pub manager: Arc<ResourceManager>,
+        pub data_maps: [Arc<ResourceDataMap>; N],
+        pub worker_pool: WorkerPool<()>,
+    }
+
     /// Commonly used fixture to create a [ResourceManager] and any accompanying
     /// [ResourceDataMaps](ResourceDataMap).
     #[fixture]
-    pub fn test_resource_manager<const N: usize>() -> (Arc<ResourceManager>, [Arc<ResourceDataMap>; N]) {
-        let mut builder = ResourceManager::builder();
+    pub fn test_resource_ctx<const N: usize>() -> TestResourceContext<N> {
+        let worker_pool = WorkerPool::<()>::builder()
+            .worker_count(1.try_into().unwrap())
+            .start();
+
+        let mut builder = ResourceManager::builder()
+            .worker_config((), &worker_pool);
         let tuples = core::array::from_fn::<_, N, _>(|_| TestResourceSource::new());
         let data_maps = core::array::from_fn::<_, N, _>(|idx| {
             tuples[idx].1.clone()
@@ -1123,7 +1141,11 @@ pub mod tests {
         }
         let manager = builder.build();
 
-        (manager, data_maps)
+        TestResourceContext {
+            manager,
+            data_maps,
+            worker_pool,
+        }
     }
 
     #[derive(Clone)]
@@ -1307,10 +1329,10 @@ pub mod tests {
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_manager_can_drop(
-        #[from(test_resource_manager)] (manager, _): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
     ) {
         timeout(
-            assert_manager_drops(manager),
+            assert_manager_drops(test_resource_ctx.manager),
             Duration::from_secs(5),
         ).await;
     }
@@ -1363,13 +1385,13 @@ pub mod tests {
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_future_or_get(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
         #[case] initial_data: impl IntoIterator<Item=TestDataEntry>,
         #[case] load_info: impl IntoIterator<Item=TestLoadInfo<String, TestResLoader>>,
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         {
-            let mut lock = data_maps[0].lock();
+            let mut lock = test_resource_ctx.data_maps[0].lock();
             for data in initial_data {
                 lock.insert(data.id, data.data, data.hash);
             }
@@ -1378,7 +1400,7 @@ pub mod tests {
         let mut load_info = load_info.into_iter();
         let mut fut = {
             let first = load_info.next().expect("'load_info' should have at least 1 item");
-            manager.get_with_loader(first.key, first.loader)
+            test_resource_ctx.manager.get_with_loader(first.key, first.loader)
         };
         for next in load_info {
             fut = fut.or_get_with_loader(next.key, next.loader);
@@ -1390,9 +1412,10 @@ pub mod tests {
 
     pub mod prelude {
         pub use super::{
-            test_resource_manager,
+            test_resource_ctx,
             ResourceDataMap,
             ResourceDataMapLock,
+            TestResourceContext,
         };
 
         pub(in crate::resource) use super::{

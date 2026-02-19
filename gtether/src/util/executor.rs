@@ -5,20 +5,23 @@
 
 use async_task::{Builder as TaskBuilder, Runnable, Task};
 use educe::Educe;
+use futures_util::stream::FuturesUnordered;
+use futures_util::task::AtomicWaker;
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use slab::Slab;
 use smol::future;
-use smol::future::FutureExt;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{atomic, Arc};
-use std::task::{Poll, Waker};
-use std::thread::JoinHandle;
+use std::task::Waker;
+use tracing::warn;
 
 use crate::util::priority::{DynamicPriorityQueue, HasDynamicPriority, HasStaticPriority, PriorityQueue, StaticPriorityQueue};
+use crate::worker::{FindWorkError, FindWorkResult, Work, WorkSource, WorkTask, WorkTaskError, WorkerPool};
 
-trait Metadata: Ord {
+trait Metadata: Ord + Send + Sync + 'static {
     fn increment_attempts(&self);
 }
 
@@ -52,7 +55,7 @@ pub struct StaticMetadata<P: HasStaticPriority> {
     attempts: AtomicUsize,
 }
 
-impl<P: HasStaticPriority> Metadata for StaticMetadata<P> {
+impl<P: HasStaticPriority + Send + Sync + 'static> Metadata for StaticMetadata<P> {
     fn increment_attempts(&self) {
         self.attempts.fetch_add(1, atomic::Ordering::Relaxed);
     }
@@ -87,7 +90,7 @@ pub struct DynamicMetadata<P: HasDynamicPriority> {
     attempts: AtomicUsize,
 }
 
-impl<P: HasDynamicPriority> Metadata for DynamicMetadata<P> {
+impl<P: HasDynamicPriority + Send + Sync + 'static> Metadata for DynamicMetadata<P> {
     fn increment_attempts(&self) {
         self.attempts.fetch_add(1, atomic::Ordering::Relaxed);
     }
@@ -123,19 +126,13 @@ fn runnable_ord_cmp<M: Metadata>(
 
 #[derive(Educe)]
 #[educe(PartialEq, Eq, PartialOrd, Ord)]
-struct RunnableOrd<M: Metadata>(
+struct RunnableWrapper<M: Metadata>(
     #[educe(Eq(method(runnable_ord_eq)))]
     #[educe(Ord(method(runnable_ord_cmp)))]
     Runnable<M>
 );
 
-impl<M: Metadata> RunnableOrd<M> {
-    fn into_inner(self) -> Runnable<M> {
-        self.0
-    }
-}
-
-impl<P: HasDynamicPriority> HasDynamicPriority for RunnableOrd<DynamicMetadata<P>> {
+impl<P: HasDynamicPriority + Send + Sync + 'static> HasDynamicPriority for RunnableWrapper<DynamicMetadata<P>> {
     type Value = P::Value;
 
     #[inline]
@@ -144,9 +141,18 @@ impl<P: HasDynamicPriority> HasDynamicPriority for RunnableOrd<DynamicMetadata<P
     }
 }
 
-trait ExecutorState: Send + Sync + 'static {
+impl<M: Metadata> Work for RunnableWrapper<M> {
+    type Output = ();
+
+    #[inline]
+    fn execute(self: Box<Self>) -> Self::Output {
+        (*self).0.run();
+    }
+}
+
+trait ExecutorType: Send + Sync + 'static {
     type Metadata: Metadata;
-    type Queue: PriorityQueue<RunnableOrd<Self::Metadata>>;
+    type Queue: PriorityQueue<RunnableWrapper<Self::Metadata>>;
 
     fn queue(&mut self) -> &mut Self::Queue;
 }
@@ -155,13 +161,13 @@ trait ExecutorState: Send + Sync + 'static {
 ///
 /// This type isn't publicly constructable, and is only available for naming to use as a generic for
 /// [Executor].
-pub struct StaticPriority<P: HasStaticPriority> {
-    queue: StaticPriorityQueue<RunnableOrd<StaticMetadata<P>>>,
+pub struct StaticPriority<P: HasStaticPriority + Send + Sync + 'static> {
+    queue: StaticPriorityQueue<RunnableWrapper<StaticMetadata<P>>>,
 }
 
-impl<P: HasStaticPriority + Send + Sync + 'static> ExecutorState for StaticPriority<P> {
+impl<P: HasStaticPriority + Send + Sync + 'static> ExecutorType for StaticPriority<P> {
     type Metadata = StaticMetadata<P>;
-    type Queue = StaticPriorityQueue<RunnableOrd<Self::Metadata>>;
+    type Queue = StaticPriorityQueue<RunnableWrapper<Self::Metadata>>;
 
     fn queue(&mut self) -> &mut Self::Queue {
         &mut self.queue
@@ -172,16 +178,87 @@ impl<P: HasStaticPriority + Send + Sync + 'static> ExecutorState for StaticPrior
 ///
 /// This type isn't publicly constructable, and is only available for naming to use as a generic for
 /// [Executor].
-pub struct DynamicPriority<P: HasDynamicPriority> {
-    queue: DynamicPriorityQueue<RunnableOrd<DynamicMetadata<P>>>,
+pub struct DynamicPriority<P: HasDynamicPriority + Send + Sync + 'static> {
+    queue: DynamicPriorityQueue<RunnableWrapper<DynamicMetadata<P>>>,
 }
 
-impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorState for DynamicPriority<P> {
+impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorType for DynamicPriority<P> {
     type Metadata = DynamicMetadata<P>;
-    type Queue = DynamicPriorityQueue<RunnableOrd<Self::Metadata>>;
+    type Queue = DynamicPriorityQueue<RunnableWrapper<Self::Metadata>>;
 
     fn queue(&mut self) -> &mut Self::Queue {
         &mut self.queue
+    }
+}
+
+struct StateInner<S: ExecutorType> {
+    scheduled: S,
+    active_tasks: Vec<WorkTask<()>>,
+}
+
+struct State<S: ExecutorType> {
+    inner: Mutex<Option<StateInner<S>>>,
+    waker: AtomicWaker,
+}
+
+impl<S: ExecutorType> State<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner: Mutex::new(Some(StateInner {
+                scheduled: inner,
+                active_tasks: vec![],
+            })),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn push_work(&self, runnable: Runnable<S::Metadata>) {
+        let mut guard = self.inner.lock();
+        let inner = match &mut *guard {
+            Some(inner) => inner,
+            // If the inner state has already been removed, then we're likely in the Executor drop
+            // logic, so just drop the incoming runnable
+            None => return,
+        };
+
+        inner.scheduled.queue().push(RunnableWrapper(runnable));
+        self.waker.wake();
+    }
+}
+
+impl<S: ExecutorType> WorkSource for State<S> {
+    fn find_work(&self) -> FindWorkResult {
+        let mut guard = self.inner.lock();
+        let inner = match &mut *guard {
+            Some(inner) => inner,
+            None => return Err(FindWorkError::Disconnected),
+        };
+
+        // If we're finding work, then some previous task must have completed
+        inner.active_tasks = inner.active_tasks.drain(..)
+            .filter_map(|task| {
+                match task.try_poll() {
+                    Ok(result) => match result {
+                        Ok(()) => None,
+                        Err(WorkTaskError::Cancelled) => {
+                            warn!("executor work task cancelled before future completed");
+                            None
+                        }
+                    },
+                    Err(task) => Some(task),
+                }
+            })
+            .collect();
+
+        inner.scheduled.queue().pop().map(|r| {
+            let (work, work_task) = WorkTask::spawn(Box::new(r));
+            inner.active_tasks.push(work_task);
+            work
+        }).ok_or(FindWorkError::NoWork)
+    }
+
+    fn set_worker_waker(&self, waker: &Waker) {
+        self.waker.register(waker);
     }
 }
 
@@ -192,11 +269,11 @@ impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorState for DynamicPri
 /// # Static Priorities
 ///
 /// ```
-/// use gtether::util::executor::ExecutorBuilder;
+/// use gtether::util::executor::Executor;
+/// use gtether::worker::WorkerPool;
 ///
-/// let executor = ExecutorBuilder::default()
-///     .static_priority::<i64>()
-///     .build();
+/// let workers = WorkerPool::single().start();
+/// let executor = Executor::new_static_priority((), &workers);
 ///
 /// let task = executor.spawn(10, async { /* insert logic here */ });
 /// ```
@@ -206,13 +283,13 @@ impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorState for DynamicPri
 /// # Dynamic Priorities
 ///
 /// ```
-/// use gtether::util::executor::ExecutorBuilder;
+/// use gtether::util::executor::Executor;
+/// use gtether::worker::WorkerPool;
 /// use std::sync::atomic::{AtomicI64, Ordering};
 /// use std::sync::Arc;
 ///
-/// let executor = ExecutorBuilder::default()
-///     .dynamic_priority::<Arc<AtomicI64>>()
-///     .build();
+/// let workers = WorkerPool::single().start();
+/// let executor = Executor::new_dynamic_priority((), &workers);
 ///
 /// let priority = Arc::new(AtomicI64::new(0));
 /// let task = executor.spawn(priority.clone(), async { /* insert logic here */ });
@@ -223,36 +300,15 @@ impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorState for DynamicPri
 /// being actively executed, changing its priority will not immediately stop its execution, but the
 /// next time the task is yielded its priority will be re-evaluated and another task may take its
 /// place.
-///
-/// # Multiple Workers
-///
-/// ```
-/// use gtether::util::executor::ExecutorBuilder;
-///
-/// let executor = ExecutorBuilder::default()
-///     .static_priority::<i64>()
-///     .worker_count(4)
-///     .build();
-///
-/// let mut tasks = vec![];
-/// executor.spawn_many(
-///     (0..4).map(|idx| (idx, async { /* insert logic here */ })),
-///     &mut tasks,
-/// );
-/// ```
-///
-/// By default, executors will be created with one threaded worker, but the worker count can be
-/// configured when building the executor.
 #[allow(private_bounds)]
-pub struct Executor<'a, S: ExecutorState> {
-    workers: Vec<WorkerHandle>,
-    state: Arc<Mutex<S>>,
+pub struct Executor<'a, S: ExecutorType> {
+    state: Arc<State<S>>,
     active: Arc<Mutex<Slab<Waker>>>,
     _marker: PhantomData<&'a ()>,
 }
 
 #[allow(private_bounds)]
-impl<'a, S: ExecutorState> Executor<'a, S> {
+impl<'a, S: ExecutorType> Executor<'a, S> {
     /// Returns `true` if there are no unfinished tasks.
     pub fn is_empty(&self) -> bool {
         self.active.lock().is_empty()
@@ -296,24 +352,34 @@ impl<'a, S: ExecutorState> Executor<'a, S> {
     }
 
     fn schedule(&self) -> impl Fn(Runnable<S::Metadata>) + Send + Sync + 'a {
-        let workers = self.workers.iter()
-            .map(WorkerHandle::waker)
-            .collect::<Vec<_>>();
         let state = Arc::downgrade(&self.state);
         move |runnable| {
-            // TODO: Enqueue directly back into the worker if task has woken itself
             runnable.metadata().increment_attempts();
             let state = state.upgrade()
-                .expect("task_queue dropped before scheduled!");
-            state.lock().queue().push(RunnableOrd(runnable));
-            for worker in &workers {
-                worker.wake();
-            }
+                .expect("executor state dropped before scheduled!");
+            state.push_work(runnable);
         }
     }
 }
 
 impl<'a, P: HasStaticPriority + Send + Sync + 'static> Executor<'a, StaticPriority<P>> {
+    pub fn new_static_priority<PP>(pool_priority: PP, worker_pool: &WorkerPool<PP>) -> Self
+    where
+        PP: HasStaticPriority + Send + Sync + 'static,
+    {
+        let state = Arc::new(State::new(StaticPriority {
+            queue: Default::default(),
+        }));
+
+        worker_pool.insert_source(pool_priority, Arc::downgrade(&state));
+
+        Self {
+            state,
+            active: Default::default(),
+            _marker: PhantomData,
+        }
+    }
+
     /// Spawns a task onto the executor with a static priority.
     pub fn spawn<T: Send + 'a>(
         &self,
@@ -359,6 +425,23 @@ impl<'a, P: HasStaticPriority + Send + Sync + 'static> Executor<'a, StaticPriori
 }
 
 impl<'a, P: HasDynamicPriority + Send + Sync + 'static> Executor<'a, DynamicPriority<P>> {
+    pub fn new_dynamic_priority<PP>(pool_priority: PP, worker_pool: &WorkerPool<PP>) -> Self
+    where
+        PP: HasStaticPriority + Send + Sync + 'static,
+    {
+        let state = Arc::new(State::new(DynamicPriority {
+            queue: Default::default(),
+        }));
+
+        worker_pool.insert_source(pool_priority, Arc::downgrade(&state));
+
+        Self {
+            state,
+            active: Default::default(),
+            _marker: PhantomData,
+        }
+    }
+
     /// Spawns a task onto the executor with a dynamic priority.
     pub fn spawn<T: Send + 'a>(
         &self,
@@ -403,26 +486,30 @@ impl<'a, P: HasDynamicPriority + Send + Sync + 'static> Executor<'a, DynamicPrio
     }
 }
 
-impl<S: ExecutorState> Drop for Executor<'_, S> {
+impl<S: ExecutorType> Drop for Executor<'_, S> {
     fn drop(&mut self) {
-        // Stop all workers first
-        for worker in self.workers.drain(..) {
-            drop(worker);
-        }
+        let state = self.state.inner.lock().take();
 
         {
-            // Wake all tasks so that they are in the queue to be cleared by the next step
+            // Wake all tasks so that they can be dropped by the now removed queue
             let mut active = self.active.lock();
             for w in active.drain() {
                 w.wake();
             }
         }
 
-        {
+        if let Some(mut state) = state {
             // Forcibly drain the queue to clear any held cyclic Arcs
-            let mut state = self.state.lock();
-            let queue = state.queue();
+            let queue = state.scheduled.queue();
             while queue.pop().is_some() {}
+
+            // Wait for any currently active tasks to complete; these will drop on completion since
+            // we have now removed the queue from the shared state
+            let mut active_tasks = state.active_tasks.into_iter()
+                .collect::<FuturesUnordered<_>>();
+            future::block_on(async move {
+                while let Some(_) = active_tasks.next().await {}
+            });
         }
     }
 }
@@ -433,7 +520,7 @@ pub type StaticPriorityExecutor<'a, P> = Executor<'a, StaticPriority<P>>;
 /// Alias for an [Executor] using dynamic priorities.
 pub type DynamicPriorityExecutor<'a, P> = Executor<'a, DynamicPriority<P>>;
 
-/// Builder pattern for [Executor].
+/*/// Builder pattern for [Executor].
 ///
 /// See Executor documentation for usage examples.
 pub struct ExecutorBuilder<S> {
@@ -502,7 +589,7 @@ impl ExecutorBuilder<()> {
 }
 
 #[allow(private_bounds)]
-impl<S: ExecutorState> ExecutorBuilder<S> {
+impl<S: ExecutorType> ExecutorBuilder<S> {
     /// Build the [Executor].
     ///
     /// The executor must first be configured to use a specific state before it can be built. This
@@ -530,7 +617,7 @@ impl<S: ExecutorState> ExecutorBuilder<S> {
             _marker: PhantomData,
         }
     }
-}
+}*/
 
 // This module is ripped from the async-executor reference implementation
 mod call_on_drop {
@@ -572,7 +659,7 @@ mod call_on_drop {
     }
 }
 
-struct WorkerWaker(Arc<Mutex<Option<Waker>>>);
+/*struct WorkerWaker(Arc<Mutex<Option<Waker>>>);
 
 impl WorkerWaker {
     fn wake(&self) {
@@ -602,13 +689,13 @@ impl Drop for WorkerHandle {
     }
 }
 
-struct Worker<S: ExecutorState> {
+struct Worker<S: ExecutorType> {
     waker: Arc<Mutex<Option<Waker>>>,
     exit_recv: smol::channel::Receiver<()>,
     state: Arc<Mutex<S>>,
 }
 
-impl<S: ExecutorState> Worker<S> {
+impl<S: ExecutorType> Worker<S> {
     async fn run(
         &self,
         #[cfg(test)]
@@ -687,28 +774,32 @@ impl<S: ExecutorState> Worker<S> {
             }
         }).await
     }
-}
+}*/
 
 fn _ensure_send_and_sync() {
     fn is_send<T: Send>(_: T) {}
     fn is_sync<T: Sync>(_: T) {}
     fn is_static<T: 'static>(_: T) {}
 
-    {
-        is_send::<Executor<'_, StaticPriority<usize>>>(ExecutorBuilder::default().static_priority().build());
-        is_sync::<Executor<'_, StaticPriority<usize>>>(ExecutorBuilder::default().static_priority().build());
+    let pool = WorkerPool::<usize>::builder()
+        .worker_count(1.try_into().unwrap())
+        .start();
 
-        let ex = ExecutorBuilder::default().static_priority::<usize>().build();
+    {
+        is_send::<Executor<'_, StaticPriority<usize>>>(Executor::new_static_priority(0, &pool));
+        is_sync::<Executor<'_, StaticPriority<usize>>>(Executor::new_static_priority(0, &pool));
+
+        let ex = Executor::<StaticPriority<usize>>::new_static_priority(0, &pool);
         is_send(ex.schedule());
         is_sync(ex.schedule());
         is_static(ex.schedule());
     }
 
     {
-        is_send::<Executor<'_, DynamicPriority<usize>>>(ExecutorBuilder::default().dynamic_priority().build());
-        is_sync::<Executor<'_, DynamicPriority<usize>>>(ExecutorBuilder::default().dynamic_priority().build());
+        is_send::<Executor<'_, DynamicPriority<usize>>>(Executor::new_dynamic_priority(0, &pool));
+        is_sync::<Executor<'_, DynamicPriority<usize>>>(Executor::new_dynamic_priority(0, &pool));
 
-        let ex = ExecutorBuilder::default().dynamic_priority::<usize>().build();
+        let ex = Executor::<DynamicPriority<usize>>::new_dynamic_priority(0, &pool);
         is_send(ex.schedule());
         is_sync(ex.schedule());
         is_static(ex.schedule());
@@ -718,14 +809,16 @@ fn _ensure_send_and_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use futures_util::FutureExt;
+    use parking_lot::RwLock;
 
     #[test]
     fn test_executor_drops() {
-        let executor = ExecutorBuilder::default()
-            .worker_count(1)
-            .static_priority::<usize>()
-            .build();
+        let workers = WorkerPool::<usize>::builder()
+            .worker_count(1.try_into().unwrap())
+            .start();
+        let executor = Executor::new_static_priority(0, &workers);
 
         let active = Arc::downgrade(&executor.active);
         let state = Arc::downgrade(&executor.state);
@@ -743,19 +836,19 @@ mod tests {
 
     #[test]
     fn test_executor_static_priority() {
-        let worker_lock = Arc::new(Mutex::new(()));
+        let worker_lock = Arc::new(RwLock::new(()));
 
-        let executor = ExecutorBuilder::default()
-            .worker_count(1)
+        let workers = WorkerPool::<usize>::builder()
+            .worker_count(1.try_into().unwrap())
             .worker_lock(worker_lock.clone())
-            .static_priority::<usize>()
-            .build();
+            .start();
+        let executor = Executor::new_static_priority(0, &workers);
 
         let output = Mutex::new(vec![]);
 
         let mut tasks = vec![];
         {
-            let _guard = worker_lock.lock();
+            let _guard = worker_lock.write();
             executor.spawn_many(
                 [
                     (1, async { output.lock().push(1); }.boxed()),
@@ -775,19 +868,19 @@ mod tests {
 
     #[test]
     fn test_executor_dynamic_priority() {
-        let worker_lock = Arc::new(Mutex::new(()));
+        let worker_lock = Arc::new(RwLock::new(()));
 
-        let executor = ExecutorBuilder::default()
-            .worker_count(1)
+        let workers = WorkerPool::<usize>::builder()
+            .worker_count(1.try_into().unwrap())
             .worker_lock(worker_lock.clone())
-            .dynamic_priority::<usize>()
-            .build();
+            .start();
+        let executor = Executor::new_dynamic_priority(0, &workers);
 
         let output = Mutex::new(vec![]);
 
         let mut tasks = vec![];
         {
-            let _guard = worker_lock.lock();
+            let _guard = worker_lock.write();
             executor.spawn_many(
                 [
                     (1, async { output.lock().push(1); }.boxed()),

@@ -4,7 +4,7 @@
 //! the capability to have "dynamic" priority, in that the priority for a value can change via
 //! interior mutability and the data structures in this module will do their best to accommodate.
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::{atomic, Arc};
 use educe::Educe;
 
@@ -142,6 +142,148 @@ pub trait PriorityQueue<T> {
     ///
     /// Time complexity depends on the implementation; see individual documentation for more.
     fn swap_if_higher(&mut self, value: T) -> T;
+}
+
+/// FIFO queue.
+///
+/// Uses a [VecDeque] internally, so most operations simply delegate to [VecDeque].
+#[derive(Educe)]
+#[educe(Default)]
+pub struct FifoQueue<T>(VecDeque<T>);
+
+impl<T> PriorityQueue<T> for FifoQueue<T> {
+    /// Returns the length of the queue.
+    ///
+    /// ```
+    /// use gtether::util::priority::{PriorityQueue, FifoQueue};
+    /// let queue = FifoQueue::<isize>::from([-2, 3]);
+    /// assert_eq!(queue.len(), 2);
+    /// ```
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Checks if the queue is empty.
+    ///
+    /// ```
+    /// use gtether::util::priority::{PriorityQueue, FifoQueue};
+    /// let mut queue = FifoQueue::<isize>::default();
+    /// assert!(queue.is_empty());
+    ///
+    /// queue.push(0);
+    /// queue.push(-2);
+    /// queue.push(3);
+    /// assert!(!queue.is_empty());
+    /// ```
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the item in the queue with the highest priority, or `None` if the queue is empty.
+    ///
+    /// ```
+    /// use gtether::util::priority::{PriorityQueue, FifoQueue};
+    /// let mut queue = FifoQueue::<isize>::default();
+    /// assert_eq!(queue.peek(), None);
+    ///
+    /// queue.push(0);
+    /// queue.push(3);
+    /// queue.push(-2);
+    /// assert_eq!(queue.peek(), Some(&0));
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Delegates to [`VecDeque::front()`]; cost should be _O_(1).
+    #[inline]
+    fn peek(&self) -> Option<&T> {
+        self.0.front()
+    }
+
+    /// Push an item onto the queue.
+    ///
+    /// ```
+    /// use gtether::util::priority::{PriorityQueue, FifoQueue};
+    /// let mut queue = FifoQueue::<isize>::default();
+    /// queue.push(0);
+    /// queue.push(3);
+    /// queue.push(-2);
+    ///
+    /// assert_eq!(queue.len(), 3);
+    /// assert_eq!(queue.peek(), Some(&0));
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Delegates to [`VecDeque::push_back()`]; cost should be amortized _O_(1).
+    #[inline]
+    fn push(&mut self, value: T) {
+        self.0.push_back(value)
+    }
+
+    /// Removes the item with the highest priority and returns it, or `None` if the queue is empty.
+    ///
+    /// ```
+    /// use gtether::util::priority::{PriorityQueue, FifoQueue};
+    /// let mut queue = FifoQueue::<isize>::from([-2, 3]);
+    ///
+    /// assert_eq!(queue.pop(), Some(-2));
+    /// assert_eq!(queue.pop(), Some(3));
+    /// assert_eq!(queue.pop(), None);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Delegates to [`VecDeque::pop_front()`]; cost should be _O_(1).
+    #[inline]
+    fn pop(&mut self) -> Option<T> {
+        self.0.pop_front()
+    }
+
+    /// Never swaps `value`; effectively an identity function.
+    ///
+    /// For a FIFO queue, the front of the queue is always highest priority, but it is assumed that
+    /// the `value` being compared has already been popped, so it is always considered to be the
+    /// highest priority.
+    ///
+    /// ```
+    /// use gtether::util::priority::{PriorityQueue, FifoQueue};
+    /// let mut queue = FifoQueue::<isize>::from([-2, 3]);
+    ///
+    /// assert_eq!(queue.swap_if_higher(0), 0);
+    /// assert_eq!(queue.swap_if_higher(10), 10);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// _O_(1).
+    #[inline]
+    fn swap_if_higher(&mut self, value: T) -> T {
+        value
+    }
+}
+
+impl<T> From<Vec<T>> for FifoQueue<T> {
+    #[inline]
+    fn from(value: Vec<T>) -> Self {
+        Self(VecDeque::from(value))
+    }
+}
+
+impl<T> FromIterator<T> for FifoQueue<T> {
+    #[inline]
+    fn from_iter<II: IntoIterator<Item=T>>(iter: II) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<T, const N: usize> From<[T; N]> for FifoQueue<T> {
+    #[inline]
+    fn from(value: [T; N]) -> Self {
+        Self::from_iter(value)
+    }
 }
 
 /// Priority queue using [static priorities](HasStaticPriority).

@@ -8,6 +8,8 @@ use gtether::net::gns::{GnsServerDriver, GnsSubsystem};
 use gtether::net::message::MessageHandler;
 use gtether::net::message::{Message, MessageBody};
 use gtether::net::{Connection, Networking, NetworkingDisconnectEvent, NetworkingError};
+use gtether::resource::manager::ResourceManager;
+use gtether::worker::WorkerPool;
 use gtether::{Engine, EngineBuilder, EngineJoinHandle};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -365,13 +367,15 @@ impl From<NetworkingError> for ServerStartError {
 }
 
 pub struct ReversiServerManager {
+    workers: Arc<WorkerPool<()>>,
     inner: Mutex<Option<EngineJoinHandle<ReversiServer>>>,
 }
 
 impl ReversiServerManager {
     #[inline]
-    pub fn new() -> Self {
+    pub fn new(workers: Arc<WorkerPool<()>>) -> Self {
         Self{
+            workers,
             inner: Mutex::new(None),
         }
     }
@@ -391,14 +395,19 @@ impl ReversiServerManager {
     }
 
     fn start_impl(
+        workers: &WorkerPool<()>,
         inner: &mut Option<EngineJoinHandle<ReversiServer>>,
         listen_addr: SocketAddr,
     ) -> Result<(), ServerStartError> {
         info!("Starting server...");
         let app = ReversiServer::new(listen_addr);
+        let resources = ResourceManager::builder()
+            .worker_config((), workers)
+            .build();
         let join_handle = EngineBuilder::new()
             .app(app)
             .app_driver(MinimalAppDriver::new())
+            .resources(resources)
             .networking_driver(GnsSubsystem::get())
             .spawn();
         *inner = Some(join_handle);
@@ -410,7 +419,7 @@ impl ReversiServerManager {
     pub fn start(&self, listen_addr: SocketAddr) -> Result<Arc<Engine<ReversiServer>>, ServerStartError> {
         let mut inner = self.inner.lock();
         if inner.is_none() {
-            Self::start_impl(&mut inner, listen_addr)?;
+            Self::start_impl(&self.workers, &mut inner, listen_addr)?;
         } else {
             debug!("Server is already running");
         }
@@ -420,7 +429,7 @@ impl ReversiServerManager {
     pub fn restart(&self, listen_addr: SocketAddr) -> Result<Arc<Engine<ReversiServer>>, ServerStartError> {
         let mut inner = self.inner.lock();
         Self::shutdown_impl(&mut inner);
-        Self::start_impl(&mut inner, listen_addr)?;
+        Self::start_impl(&self.workers, &mut inner, listen_addr)?;
         Ok(inner.as_ref().unwrap().engine())
     }
 }

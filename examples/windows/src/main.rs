@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use glm::identity;
 use parking_lot::Mutex;
 use std::fmt::{Debug, Formatter};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tracing::{event, Level};
 use tracing_subscriber::prelude::*;
@@ -27,7 +28,7 @@ use gtether::resource::manager::ResourceManager;
 use gtether::resource::source::constant::ConstantResourceSource;
 use gtether::util::tick_loop::{TickLoopBuilder, TickLoopHandle};
 use gtether::{Engine, EngineBuilder};
-
+use gtether::worker::WorkerPool;
 use crate::render::ambient::{AmbientLight, AmbientRendererBootstrap};
 use crate::render::cube::CubeRendererBootstrap;
 use crate::render::directional::{DirectionalRendererBootstrap, PointLight};
@@ -449,10 +450,18 @@ fn main() {
         .with(ConsoleLogLayer::new(app.console.log()))
         .init();
 
+    let worker_count = std::thread::available_parallelism()
+        .unwrap_or(unsafe { NonZeroUsize::new_unchecked(4) })
+        .min(unsafe { NonZeroUsize::new_unchecked(4) });
+    let workers = WorkerPool::builder()
+        .worker_count(worker_count)
+        .start();
+
     let resources = ResourceManager::builder()
         .source(ConstantResourceSource::builder()
             .resource("console_font", include_bytes!("RobotoMono/RobotoMono-VariableFont_wght.ttf"))
             .build())
+        .worker_config((), &workers)
         .build();
 
     EngineBuilder::new()

@@ -1076,26 +1076,25 @@ mod tests {
     use test_log::test as test_log;
 
     use crate::resource::manager::tests::prelude::*;
-    use crate::resource::manager::ResourceManager;
     use crate::resource::ResourceReadData;
 
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_manager_can_drop_while_loading(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
     ) {
-        data_maps[0].lock().insert("key", b"value", "h_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let sync_load = manager.test_ctx().sync_load.clone();
+        let sync_load = test_resource_ctx.manager.test_ctx().sync_load.clone();
         let _lock = sync_load.block().await;
-        let fut = manager.get_with_loader(
+        let fut = test_resource_ctx.manager.get_with_loader(
             "key",
             TestResLoader::new("key"),
         );
         drop(fut);
 
         timeout(
-            assert_manager_drops(manager),
+            assert_manager_drops(test_resource_ctx.manager),
             Duration::from_secs(5),
         ).await;
     }
@@ -1106,79 +1105,79 @@ mod tests {
     #[case::ok("key", Some(TestDataEntry::new("key", b"value", "h_value")), ExpectedLoadResult::Ok("value".to_string()))]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
         #[case] key: &str,
         #[case] start_data: Option<TestDataEntry>,
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         if let Some(start_data) = start_data {
-            data_maps[0].lock().insert(start_data.id, start_data.data, start_data.hash);
+            test_resource_ctx.data_maps[0].lock().insert(start_data.id, start_data.data, start_data.hash);
         }
 
         let fut = {
-            let _lock = manager.test_ctx().sync_load.block().await;
-            let fut = manager.get_with_loader(key, TestResLoader::new(key));
+            let _lock = test_resource_ctx.manager.test_ctx().sync_load.block().await;
+            let fut = test_resource_ctx.manager.get_with_loader(key, TestResLoader::new(key));
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
         let result = fut.await;
         // Hold a reference to keep possibly loaded values from expiring
         let _maybe_value = expected_load_result.assert_matches(result);
-        manager.test_ctx().sync_load.assert_count(1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(1);
 
-        let result = manager.get_with_loader(key, TestResLoader::new(key))
+        let result = test_resource_ctx.manager.get_with_loader(key, TestResLoader::new(key))
             .check()
             .expect("Result should be cached and pollable");
         expected_load_result.assert_matches(result);
         // No extra loads should have been made
-        manager.test_ctx().sync_load.assert_count(1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(1);
     }
 
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_expired(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
     ) {
-        data_maps[0].lock().insert("key", b"value", "h_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
 
-        data_maps[0].assert_watch("key", false);
+        test_resource_ctx.data_maps[0].assert_watch("key", false);
         let (fut1, fut2) = {
             debug!("1");
-            let _lock = manager.test_ctx().sync_load.block().await;
-            let fut1 = manager.get_with_loader("key", TestResLoader::new("key"));
-            let fut2 = manager.get_with_loader("key", TestResLoader::new("key"));
+            let _lock = test_resource_ctx.manager.test_ctx().sync_load.block().await;
+            let fut1 = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key"));
+            let fut2 = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key"));
             (fut1, fut2)
         };
 
         let value = fut1.await.expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
-        data_maps[0].assert_watch("key", true);
-        manager.test_ctx().sync_load.assert_count(1);
+        test_resource_ctx.data_maps[0].assert_watch("key", true);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(1);
 
         drop(value);
 
         let value = fut2.await.expect("Resource should reload for 'key' after first handle was dropped");
         assert_eq!(*value.read(), "value".to_owned());
-        manager.test_ctx().sync_load.assert_count(2);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(2);
     }
 
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_source_order(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 3]),
+        test_resource_ctx: TestResourceContext<3>,
     ) {
-        data_maps[1].lock().insert("key", b"value_1", "h_value_1");
-        data_maps[2].lock().insert("key", b"value_2", "h_value_2");
+        test_resource_ctx.data_maps[1].lock().insert("key", b"value_1", "h_value_1");
+        test_resource_ctx.data_maps[2].lock().insert("key", b"value_2", "h_value_2");
 
         // Load should retrieve "value_1", as it's earlier in the priority chain
-        let value = manager.get_with_loader(
+        let value = test_resource_ctx.manager.get_with_loader(
             "key",
             TestResLoader::new("key"),
         ).await.expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value_1".to_owned());
-        data_maps[0].assert_watch("key", true);
-        data_maps[1].assert_watch("key", true);
-        data_maps[2].assert_watch("key", false);
+        test_resource_ctx.data_maps[0].assert_watch("key", true);
+        test_resource_ctx.data_maps[1].assert_watch("key", true);
+        test_resource_ctx.data_maps[2].assert_watch("key", false);
     }
 
     #[rstest]
@@ -1257,7 +1256,7 @@ mod tests {
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_dependencies<T, L, A>(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
         #[case] expected_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
         #[case] expected_entries: impl IntoIterator<Item=ExpectedLoadInfo<T, L, A>>,
@@ -1268,9 +1267,9 @@ mod tests {
         L: ResourceLoader<T>,
         A: Debug + PartialEq<T>,
     {
-        setup_dependency_data(&data_maps[0], &expected_graph);
+        setup_dependency_data(&test_resource_ctx.data_maps[0], &expected_graph);
         {
-            let mut data_map = data_maps[0].lock();
+            let mut data_map = test_resource_ctx.data_maps[0].lock();
             for entry in data_entries.into_iter() {
                 data_map.insert(entry.id, entry.data, entry.hash);
             }
@@ -1278,19 +1277,19 @@ mod tests {
 
         let mut values = Vec::new();
         for entry in expected_entries.into_iter() {
-            let result = manager.get_with_loader(
+            let result = test_resource_ctx.manager.get_with_loader(
                 entry.load_info.key,
                 entry.load_info.loader,
             ).await;
             values.push(entry.expected.assert_matches(result));
         }
-        manager.test_ctx().sync_load.assert_count(expected_load_count);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(expected_load_count);
 
-        assert_eq!(&*manager.dependencies.read(), &expected_graph);
+        assert_eq!(&*test_resource_ctx.manager.dependencies.read(), &expected_graph);
 
         // Drop any held resources and check again
         drop(values);
-        assert_eq!(&*manager.dependencies.read(), &expected_graph);
+        assert_eq!(&*test_resource_ctx.manager.dependencies.read(), &expected_graph);
     }
 
     #[derive(Default)]
@@ -1318,17 +1317,17 @@ mod tests {
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_cyclic(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
     ) {
         {
-            let mut data_map = data_maps[0].lock();
+            let mut data_map = test_resource_ctx.data_maps[0].lock();
             data_map.insert("a", b"b", "h_a");
             data_map.insert("b", b"c", "h_b");
             data_map.insert("c", b"d", "h_c");
             data_map.insert("d", b"b", "h_d");
         }
 
-        let err = manager.get_with_loader("a", TestResourceCyclicRefLoader::default()).await
+        let err = test_resource_ctx.manager.get_with_loader("a", TestResourceCyclicRefLoader::default()).await
             .expect_err("Cyclic load should be detected");
         assert_matches!(err, ResourceLoadError::CyclicLoad { parents, id } => {
             assert_eq!(id, ResourceId::from("b"));
