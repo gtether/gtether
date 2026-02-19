@@ -44,7 +44,7 @@ fn atomic_usize_cmp(a: &AtomicUsize, b: &AtomicUsize) -> Ordering {
 /// [Task] metadata with a static priority.
 ///
 /// Dereferences into `P`.
-#[derive(Educe)]
+#[derive(Educe, Debug)]
 #[educe(Deref, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StaticMetadata<P: HasStaticPriority> {
     #[educe(Deref)]
@@ -57,7 +57,7 @@ pub struct StaticMetadata<P: HasStaticPriority> {
 
 impl<P: HasStaticPriority + Send + Sync + 'static> Metadata for StaticMetadata<P> {
     fn increment_attempts(&self) {
-        self.attempts.fetch_add(1, atomic::Ordering::Relaxed);
+        self.attempts.fetch_add(1, atomic::Ordering::AcqRel);
     }
 }
 
@@ -78,7 +78,7 @@ impl<P: HasStaticPriority> StaticMetadata<P> {
 /// [Task] metadata with a dynamic priority.
 ///
 /// Dereferences into `P`.
-#[derive(Educe)]
+#[derive(Educe, Debug)]
 #[educe(Deref, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DynamicMetadata<P: HasDynamicPriority> {
     #[educe(Deref)]
@@ -92,7 +92,7 @@ pub struct DynamicMetadata<P: HasDynamicPriority> {
 
 impl<P: HasDynamicPriority + Send + Sync + 'static> Metadata for DynamicMetadata<P> {
     fn increment_attempts(&self) {
-        self.attempts.fetch_add(1, atomic::Ordering::Relaxed);
+        self.attempts.fetch_add(1, atomic::Ordering::AcqRel);
     }
 }
 
@@ -107,6 +107,29 @@ impl<P: HasDynamicPriority> DynamicMetadata<P> {
     #[inline]
     pub fn into_inner(self) -> P {
         self.priority
+    }
+}
+
+/// [Task] metadata with FIFO priority.
+#[derive(Educe, Debug)]
+#[educe(PartialEq, Eq, PartialOrd, Ord)]
+pub struct FifoMetadata {
+    #[educe(Eq(method(atomic_usize_eq)))]
+    #[educe(Ord(method(atomic_usize_cmp)))]
+    attempts: AtomicUsize,
+}
+
+impl Metadata for FifoMetadata {
+    fn increment_attempts(&self) {
+        self.attempts.fetch_add(1, atomic::Ordering::AcqRel);
+    }
+}
+
+impl FifoMetadata {
+    fn new() -> Self {
+        Self {
+            attempts: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -185,6 +208,27 @@ pub struct DynamicPriority<P: HasDynamicPriority + Send + Sync + 'static> {
 impl<P: HasDynamicPriority + Send + Sync + 'static> ExecutorType for DynamicPriority<P> {
     type Metadata = DynamicMetadata<P>;
     type Queue = DynamicPriorityQueue<RunnableWrapper<Self::Metadata>>;
+
+    fn queue(&mut self) -> &mut Self::Queue {
+        &mut self.queue
+    }
+}
+
+/// Executor state for an [Executor] using FIFO priority.
+///
+/// Tasks that are submitted first will be the first to start execution. Note that if a task is
+/// currently awaiting other futures or otherwise paused (such as waiting for I/O operations), tasks
+/// that are submitted later may be executed in the meantime, and may finish first.
+///
+/// This type isn't publicly constructable, and is only available for naming to use as a generic for
+/// [Executor].
+pub struct Fifo {
+    queue: StaticPriorityQueue<RunnableWrapper<FifoMetadata>>,
+}
+
+impl ExecutorType for Fifo {
+    type Metadata = FifoMetadata;
+    type Queue = StaticPriorityQueue<RunnableWrapper<Self::Metadata>>;
 
     fn queue(&mut self) -> &mut Self::Queue {
         &mut self.queue
@@ -363,6 +407,7 @@ impl<'a, S: ExecutorType> Executor<'a, S> {
 }
 
 impl<'a, P: HasStaticPriority + Send + Sync + 'static> Executor<'a, StaticPriority<P>> {
+    /// Create a new static priority executor.
     pub fn new_static_priority<PP>(pool_priority: PP, worker_pool: &WorkerPool<PP>) -> Self
     where
         PP: HasStaticPriority + Send + Sync + 'static,
@@ -425,6 +470,7 @@ impl<'a, P: HasStaticPriority + Send + Sync + 'static> Executor<'a, StaticPriori
 }
 
 impl<'a, P: HasDynamicPriority + Send + Sync + 'static> Executor<'a, DynamicPriority<P>> {
+    /// Create a new dynamic priority executor.
     pub fn new_dynamic_priority<PP>(pool_priority: PP, worker_pool: &WorkerPool<PP>) -> Self
     where
         PP: HasStaticPriority + Send + Sync + 'static,
@@ -486,6 +532,68 @@ impl<'a, P: HasDynamicPriority + Send + Sync + 'static> Executor<'a, DynamicPrio
     }
 }
 
+impl<'a> Executor<'a, Fifo> {
+    /// Create a new FIFO executor.
+    pub fn new_fifo<PP>(pool_priority: PP, worker_pool: &WorkerPool<PP>) -> Self
+    where
+        PP: HasStaticPriority + Send + Sync + 'static,
+    {
+        let state = Arc::new(State::new(Fifo {
+            queue: Default::default()
+        }));
+
+        worker_pool.insert_source(pool_priority, Arc::downgrade(&state));
+
+        Self {
+            state,
+            active: Default::default(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Spawns a task onto the executor with FIFO priority.
+    pub fn spawn<T: Send + 'a>(
+        &self,
+        future: impl Future<Output = T> + Send + 'a,
+    ) -> Task<T, FifoMetadata> {
+        let metadata = FifoMetadata::new();
+        let mut active = self.active.lock();
+        self.spawn_inner(metadata, future, &mut *active)
+    }
+
+    /// Spawns many tasks onto the executor in FIFO priority.
+    ///
+    /// This locks the executor's inner task lock once and spawns all the tasks in one go. With
+    /// large amounts of tasks this can improve contention.
+    ///
+    /// For very large numbers of tasks the lock is occasionally dropped and re-acquired to prevent
+    /// runner thread starvation. It is assumed that the iterator provided does not block; blocking
+    /// iterators can lock up the internal mutex and therefore the entire executor.
+    pub fn spawn_many<T: Send + 'a, F: Future<Output = T> + Send + 'a>(
+        &self,
+        futures: impl IntoIterator<Item = F>,
+        handles: &mut impl Extend<Task<T, FifoMetadata>>
+    ) {
+        let mut active = Some(self.active.lock());
+
+        let tasks = futures.into_iter().enumerate()
+            .map(move |(idx, fut)| {
+                let metadata = FifoMetadata::new();
+                let active_ref = &mut **(active.as_mut().unwrap());
+                let task = self.spawn_inner(metadata, fut, active_ref);
+
+                if idx.wrapping_add(1) % 500 == 0 {
+                    drop(active.take());
+                    active = Some(self.active.lock());
+                }
+
+                task
+            });
+
+        handles.extend(tasks);
+    }
+}
+
 impl<S: ExecutorType> Drop for Executor<'_, S> {
     fn drop(&mut self) {
         let state = self.state.inner.lock().take();
@@ -520,104 +628,8 @@ pub type StaticPriorityExecutor<'a, P> = Executor<'a, StaticPriority<P>>;
 /// Alias for an [Executor] using dynamic priorities.
 pub type DynamicPriorityExecutor<'a, P> = Executor<'a, DynamicPriority<P>>;
 
-/*/// Builder pattern for [Executor].
-///
-/// See Executor documentation for usage examples.
-pub struct ExecutorBuilder<S> {
-    worker_count: Option<usize>,
-    #[cfg(test)]
-    worker_lock: Option<Arc<Mutex<()>>>,
-    state: S,
-}
-
-impl Default for ExecutorBuilder<()> {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            worker_count: None,
-            #[cfg(test)]
-            worker_lock: None,
-            state: (),
-        }
-    }
-}
-
-impl<S> ExecutorBuilder<S> {
-    /// Set the number of threaded workers this [Executor] will use.
-    ///
-    /// Defaults to `1`.
-    pub fn worker_count(mut self, count: usize) -> Self {
-        self.worker_count = Some(count);
-        self
-    }
-
-    /// In test environments, set an optional lock that must be acquired before workers can perform
-    /// work.
-    ///
-    /// This can be used to synchronize test cases for more deterministic behavior.
-    #[cfg(test)]
-    pub fn worker_lock(mut self, worker_lock: Arc<Mutex<()>>) -> Self {
-        self.worker_lock = Some(worker_lock);
-        self
-    }
-}
-
-impl ExecutorBuilder<()> {
-    /// Configure an [Executor] that uses static priorities.
-    pub fn static_priority<P: HasStaticPriority>(self) -> ExecutorBuilder<StaticPriority<P>> {
-        ExecutorBuilder {
-            worker_count: self.worker_count,
-            #[cfg(test)]
-            worker_lock: self.worker_lock,
-            state: StaticPriority {
-                queue: Default::default(),
-            },
-        }
-    }
-
-    /// Configure an [Executor] that uses dynamic priorities.
-    pub fn dynamic_priority<P: HasDynamicPriority>(self) -> ExecutorBuilder<DynamicPriority<P>> {
-        ExecutorBuilder {
-            worker_count: self.worker_count,
-            #[cfg(test)]
-            worker_lock: self.worker_lock,
-            state: DynamicPriority {
-                queue: Default::default(),
-            },
-        }
-    }
-}
-
-#[allow(private_bounds)]
-impl<S: ExecutorType> ExecutorBuilder<S> {
-    /// Build the [Executor].
-    ///
-    /// The executor must first be configured to use a specific state before it can be built. This
-    /// is done by using one of the following methods:
-    ///  * [`static_priority()`](ExecutorBuilder::static_priority)
-    ///  * [`dynamic_priority()`](ExecutorBuilder::dynamic_priority)
-    pub fn build<'a>(self) -> Executor<'a, S> {
-        let worker_count = self.worker_count.unwrap_or(1);
-        let state = Arc::new(Mutex::new(self.state));
-
-        let workers = (0..worker_count).into_iter()
-            .map(|_| Worker::start(
-                state.clone(),
-                #[cfg(test)]
-                self.worker_lock.clone(),
-            ))
-            .collect();
-
-        let active = Arc::new(Mutex::new(Slab::new()));
-
-        Executor {
-            workers,
-            state,
-            active,
-            _marker: PhantomData,
-        }
-    }
-}*/
+/// Alias for an [Executor] using FIFO priority.
+pub type FifoExecutor<'a> = Executor<'a, Fifo>;
 
 // This module is ripped from the async-executor reference implementation
 mod call_on_drop {
@@ -658,123 +670,6 @@ mod call_on_drop {
         }
     }
 }
-
-/*struct WorkerWaker(Arc<Mutex<Option<Waker>>>);
-
-impl WorkerWaker {
-    fn wake(&self) {
-        if let Some(waker) = self.0.lock().take() {
-            waker.wake();
-        }
-    }
-}
-
-struct WorkerHandle {
-    waker: Arc<Mutex<Option<Waker>>>,
-    handle: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
-}
-
-impl WorkerHandle {
-    fn waker(&self) -> WorkerWaker {
-        WorkerWaker(self.waker.clone())
-    }
-}
-
-impl Drop for WorkerHandle {
-    fn drop(&mut self) {
-        if let Some((exit_send, join_handle)) = self.handle.take() {
-            drop(exit_send);
-            join_handle.join().unwrap();
-        }
-    }
-}
-
-struct Worker<S: ExecutorType> {
-    waker: Arc<Mutex<Option<Waker>>>,
-    exit_recv: smol::channel::Receiver<()>,
-    state: Arc<Mutex<S>>,
-}
-
-impl<S: ExecutorType> Worker<S> {
-    async fn run(
-        &self,
-        #[cfg(test)]
-        worker_lock: Option<Arc<Mutex<()>>>
-    ) {
-        loop {
-            for _ in 0..200 {
-                #[cfg(test)]
-                let _guard = worker_lock.as_ref().map(|lock| lock.lock());
-                let runnable = self.runnable().await;
-                runnable.run();
-            }
-            future::yield_now().await;
-        }
-    }
-
-    async fn check_exit(&self) {
-        let _ = self.exit_recv.recv().await;
-    }
-
-    fn start(
-        state: Arc<Mutex<S>>,
-        #[cfg(test)]
-        worker_lock: Option<Arc<Mutex<()>>>,
-    ) -> WorkerHandle {
-        let waker = Arc::new(Mutex::new(None));
-        let (exit_send, exit_recv) = smol::channel::bounded(1);
-
-        let runner = Self {
-            waker: waker.clone(),
-            exit_recv,
-            state,
-        };
-
-        let join_handle = std::thread::spawn(move || {
-            future::block_on(runner.check_exit().or(runner.run(
-                #[cfg(test)]
-                worker_lock,
-            )));
-        });
-
-        WorkerHandle {
-            waker,
-            handle: Some((exit_send, join_handle)),
-        }
-    }
-
-    fn sleep(&self, new_waker: &Waker) -> bool {
-        let mut waker = self.waker.lock();
-        if waker.is_none() {
-            let _ = waker.insert(new_waker.clone());
-            true
-        } else {
-            false
-        }
-    }
-
-    async fn runnable(&self) -> Runnable<S::Metadata> {
-        future::poll_fn(|cx| {
-            loop {
-                match self.state.lock().queue().pop() {
-                    None => {
-                        if !self.sleep(cx.waker()) {
-                            // Only returning this after sleeping twice and not detecting a change
-                            // in state avoids a race condition where a new task can become
-                            // available after setting the waker but before yielding from this
-                            // method.
-                            return Poll::Pending
-                        }
-                    },
-                    Some(r) => {
-                        self.waker.lock().take();
-                        return Poll::Ready(r.into_inner())
-                    },
-                }
-            }
-        }).await
-    }
-}*/
 
 fn _ensure_send_and_sync() {
     fn is_send<T: Send>(_: T) {}
