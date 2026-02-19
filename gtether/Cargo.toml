@@ -64,6 +64,7 @@ smallvec = { workspace = true }
 smol = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
+thread_local = { workspace = true }
 tobj = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

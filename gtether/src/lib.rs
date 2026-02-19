@@ -33,6 +33,7 @@ pub mod net;
 pub mod render;
 pub mod resource;
 pub mod util;
+pub mod worker;
 
 /// Error indicating the [Engine] tried to transition to an invalid [stage](EngineStage).
 ///
