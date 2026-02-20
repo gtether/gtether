@@ -12,6 +12,7 @@ readme = "../README.md"
 
 [package.metadata.release]
 shared-version = true
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}", "656d56c..HEAD"]
 
 [features]
 derive = [

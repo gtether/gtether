@@ -11,6 +11,7 @@ categories.workspace = true
 
 [package.metadata.release]
 shared-version = true
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}", "656d56c..HEAD"]
 
 [lib]
 proc-macro = true
