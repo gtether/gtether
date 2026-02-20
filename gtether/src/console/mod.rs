@@ -6,6 +6,8 @@ use tracing::{event, Level};
 
 use crate::console::command::{Command, CommandError, CommandRegisterError, CommandRegistry, CommandTree};
 use crate::console::log::ConsoleLog;
+use crate::util::priority::HasStaticPriority;
+use crate::worker::{WorkQueue, WorkTask, WorkerPool};
 
 pub mod command;
 #[cfg(feature = "gui")]
@@ -18,15 +20,16 @@ pub mod log;
 /// state. Custom [Command]s can be registered at engine initialization, and can be used to execute
 /// custom logic.
 pub struct Console {
-    commands: RwLock<CommandTree>,
+    commands: Arc<RwLock<CommandTree>>,
     log: Arc<ConsoleLog>,
+    work_queue: Arc<WorkQueue>,
 }
 
 impl Console {
     /// Alias for [ConsoleBuilder::default()], that doesn't require bringing [ConsoleBuilder] into
     /// scope.
     #[inline]
-    pub fn builder() -> ConsoleBuilder {
+    pub fn builder<'a>() -> ConsoleBuilder<'a> {
         ConsoleBuilder::default()
     }
 
@@ -38,13 +41,16 @@ impl Console {
     ///
     /// If no commands are found, or there is otherwise an error with command execution, will log a
     /// warning event with the details.
-    pub fn handle_command(&self, command: String) -> Result<(), CommandError> {
-        let parts = shlex::split(&command).unwrap();
-        self.commands.read().handle(parts.as_slice())
-            .map_err(|err| {
-                event!(Level::WARN, "Command failed: {err}");
-                err
-            })
+    pub fn handle_command(&self, command: String) -> WorkTask<Result<(), CommandError>> {
+        let commands = self.commands.clone();
+        self.work_queue.execute(move || {
+            let parts = shlex::split(&command).unwrap();
+            commands.read().handle(parts.as_slice())
+                .map_err(|err| {
+                    event!(Level::WARN, "Command failed: {err}");
+                    err
+                })
+        })
     }
 
     /// Get a [ConsoleCommandRegistry] that can register commands to this [Console].
@@ -75,27 +81,35 @@ impl Console {
 /// Basic console using defaults.
 /// ```
 /// use gtether::console::Console;
+/// use gtether::worker::WorkerPool;
 ///
-/// let console = Console::builder().build();
+/// let workers = WorkerPool::<()>::single().start();
+/// let console = Console::builder()
+///     .worker_config((), &workers)
+///     .build();
 /// ```
 ///
 /// Console with modified [log record][record] buffer size.
 /// ```
 /// use gtether::console::Console;
 /// use gtether::console::log::ConsoleLog;
+/// use gtether::worker::WorkerPool;
 ///
+/// let workers = WorkerPool::<()>::single().start();
 /// let console = Console::builder()
 ///     .log(ConsoleLog::new(50))
+///     .worker_config((), &workers)
 ///     .build();
 /// ```
 ///
 /// [record]: log::ConsoleLogRecord
 #[derive(Default)]
-pub struct ConsoleBuilder {
+pub struct ConsoleBuilder<'a> {
     log: Option<ConsoleLog>,
+    work_queue_builder: Option<Box<dyn (FnOnce() -> Arc<WorkQueue>) + 'a>>,
 }
 
-impl ConsoleBuilder {
+impl<'a> ConsoleBuilder<'a> {
     /// Specify a custom [ConsoleLog].
     ///
     /// If not specified, a default [ConsoleLog] will be created.
@@ -104,11 +118,34 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Configure the workers used for command execution.
+    ///
+    /// Command tasks will be executed by the worker pool with the given priority.
+    pub fn worker_config<PP>(
+        mut self,
+        pool_priority: PP,
+        workers: &'a WorkerPool<PP>,
+    ) -> Self
+    where
+        PP: HasStaticPriority + Send + Sync + 'static,
+    {
+        self.work_queue_builder = Some(Box::new(move || {
+            let work_queue = Arc::new(WorkQueue::new());
+            workers.insert_source(pool_priority, Arc::downgrade(&work_queue));
+            work_queue
+        }));
+        self
+    }
+
     /// Build the [Console] and consume this builder.
     pub fn build(self) -> Console {
+        let work_queue_builder = self.work_queue_builder
+            .expect(".worker_config() is required");
+        let work_queue = work_queue_builder();
         Console {
-            commands: RwLock::new(CommandTree::default()),
+            commands: Arc::new(RwLock::new(CommandTree::default())),
             log: Arc::new(self.log.unwrap_or_default()),
+            work_queue,
         }
     }
 }
@@ -124,6 +161,7 @@ impl ConsoleBuilder {
 /// # use gtether::console::command::{Command, CommandError};
 /// # use gtether::console::Console;
 /// use gtether::console::command::CommandRegistry;
+/// # use gtether::worker::WorkerPool;
 ///
 /// # #[derive(Debug)]
 /// # struct MyCommand {}
@@ -137,7 +175,8 @@ impl ConsoleBuilder {
 /// #     fn new() -> Self { Self {} }
 /// # }
 /// #
-/// # let console = Console::builder().build();
+/// # let workers = WorkerPool::<()>::single().start();
+/// # let console = Console::builder().worker_config((), &workers).build();
 /// #
 /// console.registry()
 ///     .register_command("my-command", Box::new(MyCommand::new())).unwrap()
@@ -177,8 +216,12 @@ impl CommandRegistry for ConsoleCommandRegistry<'_> {
 /// ```
 /// use std::sync::Arc;
 /// use gtether::console::{Console, ConsoleStdinReader};
+/// use gtether::worker::WorkerPool;
 ///
-/// let console = Console::builder().build();
+/// let workers = WorkerPool::<()>::single().start();
+/// let console = Console::builder()
+///     .worker_config((), &workers)
+///     .build();
 /// // Configure the console...
 ///
 /// let console = Arc::new(console);

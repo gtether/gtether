@@ -22,6 +22,7 @@ use gtether::Engine;
 use parking_lot::{Mutex, RwLock};
 use parry3d::na::Point3;
 use std::collections::HashSet;
+use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
@@ -60,6 +61,7 @@ impl ReversiClient {
     pub fn new(workers: Arc<WorkerPool<()>>) -> Self {
         let console = Arc::new(Console::builder()
             .log(ConsoleLog::new(1000))
+            .worker_config((), &workers)
             .build());
 
         let server = Arc::new(ReversiServerManager::new(workers.clone()));
@@ -336,7 +338,11 @@ impl Command for HostCommand {
         };
 
         server.restart(socket_addr)
-            .map_err(|err| CommandError::CommandFailure(Box::new(err)))?;
+            .map_err(|err| {
+                CommandError::CommandFailure(Box::<dyn Error + Send + Sync + 'static>::from(
+                    format!("Server failed to start: {err}")
+                ))
+            })?;
 
         self.client.app().connect(
             socket_addr,

@@ -1,5 +1,6 @@
 extern crate nalgebra_glm as glm;
 
+use std::error::Error;
 use async_trait::async_trait;
 use glm::identity;
 use parking_lot::Mutex;
@@ -90,7 +91,9 @@ impl<const CAP: usize> Command for PointLightDeleteCommand<CAP> {
             .map_err(|e| CommandError::CommandFailure(Box::new(e)))?;
 
         if idx >= point_lights.len() {
-            return Err(CommandError::CommandFailure(format!("Index out of bounds: {idx}").as_str().into()))
+            return Err(CommandError::CommandFailure(Box::<dyn Error + Send + Sync + 'static>::from(
+                format!("Index out of bounds: {idx}")
+            )))
         }
 
         point_lights.remove(idx);
@@ -214,9 +217,10 @@ struct WindowsApp {
 }
 
 impl WindowsApp {
-    fn new() -> Self {
+    fn new(workers: &WorkerPool<()>) -> Self {
         let console = Arc::new(Console::builder()
             .log(ConsoleLog::new(1000))
+            .worker_config((), workers)
             .build());
 
         ConsoleStdinReader::start(&console);
@@ -442,20 +446,20 @@ impl Application for WindowsApp {
 }
 
 fn main() {
-    let app = WindowsApp::new();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .finish()
-        .with(ConsoleLogLayer::new(app.console.log()))
-        .init();
-
     let worker_count = std::thread::available_parallelism()
         .unwrap_or(unsafe { NonZeroUsize::new_unchecked(4) })
         .min(unsafe { NonZeroUsize::new_unchecked(4) });
     let workers = WorkerPool::builder()
         .worker_count(worker_count)
         .start();
+
+    let app = WindowsApp::new(&workers);
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .finish()
+        .with(ConsoleLogLayer::new(app.console.log()))
+        .init();
 
     let resources = ResourceManager::builder()
         .source(ConstantResourceSource::builder()

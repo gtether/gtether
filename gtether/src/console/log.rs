@@ -218,8 +218,13 @@ impl ExactSizeIterator for ConsoleLogIter<'_> {}
 ///
 /// use gtether::console::Console;
 /// use gtether::console::log::ConsoleLogLayer;
+/// use gtether::worker::WorkerPool;
 ///
-/// let console = Console::builder().build();
+/// let workers = WorkerPool::<()>::single().start();
+///
+/// let console = Console::builder()
+///     .worker_config((), &workers)
+///     .build();
 ///
 /// tracing_subscriber::fmt()
 ///     .finish()
