@@ -12,6 +12,7 @@ readme = "../README.md"
 
 [package.metadata.release]
 shared-version = true
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}", "656d56c..HEAD"]
 
 [features]
 derive = [
@@ -32,6 +33,7 @@ ab_glyph = { workspace = true, optional = true }
 aquamarine = { workspace = true }
 ahash = { workspace = true }
 arrayvec = { workspace = true }
+async-task = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bimap = { workspace = true }
@@ -54,13 +56,17 @@ notify-debouncer-full = { workspace = true }
 ouroboros = { workspace = true }
 papaya = { workspace = true }
 parking_lot = { workspace = true }
+pin-project = { workspace = true }
+pin-project-lite = { workspace = true }
 ringbuf = { workspace = true }
 sha2 = { workspace = true }
 shlex = { workspace = true }
+slab = { workspace = true }
 smallvec = { workspace = true }
 smol = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
+thread_local = { workspace = true }
 tobj = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

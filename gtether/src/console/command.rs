@@ -119,7 +119,7 @@ pub enum CommandError {
     /// The count of parameters is invalid for this command.
     InvalidParameterCount{ actual: u32, compare_op: ParamCountCheck },
     /// Generalized catch-all for all other failure types.
-    CommandFailure(Box<dyn Error>),
+    CommandFailure(Box<dyn Error + Send>),
 }
 
 impl fmt::Display for CommandError {

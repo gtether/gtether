@@ -33,6 +33,7 @@ pub mod net;
 pub mod render;
 pub mod resource;
 pub mod util;
+pub mod worker;
 
 /// Error indicating the [Engine] tried to transition to an invalid [stage](EngineStage).
 ///
@@ -416,10 +417,12 @@ impl<A: Application> EngineJoinHandle<A> {
 ///
 /// ```
 /// use async_trait::async_trait;
-/// use gtether::app::Application;
 /// use gtether::Engine;
+/// use gtether::app::Application;
 /// use gtether::app::driver::MinimalAppDriver;
 /// use gtether::net::driver::NoNetDriver;
+/// use gtether::resource::manager::ResourceManager;
+/// use gtether::worker::WorkerPool;
 ///
 /// struct MyApp {}
 ///
@@ -431,9 +434,16 @@ impl<A: Application> EngineJoinHandle<A> {
 /// }
 ///
 /// let app = MyApp {};
+///
+/// let workers = WorkerPool::single().start();
+/// let resources = ResourceManager::builder()
+///     .worker_config((), &workers)
+///     .build();
+///
 /// let engine = Engine::builder()
 ///     .app(app)
 ///     .app_driver(MinimalAppDriver::new())
+///     .resources(resources)
 ///     .networking_driver(NoNetDriver::new())
 ///     .build();
 /// ```
@@ -466,8 +476,7 @@ impl<A: Application> EngineBuilder<A> {
 
     /// Configure a main [ResourceManager] for the engine.
     ///
-    /// If no [ResourceManager] is specified, a default one with no sources - effectively a noop
-    /// manager - will be created.
+    /// This is required.
     pub fn resources(mut self, resources: Arc<ResourceManager>) -> Self {
         self.resources = Some(resources);
         self
@@ -492,7 +501,7 @@ impl<A: Application> EngineBuilder<A> {
             .expect(".app_driver() is required");
 
         let resources = self.resources
-            .unwrap_or_else(|| ResourceManager::builder().build());
+            .expect(".resources() is required");
 
         let networking = self.networking
             .expect(".networking_driver() is required");

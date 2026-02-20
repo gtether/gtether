@@ -581,8 +581,6 @@ mod tests {
     use std::time::Duration;
     use test_log::test as test_log;
 
-    use crate::resource::manager::ResourceManager;
-
     #[derive(Clone, Debug)]
     enum SubStringLoaderError {
         NoSuffix,
@@ -643,13 +641,13 @@ mod tests {
     #[case::ok(SubStringLoader::new("subvalue"), Some("subvalue"))]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_sub_resource(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
         #[case] sub_loader: SubStringLoader,
         #[case] expected_sub_value: Option<&str>,
     ) {
-        data_maps[0].lock().insert("key", b"value", "h_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let resource = manager.get_with_loader("key", TestResLoader::new("key")).await
+        let resource = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key")).await
             .expect("Resource should load");
 
         let result = resource.attach_sub_resource(sub_loader).await;
@@ -674,13 +672,13 @@ mod tests {
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_sub_resource_update(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
         #[case] sub_loaders: impl IntoIterator<Item=SubStringLoader>,
         #[case] expected_sub_values: impl IntoIterator<Item=&str>,
     ) {
-        data_maps[0].lock().insert("key", b"value", "h_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let resource = manager.get_with_loader("key", TestResLoader::new("key")).await
+        let resource = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key")).await
             .expect("Resource should load");
 
         let mut sub_resources = Vec::new();
@@ -690,9 +688,9 @@ mod tests {
             sub_resources.push(sub_resource);
         }
 
-        data_maps[0].lock().insert("key", b"new_value", "h_new_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"new_value", "h_new_value");
         timeout(
-            manager.test_ctx().sync_update.wait_count(1),
+            test_resource_ctx.manager.test_ctx().sync_update.wait_count(1),
             Duration::from_millis(200),
         ).await;
 
@@ -706,11 +704,11 @@ mod tests {
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_chained_sub_resource(
-        #[from(test_resource_manager)] (manager, data_maps): (Arc<ResourceManager>, [Arc<ResourceDataMap>; 1]),
+        test_resource_ctx: TestResourceContext<1>,
     ) {
-        data_maps[0].lock().insert("key", b"value", "h_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
 
-        let resource = manager.get_with_loader("key", TestResLoader::new("key")).await
+        let resource = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key")).await
             .expect("Resource should load");
 
         let sub_resource = resource.attach_sub_resource(SubStringLoader::new("subvalue")).await
@@ -719,9 +717,9 @@ mod tests {
             .expect("Sub-sub-resource should load");
         assert_eq!(&*sub_sub_resource.read(), "value-subvalue-subsubvalue");
 
-        data_maps[0].lock().insert("key", b"new_value", "h_new_value");
+        test_resource_ctx.data_maps[0].lock().insert("key", b"new_value", "h_new_value");
         timeout(
-            manager.test_ctx().sync_update.wait_count(1),
+            test_resource_ctx.manager.test_ctx().sync_update.wait_count(1),
             Duration::from_millis(200)
         ).await;
         assert_eq!(&*sub_sub_resource.read(), "new_value-subvalue-subsubvalue");

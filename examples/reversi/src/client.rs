@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use educe::Educe;
 use gtether::app::Application;
-use gtether::gui::window::winit::{CreateWindowInfo, WindowAttributes, WindowHandle, WinitDriver};
 use gtether::console::command::{Command, CommandError, CommandRegistry, ParamCountCheck};
 use gtether::console::gui::ConsoleGui;
 use gtether::console::log::ConsoleLog;
 use gtether::console::Console;
 use gtether::event::Event;
+use gtether::gui::window::winit::{CreateWindowInfo, WindowAttributes, WindowHandle, WinitDriver};
 use gtether::net::gns::GnsClientDriver;
 use gtether::net::{Networking, NetworkingError};
 use gtether::render::font::glyph::GlyphFontLoader;
@@ -17,10 +17,12 @@ use gtether::render::render_pass::EngineRenderPassBuilder;
 use gtether::render::uniform::Uniform;
 use gtether::render::RendererStaleEvent;
 use gtether::resource::Resource;
+use gtether::worker::WorkerPool;
 use gtether::Engine;
 use parking_lot::{Mutex, RwLock};
 use parry3d::na::Point3;
 use std::collections::HashSet;
+use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
@@ -56,12 +58,13 @@ pub struct ReversiClient {
 }
 
 impl ReversiClient {
-    pub fn new() -> Self {
+    pub fn new(workers: Arc<WorkerPool<()>>) -> Self {
         let console = Arc::new(Console::builder()
             .log(ConsoleLog::new(1000))
+            .worker_config((), &workers)
             .build());
 
-        let server = Arc::new(ReversiServerManager::new());
+        let server = Arc::new(ReversiServerManager::new(workers.clone()));
 
         Self {
             console,
@@ -335,7 +338,11 @@ impl Command for HostCommand {
         };
 
         server.restart(socket_addr)
-            .map_err(|err| CommandError::CommandFailure(Box::new(err)))?;
+            .map_err(|err| {
+                CommandError::CommandFailure(Box::<dyn Error + Send + Sync + 'static>::from(
+                    format!("Server failed to start: {err}")
+                ))
+            })?;
 
         self.client.app().connect(
             socket_addr,

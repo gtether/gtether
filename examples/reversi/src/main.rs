@@ -2,12 +2,15 @@
 
 extern crate nalgebra_glm as glm;
 
-use gtether::gui::window::winit::WinitDriver;
 use gtether::console::log::ConsoleLogLayer;
+use gtether::gui::window::winit::WinitDriver;
 use gtether::net::gns::GnsSubsystem;
 use gtether::resource::manager::ResourceManager;
 use gtether::resource::source::constant::ConstantResourceSource;
+use gtether::worker::WorkerPool;
 use gtether::EngineBuilder;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -23,7 +26,14 @@ mod server;
 mod client;
 
 fn main() {
-    let app = ReversiClient::new();
+    let worker_count = std::thread::available_parallelism()
+        .unwrap_or(unsafe { NonZeroUsize::new_unchecked(4) })
+        .min(unsafe { NonZeroUsize::new_unchecked(4) });
+    let workers = Arc::new(WorkerPool::builder()
+        .worker_count(worker_count)
+        .start());
+
+    let app = ReversiClient::new(workers.clone());
 
     let subscriber_builder = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env()
@@ -42,6 +52,7 @@ fn main() {
             .resource("tile.obj", include_bytes!("../assets/tile.obj"))
             .resource("piece.obj", include_bytes!("../assets/piece.obj"))
             .build())
+        .worker_config((), &workers)
         .build();
 
     EngineBuilder::new()
