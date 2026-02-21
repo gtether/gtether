@@ -173,6 +173,9 @@ impl<P: HasStaticPriority + Send + Sync + 'static> State<P> {
         } else {
             let create_waker = sleepers.is_empty();
             sleepers.insert(thread.id(), thread);
+            // We don't need to hold the lock anymore, and it can deadlock with external logic
+            // triggered by .set_worker_waker() below
+            drop(sleepers);
             if create_waker {
                 let waker = Waker::from(self.clone());
                 for bucket in self.work_sources.read().values() {
