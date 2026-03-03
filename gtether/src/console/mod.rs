@@ -43,6 +43,8 @@ impl Console {
     /// warning event with the details.
     pub fn handle_command(&self, command: String) -> WorkTask<Result<(), CommandError>> {
         let commands = self.commands.clone();
+        // TODO: Commands should probably be modified to be async, so they can't dominate a shared
+        //  worker pool
         self.work_queue.execute(move || {
             let parts = shlex::split(&command).unwrap();
             commands.read().handle(parts.as_slice())
