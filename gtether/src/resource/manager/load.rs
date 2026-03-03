@@ -16,7 +16,7 @@ use crate::resource::manager::dependency::{DependencyGraph, DependencyGraphLayer
 use crate::resource::manager::source::Sources;
 use crate::resource::manager::task::{ManagerExecutor, TaskPriority};
 use crate::resource::manager::update::{UpdateOutput, UpdateOutputUntyped, Updates};
-use crate::resource::manager::{ManagerTask, ResourceFuture, ResourceFutureInner};
+use crate::resource::manager::{GetOrLoad, ManagerTask, ResourceFuture};
 use crate::resource::source::SourceIndex;
 use crate::resource::{Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceMut};
 use crate::util::waker::MultiWaker;
@@ -159,7 +159,7 @@ impl ResourceLoadContext {
     pub fn get<T>(
         &self,
         id: impl Into<ResourceId>,
-    ) -> ResourceFuture<'_, T>
+    ) -> ResourceFuture<'_, T, GetOrLoad<T>>
     where
         T: ResourceDefaultLoader,
     {
@@ -175,7 +175,7 @@ impl ResourceLoadContext {
         &self,
         id: impl Into<ResourceId>,
         loader: impl ResourceLoader<T>,
-    ) -> ResourceFuture<'_, T>
+    ) -> ResourceFuture<'_, T, GetOrLoad<T>>
     where
         T: ?Sized + Send + Sync + 'static,
     {
@@ -202,17 +202,17 @@ impl ResourceLoadContext {
                 id,
             });
             ResourceFuture::with_context(
-                ResourceFutureInner::Cached(result),
+                GetOrLoad::Cached(result),
                 self.cache.clone(),
                 load_params,
                 self,
             )
         } else {
-            let inner = self.cache.get_or_load(
+            let future = self.cache.get_or_load(
                 id,
                 load_params.clone(),
             );
-            ResourceFuture::with_context(inner, self.cache.clone(), load_params, self)
+            ResourceFuture::with_context(future, self.cache.clone(), load_params, self)
         }
     }
 }
@@ -767,7 +767,7 @@ impl CacheEntry {
     }
 }
 
-pub struct Cache {
+pub(in crate::resource) struct Cache {
     entries: RwLock<HashMap<ResourceId, CacheEntry>>,
     executor: Arc<ManagerExecutor>,
     sources: Arc<Sources>,
@@ -802,7 +802,7 @@ impl Cache {
         self: &Arc<Self>,
         id: ResourceId,
         load_params: ResourceLoadParams<T>,
-    ) -> ResourceFutureInner<T>
+    ) -> GetOrLoad<T>
     where
         T: ?Sized + Send + Sync + 'static,
     {
@@ -817,7 +817,7 @@ impl Cache {
         if let Some(entry) = entries.get(&id) {
             if let Some(get_result) = entry.try_get() {
                 if let Some(result) = get_result.try_result() {
-                    return ResourceFutureInner::Cached(result)
+                    return GetOrLoad::Cached(result)
                 } // else expired, start a new load task
             } else {
                 // Entry exists, but needs to be mutated or is still loading
@@ -829,12 +829,12 @@ impl Cache {
                 match poll_result {
                     Poll::Ready(get_result) => {
                         if let Some(result) = get_result.try_result() {
-                            return ResourceFutureInner::Cached(result)
+                            return GetOrLoad::Cached(result)
                         } // else expired, start a new load task
                     },
                     Poll::Pending => {
                         // Yield future for existing load task
-                        return ResourceFutureInner::Loading(ResourceLoadFuture {
+                        return GetOrLoad::Loading(ResourceLoadFuture {
                             cache: self.clone(),
                             id,
                             load_params,
@@ -857,8 +857,8 @@ impl Cache {
         });
 
         match poll {
-            Poll::Ready(result) => ResourceFutureInner::Cached(result),
-            Poll::Pending => ResourceFutureInner::Loading(ResourceLoadFuture {
+            Poll::Ready(result) => GetOrLoad::Cached(result),
+            Poll::Pending => GetOrLoad::Loading(ResourceLoadFuture {
                 cache: self.clone(),
                 id,
                 load_params,
@@ -893,6 +893,14 @@ impl Cache {
             #[cfg(test)]
             let _test_ctx_lock = sync_load.run().await;
 
+            let ctx = ResourceLoadContext::new(
+                cache,
+                id.clone(),
+                load_params.priority,
+                load_params.parents.clone(),
+                load_params.resource_cache.clone(),
+            );
+
             let result = match sources.find_data(&id).await {
                 Some(Ok(data)) => {
                     trace!(
@@ -910,14 +918,6 @@ impl Cache {
                         // If this is the original load, we need to start watching for updates
                         sources.watch_n(&id, &data.source.idx)
                     }
-
-                    let ctx = ResourceLoadContext::new(
-                        cache,
-                        id.clone(),
-                        load_params.priority,
-                        load_params.parents,
-                        load_params.resource_cache.clone(),
-                    );
 
                     match load_params.loader.load(data.data, &ctx).await {
                         Ok(value) => {
@@ -1005,6 +1005,7 @@ impl Cache {
     }
 }
 
+/// Future for awaiting a [Resource] load operation.
 pub struct ResourceLoadFuture<T: ?Sized + Send + Sync + 'static> {
     cache: Arc<Cache>,
     id: ResourceId,

@@ -13,9 +13,9 @@ use tracing::{debug, trace, warn};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::DependencyGraph;
+use crate::resource::manager::future::GetOrLoad;
 use crate::resource::manager::load::{Cache, CacheEntryMetadata, UpdateParams};
 use crate::resource::manager::source::Sources;
-use crate::resource::manager::ResourceFutureInner;
 use crate::resource::source::{ResourceUpdate, SourceIndex};
 use crate::resource::watcher::{ResourceWatcherReceiver, ResourceWatcherSender, UpdateMsg};
 use crate::resource::{ResourceLoadError, ResourceLoadResult};
@@ -92,6 +92,7 @@ impl UpdateOutputUntyped {
     }
 }
 
+/// Future for awaiting a [Resource] update operation.
 pub struct ResourceUpdateFuture<T: ?Sized + Send + Sync + 'static> {
     output: Arc<UpdateOutput<T>>,
     waker: Arc<AtomicWaker>,
@@ -150,7 +151,7 @@ impl Updates {
         })
     }
 
-    pub fn get_future<T>(&self, id: &ResourceId) -> Option<ResourceFutureInner<T>>
+    pub fn get_future<T>(&self, id: &ResourceId) -> Option<GetOrLoad<T>>
     where
         T: ?Sized + Send + Sync + 'static,
     {
@@ -158,8 +159,8 @@ impl Updates {
         let task = inner.get(id)?;
         if !task.is_stale() {
             match task.output.clone().into_typed() {
-                Ok(output) => Some(ResourceFutureInner::Updating(output.future())),
-                Err(error) => Some(ResourceFutureInner::Cached(Err(error))),
+                Ok(output) => Some(GetOrLoad::Updating(output.future())),
+                Err(error) => Some(GetOrLoad::Cached(Err(error))),
             }
         } else {
             // Update entry is stale; it has already modified the cache so there is no need to wait

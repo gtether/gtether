@@ -22,7 +22,6 @@
 
 use async_trait::async_trait;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use smol::future;
 use smol::io::AsyncRead;
 use std::any::TypeId;
 use std::error::Error;
@@ -255,7 +254,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
         &self,
         loader: impl SubResourceLoader<S, T>,
     ) -> ResourceLoadResult<S> {
-        future::block_on(self.attach_sub_resource(loader))
+        smol::future::block_on(self.attach_sub_resource(loader))
     }
 
     /// Attach a callback to this resource, which is executed when this resource is updated.
@@ -277,7 +276,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
         F: (Fn(Arc<Resource<T>>) -> Fut) + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        future::block_on(self.attach_update_callback(callback))
+        smol::future::block_on(self.attach_update_callback(callback))
     }
 }
 
