@@ -18,7 +18,7 @@ use crate::resource::manager::load::{Cache, CacheEntryMetadata, UpdateParams};
 use crate::resource::manager::source::Sources;
 use crate::resource::source::{ResourceUpdate, SourceIndex};
 use crate::resource::watcher::{ResourceWatcherReceiver, ResourceWatcherSender, UpdateMsg};
-use crate::resource::{ResourceLoadError, ResourceLoadResult};
+use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader};
 use crate::util::waker::MultiWaker;
 
 pub struct UpdateOutput<T: ?Sized + Send + Sync + 'static> {
@@ -151,9 +151,9 @@ impl Updates {
         })
     }
 
-    pub fn get_future<T>(&self, id: &ResourceId) -> Option<GetOrLoad<T>>
+    pub fn get_future<L>(&self, id: &ResourceId) -> Option<GetOrLoad<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ?Sized + ResourceLoader,
     {
         let inner = self.inner.read_blocking();
         let task = inner.get(id)?;
@@ -843,7 +843,7 @@ mod tests {
         test_resource_ctx: TestResourceContext<1>,
         #[case] dependency_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
-        #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<Vec<String>, L, Vec<&'static str>>>,
+        #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<L, Vec<&'static str>>>,
         #[case] update: BulkUpdate,
         #[case] wait_update_count: usize,
         #[case] expected_update_load_count: usize,
@@ -851,7 +851,7 @@ mod tests {
         #[case] expected_graph: DependencyGraph,
     )
     where
-        L: ResourceLoader<Vec<String>>,
+        L: ResourceLoader<Output=Vec<String>>,
     {
         setup_dependency_data(&test_resource_ctx.data_maps[0], &dependency_graph);
         {

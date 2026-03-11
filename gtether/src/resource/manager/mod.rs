@@ -44,7 +44,8 @@
 //! # #[derive(Default)]
 //! # struct MyLoader(());
 //! # #[async_trait]
-//! # impl ResourceLoader<()> for MyLoader {
+//! # impl ResourceLoader for MyLoader {
+//! #     type Output = ();
 //! #     async fn load(&self, data: ResourceReadData, ctx: &ResourceLoadContext) -> Result<Box<()>, ResourceLoadError> {
 //! #         Ok(Box::new(()))
 //! #     }
@@ -71,7 +72,8 @@
 //! # #[derive(Default)]
 //! # struct MyLoader(());
 //! # #[async_trait]
-//! # impl ResourceLoader<()> for MyLoader {
+//! # impl ResourceLoader for MyLoader {
+//! #     type Output = ();
 //! #     async fn load(&self, data: ResourceReadData, ctx: &ResourceLoadContext) -> Result<Box<()>, ResourceLoadError> {
 //! #         Ok(Box::new(()))
 //! #     }
@@ -98,7 +100,7 @@
 //! # use gtether::resource::manager::ResourceManager;
 //! # use gtether::resource::ResourceLoader;
 //!
-//! # async fn wrapper<T: Send + Sync + 'static>(manager: &ResourceManager, loader1: impl ResourceLoader<T>, loader2: impl ResourceLoader<T>) {
+//! # async fn wrapper<T: Send + Sync + 'static>(manager: &ResourceManager, loader1: impl ResourceLoader<Output=T>, loader2: impl ResourceLoader<Output=T>) {
 //! // Poll whether the resource is ready
 //! let fut = manager.get_with_loader("key1", loader1);
 //! match fut.check() {
@@ -118,8 +120,8 @@
 //! # use gtether::resource::manager::ResourceManager;
 //! # use gtether::resource::ResourceLoader;
 //!
-//! # async fn wrapper<T, R>(manager: &ResourceManager, loader1: R, loader2: R, loader3: R)
-//! # where T: Send + Sync + 'static, R: ResourceLoader<T> {
+//! # async fn wrapper<R>(manager: &ResourceManager, loader1: R, loader2: R, loader3: R)
+//! # where R: ResourceLoader {
 //! let handle1 = manager.get_with_loader("key", loader1);
 //! let handle2 = manager.get_with_loader("key", loader2);
 //! let handle3 = manager.get_with_loader("key", loader3);
@@ -147,6 +149,7 @@ use std::sync::Arc;
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::DependencyGraph;
+use crate::resource::manager::future::GetOrLoad;
 use crate::resource::manager::load::{Cache, ResourceLoadOperation, ResourceLoadParams};
 use crate::resource::manager::source::Sources;
 use crate::resource::manager::task::ManagerExecutor;
@@ -158,13 +161,16 @@ use crate::util::priority::HasStaticPriority;
 use crate::worker::WorkerPool;
 
 pub mod dependency;
-mod future;
+pub mod future;
 mod load;
 mod source;
 mod task;
 mod update;
 
-pub use future::*;
+pub use future::{
+    ResourceFuture,
+    ResourceFutureBoxed,
+};
 pub use load::{
     LoadPriority,
     ResourceLoadContext,
@@ -250,11 +256,14 @@ impl ResourceManager {
     ///
     /// See also: [Self#loading]
     #[inline]
-    pub fn get<T>(&self, id: impl Into<ResourceId>) -> ResourceFuture<'static, T, GetOrLoad<T>>
+    pub fn get<T>(
+        &self,
+        id: impl Into<ResourceId>,
+    ) -> ResourceFuture<'static, GetOrLoad<T::Loader>>
     where
-        T: ResourceDefaultLoader,
+        T: ?Sized + ResourceDefaultLoader,
     {
-        self.get_with_priority(id, LoadPriority::immediate())
+        self.get_with_priority::<T>(id, LoadPriority::immediate())
     }
 
     /// Get/load a [Resource] with a default [ResourceLoader].
@@ -267,9 +276,9 @@ impl ResourceManager {
         &self,
         id: impl Into<ResourceId>,
         load_priority: LoadPriority,
-    ) -> ResourceFuture<'static, T, GetOrLoad<T>>
+    ) -> ResourceFuture<'static, GetOrLoad<T::Loader>>
     where
-        T: ResourceDefaultLoader,
+        T: ?Sized + ResourceDefaultLoader,
     {
         self.get_with_loader_priority(id, T::default_loader(), load_priority)
     }
@@ -280,13 +289,13 @@ impl ResourceManager {
     ///
     /// See also: [Self#loading]
     #[inline]
-    pub fn get_with_loader<T>(
+    pub fn get_with_loader<L>(
         &self,
         id: impl Into<ResourceId>,
-        loader: impl ResourceLoader<T>,
-    ) -> ResourceFuture<'static, T, GetOrLoad<T>>
+        loader: L,
+    ) -> ResourceFuture<'static, GetOrLoad<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ResourceLoader,
     {
         self.get_with_loader_priority(id, loader, LoadPriority::immediate())
     }
@@ -294,15 +303,16 @@ impl ResourceManager {
     /// Get/load a [Resource].
     ///
     /// See also: [Self#loading]
-    pub fn get_with_loader_priority<T>(
+    pub fn get_with_loader_priority<L>(
         &self,
         id: impl Into<ResourceId>,
-        loader: impl ResourceLoader<T>,
+        loader: L,
         load_priority: LoadPriority,
-    ) -> ResourceFuture<'static, T, GetOrLoad<T>>
+    ) -> ResourceFuture<'static, GetOrLoad<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ResourceLoader,
     {
+        let id = id.into();
         let load_params = ResourceLoadParams {
             loader: Arc::new(loader),
             priority: load_priority.into(),
@@ -312,10 +322,10 @@ impl ResourceManager {
         };
 
         let future = self.cache.get_or_load(
-            id.into(),
+            id,
             load_params.clone(),
         );
-        ResourceFuture::new(future, self.cache.clone(), load_params)
+        ResourceFuture::new(future, id, self.cache.clone(), load_params)
     }
 }
 
@@ -478,7 +488,6 @@ pub mod tests {
     use smol::prelude::*;
     use smol::Timer;
     use smol_macros::test as smol_test;
-    use std::marker::PhantomData;
     use std::time::Duration;
     use test_log::test as test_log;
 
@@ -661,7 +670,9 @@ pub mod tests {
     pub(in crate::resource) struct StringLoader(());
 
     #[async_trait]
-    impl ResourceLoader<String> for StringLoader {
+    impl ResourceLoader for StringLoader {
+        type Output = String;
+
         async fn load(
             &self,
             mut data: ResourceReadData,
@@ -688,7 +699,9 @@ pub mod tests {
     }
 
     #[async_trait]
-    impl ResourceLoader<String> for TestResLoader {
+    impl ResourceLoader for TestResLoader {
+        type Output = String;
+
         async fn load(
             &self,
             data: ResourceReadData,
@@ -700,45 +713,36 @@ pub mod tests {
     }
 
     #[derive(Debug)]
-    pub(in crate::resource) struct TestResRef<T: Send + Sync + 'static> {
+    pub(in crate::resource) struct TestResRef<T: ?Sized + Send + Sync + 'static> {
         pub resources: Vec<Arc<Resource<T>>>,
     }
 
     #[derive(Clone)]
-    pub(in crate::resource) struct TestRefLoader<T, L>
-    where
-        T: Send + Sync + 'static,
-        L: ResourceLoader<T>,
-    {
+    pub(in crate::resource) struct TestRefLoader<L: ResourceLoader> {
         loader: L,
-        _phantom: PhantomData<T>,
     }
 
-    impl<T, L> TestRefLoader<T, L>
-    where
-        T: Send + Sync + 'static,
-        L: ResourceLoader<T>,
-    {
+    impl<L: ResourceLoader> TestRefLoader<L> {
         #[inline]
         pub fn new(loader: L) -> Self {
             Self {
                 loader,
-                _phantom: PhantomData::default(),
             }
         }
     }
 
     #[async_trait]
-    impl<T, L> ResourceLoader<TestResRef<T>> for TestRefLoader<T, L>
+    impl<L> ResourceLoader for TestRefLoader<L>
     where
-        T: Send + Sync + 'static,
-        L: ResourceLoader<T> + Clone,
+        L: ResourceLoader + Clone,
     {
+        type Output = TestResRef<L::Output>;
+
         async fn load(
             &self,
             mut data: ResourceReadData,
             ctx: &ResourceLoadContext,
-        ) -> Result<Box<TestResRef<T>>, ResourceLoadError> {
+        ) -> Result<Box<TestResRef<L::Output>>, ResourceLoadError> {
             let mut ids = String::new();
             data.read_to_string(&mut ids).await?;
 
@@ -760,7 +764,9 @@ pub mod tests {
     pub(in crate::resource) struct TestResChainLoader(());
 
     #[async_trait]
-    impl ResourceLoader<Vec<String>> for TestResChainLoader {
+    impl ResourceLoader for TestResChainLoader {
+        type Output = Vec<String>;
+
         async fn load(
             &self,
             mut data: ResourceReadData,
@@ -1024,19 +1030,17 @@ pub mod tests {
         }
     }
 
-    pub(in crate::resource) struct TestLoadInfo<T: ?Sized + Send + Sync + 'static, L: ResourceLoader<T>> {
+    pub(in crate::resource) struct TestLoadInfo<L: ResourceLoader> {
         pub key: ResourceId,
         pub loader: L,
-        _phantom: PhantomData<T>,
     }
 
-    impl<T: ?Sized + Send + Sync + 'static, L: ResourceLoader<T>> TestLoadInfo<T, L> {
+    impl<L: ResourceLoader> TestLoadInfo<L> {
         #[inline]
         pub fn new(key: impl Into<ResourceId>, loader: L) -> Self {
             Self {
                 key: key.into(),
                 loader,
-                _phantom: PhantomData::default(),
             }
         }
     }
@@ -1117,13 +1121,12 @@ pub mod tests {
         }
     }
 
-    pub(in crate::resource) struct ExpectedLoadInfo<T, L, A>
+    pub(in crate::resource) struct ExpectedLoadInfo<L, A>
     where
-        T: ?Sized + Send + Sync + 'static,
-        L: ResourceLoader<T>,
-        A: PartialEq<T>,
+        L: ResourceLoader,
+        A: PartialEq<L::Output>,
     {
-        pub load_info: TestLoadInfo<T, L>,
+        pub load_info: TestLoadInfo<L>,
         pub expected: ExpectedLoadResult<A>,
     }
 
@@ -1241,7 +1244,7 @@ pub mod tests {
     async fn test_future_or_get(
         test_resource_ctx: TestResourceContext<1>,
         #[case] initial_data: impl IntoIterator<Item=TestDataEntry>,
-        #[case] load_info: impl IntoIterator<Item=TestLoadInfo<String, TestResLoader>>,
+        #[case] load_info: impl IntoIterator<Item=TestLoadInfo<TestResLoader>>,
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         {

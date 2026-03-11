@@ -1,3 +1,24 @@
+//! Futures and their adapters for resource loading.
+//!
+//! The primary type provided this module is [ResourceFuture], which is yielded by
+//! [ResourceManager](super::ResourceManager) [`get*()`](super::ResourceManager::get) methods, and
+//! can be awaited to retrieve [Resource](crate::resource::Resource) values.
+//!
+//! In addition, ResourceFuture provides a [`check()`](ResourceFuture::check) method that can be
+//! used to synchronously check if the resource has finished loading. See that method for more
+//! details.
+//!
+//! # Adapters
+//!
+//! Resource futures can be composed with adapters to modify their functionality, similar to `std`
+//! iterators. Unlike `std` iterators, however, resource future adapters are internally implemented,
+//! and not meant to be extended by users, meaning there is a limited amount of valid adapters.
+//!
+//! Adapters are specified using generics on [ResourceFuture] itself. This can make it hard to e.g.
+//! store collections of resource futures with different adapters. To handle this,
+//! [`ResourceFuture::to_boxed()`] can be used to acquire a resource future with a dyn typed
+//! adapter.
+
 use educe::Educe;
 use futures_core::FusedFuture;
 use pin_project::pin_project;
@@ -10,17 +31,13 @@ use std::task::{ready, Context, Poll, Waker};
 use crate::resource::id::ResourceId;
 use crate::resource::manager::load::{Cache, ResourceLoadParams};
 use crate::resource::manager::{ResourceLoadContext, ResourceLoadFuture, ResourceUpdateFuture};
-use crate::resource::{ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader};
+use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader};
 
-#[derive(Educe)]
-#[educe(Clone)]
-#[doc(hidden)]
-pub struct _ResourceFutureInternals<T: ?Sized + Send + Sync + 'static> {
+pub struct ResourceFutureMetadata {
     cache: Arc<Cache>,
-    load_params: Arc<ResourceLoadParams<T>>,
 }
 
-pub type ResourceFutureBoxed<'ctx, T> = ResourceFuture<'ctx, T, Box<dyn Future<Output=ResourceLoadResult<T>> + Unpin>>;
+pub type ResourceFutureBoxed<'ctx, BaseLoader> = ResourceFuture<'ctx, Box<dyn ResourceFutureAdapter<BaseLoader=BaseLoader> + Unpin>>;
 
 /// Future for retrieving results when loading a [Resource][res].
 ///
@@ -39,56 +56,50 @@ pub type ResourceFutureBoxed<'ctx, T> = ResourceFuture<'ctx, T, Box<dyn Future<O
 #[educe(Debug)]
 #[pin_project]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct ResourceFuture<'ctx, T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
-    #[pin] future: Fut,
+pub struct ResourceFuture<'ctx, A: ResourceFutureAdapter> {
+    #[pin] adapter: A,
+    primary_id: ResourceId,
     #[educe(Debug(ignore))]
-    _internals: _ResourceFutureInternals<T>,
+    metadata: ResourceFutureMetadata,
+    load_params: ResourceLoadParams<A::BaseLoader>,
     #[educe(Debug(ignore))]
     ctx: Option<&'ctx ResourceLoadContext>,
 }
 
-impl<T, Fut> ResourceFuture<'static, T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
+impl<A: ResourceFutureAdapter> ResourceFuture<'static, A> {
     pub(super) fn new(
-        future: Fut,
+        adapter: A,
+        primary_id: ResourceId,
         cache: Arc<Cache>,
-        load_params: ResourceLoadParams<T>,
+        load_params: ResourceLoadParams<A::BaseLoader>,
     ) -> Self {
         Self {
-            future,
-            _internals: _ResourceFutureInternals {
+            adapter,
+            primary_id,
+            metadata: ResourceFutureMetadata {
                 cache,
-                load_params: Arc::new(load_params),
             },
+            load_params,
             ctx: None,
         }
     }
 }
 
-impl<'ctx, T, Fut> ResourceFuture<'ctx, T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
+impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     pub(super) fn with_context(
-        future: Fut,
+        adapter: A,
+        primary_id: ResourceId,
         cache: Arc<Cache>,
-        load_params: ResourceLoadParams<T>,
+        load_params: ResourceLoadParams<A::BaseLoader>,
         ctx: &'ctx ResourceLoadContext,
     ) -> Self {
         Self {
-            future,
-            _internals: _ResourceFutureInternals {
+            adapter,
+            primary_id,
+            metadata: ResourceFutureMetadata {
                 cache,
-                load_params: Arc::new(load_params),
             },
+            load_params,
             ctx: Some(ctx),
         }
     }
@@ -96,9 +107,9 @@ where
     /// Convenience method to synchronously check if the future is complete by polling once.
     ///
     /// If the future is not complete, yields itself as the `Err()`.
-    pub fn check(mut self) -> Result<ResourceLoadResult<T>, Self>
+    pub fn check(mut self) -> Result<ResourceLoadResult<<A::BaseLoader as ResourceLoader>::Output>, Self>
     where
-        Fut: Unpin,
+        A: Unpin,
     {
         let mut cx = Context::from_waker(Waker::noop());
         match self.poll(&mut cx) {
@@ -111,50 +122,35 @@ where
     ///
     /// This allows for shared storage of different adapter patterns. For example:
     /// ```
-    /// # use async_trait::async_trait;
-    /// use gtether::resource::manager::ResourceFutureBoxed;
-    /// # use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
-    /// # use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
-    /// # use gtether::worker::WorkerPool;
-    /// #
-    /// # #[derive(Default)]
-    /// # struct StringLoader(());
-    /// #
-    /// # #[async_trait]
-    /// # impl ResourceLoader<String> for StringLoader {
-    /// #     async fn load(
-    /// #         &self,
-    /// #         data: ResourceReadData,
-    /// #         ctx: &ResourceLoadContext,
-    /// #     ) -> Result<Box<String>, ResourceLoadError> {
-    /// #         Ok(Box::new(ctx.id().to_string()))
-    /// #     }
-    /// # }
-    /// #
-    /// # let workers = WorkerPool::single().start();
-    /// # let manager = ResourceManager::builder().worker_config((), &workers).build();
+    /// use gtether::resource::manager::{ResourceFutureBoxed, ResourceManager};
+    /// use gtether::resource::IdentityLoader;
+    /// use gtether::worker::WorkerPool;
     ///
-    /// let mut tasks: Vec<ResourceFutureBoxed<String>> = vec![];
+    /// let workers = WorkerPool::single().start();
+    /// let manager = ResourceManager::builder().worker_config((), &workers).build();
     ///
-    /// // Given some `StringLoader` that yields Strings:
+    /// let mut tasks: Vec<ResourceFutureBoxed<IdentityLoader>> = vec![];
+    ///
     /// tasks.push(
-    ///     manager.get_with_loader("a", StringLoader::default())
+    ///     manager.get_with_loader("a", IdentityLoader::default())
     ///         .to_boxed()
     /// );
     /// tasks.push(
     ///     // This would normally have a different type
-    ///     manager.get_with_loader("b", StringLoader::default())
-    ///         .or_get_with_loader("c", StringLoader::default())
+    ///     manager.get_with_loader("b", IdentityLoader::default())
+    ///         .or_get_with_loader("c", IdentityLoader::default())
     ///         .to_boxed()
     /// );
     /// ```
-    pub fn to_boxed(self) -> ResourceFutureBoxed<'ctx, T>
+    pub fn to_boxed(self) -> ResourceFutureBoxed<'ctx, A::BaseLoader>
     where
-        Fut: Unpin + 'static,
+        A: Unpin + 'static,
     {
         ResourceFuture {
-            future: Box::new(self.future),
-            _internals: self._internals,
+            adapter: Box::new(self.adapter),
+            primary_id: self.primary_id,
+            metadata: self.metadata,
+            load_params: self.load_params,
             ctx: self.ctx,
         }
     }
@@ -166,47 +162,106 @@ where
     ///
     /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it attempts
     /// to load this fallback configuration instead.
-    pub fn or_get(self, id: impl Into<ResourceId>) -> ResourceFuture<'ctx, T, OrGetOrLoad<T, Fut>>
+    ///
+    /// ```
+    /// use gtether::resource::id::ResourceId;
+    /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::source::constant::ConstantResourceSource;
+    /// use gtether::worker::WorkerPool;
+    /// # use smol::future;
+    ///
+    /// static BYTES: [u8; 0] = [];
+    ///
+    /// let workers = WorkerPool::single().start();
+    /// let manager = ResourceManager::builder()
+    ///     .worker_config((), &workers)
+    ///     .source(ConstantResourceSource::builder()
+    ///         .resource("b", &BYTES)
+    ///         .build())
+    ///     .build();
+    ///
+    /// # future::block_on(async move {
+    /// // This uses IdentityLoader based on ResourceDefaultLoader implemented for ResourceId
+    /// let id = manager.get::<ResourceId>("a")
+    ///     .or_get("b")
+    ///     .await.expect("a resource should be found");
+    /// assert_eq!(*id.read(), ResourceId::from("b"));
+    /// # });
+    /// ```
+    pub fn or_get(
+        self,
+        id: impl Into<ResourceId>,
+    ) -> ResourceFuture<'ctx, OrGetOrLoad<A, A::BaseLoader>>
     where
-        T: ResourceDefaultLoader,
+        A::BaseLoader: Clone,
     {
-        self.or_get_with_loader(id, T::default_loader())
+        let loader = (*self.load_params.loader).clone();
+        self.or_get_with_loader(id, loader)
     }
 
     /// Compose this ResourceFuture with a fallback load configuration.
     ///
     /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it attempts
     /// to load this fallback configuration instead.
-    pub fn or_get_with_loader(
+    ///
+    /// ```
+    /// use gtether::resource::IdentityLoader;
+    /// use gtether::resource::id::ResourceId;
+    /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::source::constant::ConstantResourceSource;
+    /// use gtether::worker::WorkerPool;
+    /// # use smol::future;
+    ///
+    /// static BYTES: [u8; 0] = [];
+    ///
+    /// let workers = WorkerPool::single().start();
+    /// let manager = ResourceManager::builder()
+    ///     .worker_config((), &workers)
+    ///     .source(ConstantResourceSource::builder()
+    ///         .resource("b", &BYTES)
+    ///         .build())
+    ///     .build();
+    ///
+    /// # future::block_on(async move {
+    /// let id = manager.get_with_loader("a", IdentityLoader)
+    ///     .or_get_with_loader("b", IdentityLoader)
+    ///     .await.expect("a resource should be found");
+    /// assert_eq!(*id.read(), ResourceId::from("b"));
+    /// # });
+    /// ```
+    pub fn or_get_with_loader<L>(
         self,
         id: impl Into<ResourceId>,
-        loader: impl ResourceLoader<T>
-    ) -> ResourceFuture<'ctx, T, OrGetOrLoad<T, Fut>> {
-        let future = OrGetOrLoad::First {
-            future: self.future,
-            id: id.into(),
-            loader: Arc::new(loader),
-            _internals: self._internals.clone(),
-        };
+        loader: L,
+    ) -> ResourceFuture<'ctx, OrGetOrLoad<A, L>>
+    where
+        L: ResourceLoader<Output=<A::BaseLoader as ResourceLoader>::Output>,
+    {
+        let adapter = OrGetOrLoad(AdapterState::Primary {
+            adapter: self.adapter,
+            data: Some(OrGetOrLoadData {
+                id: id.into(),
+                load_params: self.load_params.clone()
+                    .with_loader(Arc::new(loader)),
+            }),
+        });
 
         ResourceFuture {
-            future,
-            _internals: self._internals,
+            adapter,
+            primary_id: self.primary_id,
+            metadata: self.metadata,
+            load_params: self.load_params,
             ctx: self.ctx,
         }
     }
 }
 
-impl<'ctx, T, Fut> Future for ResourceFuture<'ctx, T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
-    type Output = ResourceLoadResult<T>;
+impl<'ctx, A: ResourceFutureAdapter> Future for ResourceFuture<'ctx, A> {
+    type Output = ResourceLoadResult<<A::BaseLoader as ResourceLoader>::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().project();
-        let result = ready!(this.future.poll(cx));
+        let result = ready!(this.adapter.poll(cx, &this.metadata));
 
         if let Ok(resource) = &result && let Some(ctx) = this.ctx {
             ctx.add_dependency(resource.id().clone());
@@ -217,32 +272,81 @@ where
     }
 }
 
-impl<'ctx, T, Fut> FusedFuture for ResourceFuture<'ctx, T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>> + FusedFuture,
-{
+impl<'ctx, A: ResourceFutureAdapter> FusedFuture for ResourceFuture<'ctx, A> {
     #[inline]
     fn is_terminated(&self) -> bool {
-        self.future.is_terminated()
+        self.adapter.is_terminated()
     }
 }
 
-/// Base future for [`ResourceManager::get_*()`](crate::resource::manager::ResourceManager::get).
+/// Trait implemented by [adapters](super::future#adapters).
 ///
-/// This future is not directly accessible, but is available for type naming with [ResourceFuture].
+/// This trait is not intended to be implemented externally, and it would be difficult if not
+/// impossible to properly do so. It is instead used as a bound for provided adapters to function
+/// generically.
+pub trait ResourceFutureAdapter {
+    type BaseLoader: ?Sized + ResourceLoader;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        metadata: &ResourceFutureMetadata,
+    ) -> Poll<ResourceLoadResult<<Self::BaseLoader as ResourceLoader>::Output>>;
+
+    fn is_terminated(&self) -> bool;
+}
+
+impl<A: ?Sized + ResourceFutureAdapter + Unpin> ResourceFutureAdapter for Box<A> {
+    type BaseLoader = A::BaseLoader;
+
+    #[inline]
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        metadata: &ResourceFutureMetadata,
+    ) -> Poll<ResourceLoadResult<<Self::BaseLoader as ResourceLoader>::Output>> {
+        Pin::new(&mut (**self)).poll(cx, metadata)
+    }
+
+    #[inline]
+    fn is_terminated(&self) -> bool {
+        (**self).is_terminated()
+    }
+}
+
+macro_rules! impl_pinned_adapter_wrapper {
+    () => {
+        type BaseLoader = A::BaseLoader;
+
+        fn poll(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            metadata: &ResourceFutureMetadata,
+        ) -> Poll<ResourceLoadResult<<Self::BaseLoader as ResourceLoader>::Output>> {
+            self.as_mut().project().0.poll(cx, metadata)
+        }
+
+        fn is_terminated(&self) -> bool {
+            self.0.is_terminated()
+        }
+    };
+}
+
+/// Base future adapter for [`ResourceManager::get_*()`](crate::resource::manager::ResourceManager::get).
+///
+/// This adapter is not directly accessible, but is available for type naming with [ResourceFuture].
 #[pin_project(project = GetOrLoadProj, project_replace = GetOrLoadProjReplace)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub enum GetOrLoad<T: ?Sized + Send + Sync + 'static> {
-    Cached(ResourceLoadResult<T>),
-    Loading(#[pin] ResourceLoadFuture<T>),
-    Updating(#[pin] ResourceUpdateFuture<T>),
+pub enum GetOrLoad<Loader: ?Sized + ResourceLoader> {
+    Cached(ResourceLoadResult<Loader::Output>),
+    Loading(#[pin] ResourceLoadFuture<Loader>),
+    Updating(#[pin] ResourceUpdateFuture<Loader::Output>),
     Complete,
 }
 
-impl<T: ?Sized + Send + Sync + 'static> Debug for GetOrLoad<T> {
+impl<Loader: ?Sized + ResourceLoader> Debug for GetOrLoad<Loader> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ResourceFuture(")?;
+        write!(f, "GetOrLoad::")?;
         match self {
             Self::Cached(Ok(res)) => write!(f, "Cached(Ok({}))", res.id())?,
             Self::Cached(Err(e)) => {
@@ -254,23 +358,18 @@ impl<T: ?Sized + Send + Sync + 'static> Debug for GetOrLoad<T> {
             Self::Updating(_) => write!(f, "Updating(<update-future>)")?,
             Self::Complete => write!(f, "Complete")?,
         }
-        write!(f, ")")
+        Ok(())
     }
 }
 
-impl<T: ?Sized + Send + Sync + 'static> FusedFuture for GetOrLoad<T> {
-    fn is_terminated(&self) -> bool {
-        match self {
-            Self::Complete => true,
-            _ => false,
-        }
-    }
-}
+impl<Loader: ?Sized + ResourceLoader> ResourceFutureAdapter for GetOrLoad<Loader> {
+    type BaseLoader = Loader;
 
-impl<T: ?Sized + Send + Sync + 'static> Future for GetOrLoad<T> {
-    type Output = ResourceLoadResult<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _metadata: &ResourceFutureMetadata,
+    ) -> Poll<ResourceLoadResult<<Self::BaseLoader as ResourceLoader>::Output>> {
         match self.as_mut().project() {
             GetOrLoadProj::Cached(_) => {
                 match self.project_replace(Self::Complete) {
@@ -299,35 +398,7 @@ impl<T: ?Sized + Send + Sync + 'static> Future for GetOrLoad<T> {
             }
         }
     }
-}
 
-/// Adapter future for [`ResourceFuture::or_get_*()`](ResourceFuture::or_get).
-///
-/// This future is not directly accessible, but is available for type naming with [ResourceFuture].
-#[pin_project(project = OrGetOrLoadProj, project_replace = OrGetOrLoadProjReplace)]
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub enum OrGetOrLoad<T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
-    First {
-        #[pin] future: Fut,
-        id: ResourceId,
-        loader: Arc<dyn ResourceLoader<T>>,
-        _internals: _ResourceFutureInternals<T>,
-    },
-    Second {
-        #[pin] future: GetOrLoad<T>,
-    },
-    Complete,
-}
-
-impl<T, Fut> FusedFuture for OrGetOrLoad<T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
     fn is_terminated(&self) -> bool {
         match self {
             Self::Complete => true,
@@ -336,29 +407,77 @@ where
     }
 }
 
-impl<T, Fut> Future for OrGetOrLoad<T, Fut>
-where
-    T: ?Sized + Send + Sync + 'static,
-    Fut: Future<Output=ResourceLoadResult<T>>,
-{
-    type Output = Fut::Output;
+trait AdapterData {
+    type Adapter;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn into_adapter(self, cache: &Arc<Cache>) -> Self::Adapter
+    where
+        Self: Sized;
+}
+
+#[pin_project(project = AdapterStateProj, project_replace = AdapterStateProjReplace)]
+enum AdapterState<A1, A2, D> {
+    Primary {
+        #[pin] adapter: A1,
+        data: Option<D>,
+    },
+    Secondary {
+        #[pin] adapter: A2,
+    },
+    Complete,
+}
+
+impl<A1, A2, D> Debug for AdapterState<A1, A2, D>
+where
+    A1: Debug,
+    A2: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AdapterState::")?;
+        match self {
+            Self::Primary { adapter, .. } => {
+                write!(f, "Primary(")?;
+                Debug::fmt(adapter, f)?;
+                write!(f, ")")?;
+            },
+            Self::Secondary { adapter } => {
+                write!(f, "Secondary(")?;
+                Debug::fmt(adapter, f)?;
+                write!(f, ")")?;
+            },
+            Self::Complete => write!(f, "Complete")?,
+        }
+        Ok(())
+    }
+}
+
+impl<A1, A2, D> ResourceFutureAdapter for AdapterState<A1, A2, D>
+where
+    A1: ResourceFutureAdapter,
+    A2: ResourceFutureAdapter,
+    A2::BaseLoader: ResourceLoader<Output=<A1::BaseLoader as ResourceLoader>::Output>,
+    D: AdapterData<Adapter=A2>,
+{
+    type BaseLoader = A1::BaseLoader;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        metadata: &ResourceFutureMetadata,
+    ) -> Poll<ResourceLoadResult<<Self::BaseLoader as ResourceLoader>::Output>> {
         match self.as_mut().project() {
-            OrGetOrLoadProj::First {
-                future,
-                id,
-                loader,
-                _internals,
+            AdapterStateProj::Primary {
+                adapter,
+                data,
             } => {
-                let output = ready!(future.poll(cx));
+                let output = ready!(adapter.poll(cx, &metadata));
                 match output {
                     Err(ResourceLoadError::NotFound(_)) => {
-                        let mut load_params = (*_internals.load_params).clone();
-                        load_params.loader = loader.clone();
-                        let future = _internals.cache.get_or_load(id.clone(), load_params);
-                        match self.project_replace(Self::Second { future }) {
-                            OrGetOrLoadProjReplace::First { .. } => {
+                        let adapter = data.take()
+                            .expect("transition from Primary => Secondary should only occur once")
+                            .into_adapter(&metadata.cache);
+                        match self.project_replace(Self::Secondary { adapter }) {
+                            AdapterStateProjReplace::Primary { .. } => {
                                 // We want to re-poll immediately
                                 cx.waker().wake_by_ref();
                                 Poll::Pending
@@ -368,22 +487,68 @@ where
                     },
                     result => {
                         match self.project_replace(Self::Complete) {
-                            OrGetOrLoadProjReplace::First { .. } => Poll::Ready(result),
+                            AdapterStateProjReplace::Primary { .. } => Poll::Ready(result),
                             _ => unreachable!(),
                         }
                     },
                 }
             },
-            OrGetOrLoadProj::Second { future } => {
-                let output = ready!(future.poll(cx));
+            AdapterStateProj::Secondary {
+                adapter,
+            } => {
+                let output = ready!(adapter.poll(cx, metadata));
                 match self.project_replace(Self::Complete) {
-                    OrGetOrLoadProjReplace::Second { .. } => Poll::Ready(output),
+                    AdapterStateProjReplace::Secondary { .. } => Poll::Ready(output),
                     _ => unreachable!(),
                 }
             },
-            OrGetOrLoadProj::Complete => {
-                panic!("OrLoad must not be polled after it returned `Poll::Ready`")
-            }
+            AdapterStateProj::Complete => {
+                panic!("adapter future must not be polled after it returned `Poll::Ready`")
+            },
         }
     }
+
+    fn is_terminated(&self) -> bool {
+        match self {
+            Self::Complete => true,
+            _ => false,
+        }
+    }
+}
+
+struct OrGetOrLoadData<NewLoader: ?Sized> {
+    id: ResourceId,
+    load_params: ResourceLoadParams<NewLoader>,
+}
+
+impl<NewLoader: ?Sized + ResourceLoader> AdapterData for OrGetOrLoadData<NewLoader> {
+    type Adapter = GetOrLoad<NewLoader>;
+
+    fn into_adapter(self, cache: &Arc<Cache>) -> Self::Adapter
+    where
+        Self: Sized,
+    {
+        cache.get_or_load(self.id, self.load_params)
+    }
+}
+
+/// Adapter future for [`ResourceFuture::or_get_*()`](ResourceFuture::or_get).
+///
+/// This future is not directly accessible, but is available for type naming with [ResourceFuture].
+#[pin_project]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct OrGetOrLoad<A, L: ?Sized + ResourceLoader>(#[pin] AdapterState<
+    A,
+    GetOrLoad<L>,
+    OrGetOrLoadData<L>,
+>);
+
+impl<A, L> ResourceFutureAdapter for OrGetOrLoad<A, L>
+where
+    A: ResourceFutureAdapter,
+    L: ?Sized + ResourceLoader<Output=<A::BaseLoader as ResourceLoader>::Output>,
+{
+    impl_pinned_adapter_wrapper!();
 }
