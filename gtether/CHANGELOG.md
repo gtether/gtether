@@ -1,4 +1,18 @@
-## [0.2.2] - 2026-02-21
+## [0.2.3] - 2026-03-12
+
+### 🚀 Features
+
+- Add or_default* ResourceFuture adapters
+
+### 🚜 Refactor
+
+- Use adapter patterns for ResourceFuture sub-types
+- [**breaking**] Move ResourceLoader generic T to associated type
+
+### ⚙️ Miscellaneous Tasks
+
+- Add todo reminder for future console enhancements
+## [gtether_derive-v0.2.2] - 2026-02-21
 
 ### 🐛 Bug Fixes
 
@@ -7,6 +21,10 @@
 ### 📚 Documentation
 
 - Add starting changelogs
+
+### ⚙️ Miscellaneous Tasks
+
+- Release 0.2.2
 ## [gtether_derive-v0.2.1] - 2026-02-20
 
 ### 🚀 Features
