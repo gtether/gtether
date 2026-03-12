@@ -2,7 +2,7 @@ use crate::resource::id::ResourceId;
 use crate::resource::source::{ResourceSource, SealedResourceDataResult, SealedResourceDataSource, SourceIndex};
 use crate::resource::ResourceLoadError;
 
-pub struct Sources {
+pub(in crate::resource) struct Sources {
     inner: Vec<Box<dyn ResourceSource>>,
 }
 

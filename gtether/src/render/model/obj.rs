@@ -90,7 +90,9 @@ impl<V: Vertex> ModelObjLoader<V> {
 }
 
 #[async_trait]
-impl ResourceLoader<Model<ModelVertex>> for ModelObjLoader<ModelVertex> {
+impl ResourceLoader for ModelObjLoader<ModelVertex> {
+    type Output = Model<ModelVertex>;
+
     async fn load(
         &self,
         data: ResourceReadData,
@@ -110,7 +112,9 @@ impl ResourceLoader<Model<ModelVertex>> for ModelObjLoader<ModelVertex> {
 }
 
 #[async_trait]
-impl ResourceLoader<Model<ModelVertexNormal>> for ModelObjLoader<ModelVertexNormal> {
+impl ResourceLoader for ModelObjLoader<ModelVertexNormal> {
+    type Output = Model<ModelVertexNormal>;
+
     async fn load(
         &self,
         data: ResourceReadData,
@@ -135,7 +139,9 @@ impl ResourceLoader<Model<ModelVertexNormal>> for ModelObjLoader<ModelVertexNorm
 }
 
 #[async_trait]
-impl ResourceLoader<Model<ModelVertexNormalColor>> for ModelObjLoader<ModelVertexNormalColor> {
+impl ResourceLoader for ModelObjLoader<ModelVertexNormalColor> {
+    type Output = Model<ModelVertexNormalColor>;
+
     async fn load(
         &self,
         data: ResourceReadData,
@@ -163,7 +169,9 @@ impl ResourceLoader<Model<ModelVertexNormalColor>> for ModelObjLoader<ModelVerte
 }
 
 #[async_trait]
-impl ResourceLoader<Model<ModelVertexNormalTex>> for ModelObjLoader<ModelVertexNormalTex> {
+impl ResourceLoader for ModelObjLoader<ModelVertexNormalTex> {
+    type Output = Model<ModelVertexNormalTex>;
+
     async fn load(
         &self,
         data: ResourceReadData,

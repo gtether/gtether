@@ -13,12 +13,12 @@ use tracing::{debug, trace, warn};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::DependencyGraph;
+use crate::resource::manager::future::GetOrLoad;
 use crate::resource::manager::load::{Cache, CacheEntryMetadata, UpdateParams};
 use crate::resource::manager::source::Sources;
-use crate::resource::manager::ResourceFutureInner;
 use crate::resource::source::{ResourceUpdate, SourceIndex};
 use crate::resource::watcher::{ResourceWatcherReceiver, ResourceWatcherSender, UpdateMsg};
-use crate::resource::{ResourceLoadError, ResourceLoadResult};
+use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader};
 use crate::util::waker::MultiWaker;
 
 pub struct UpdateOutput<T: ?Sized + Send + Sync + 'static> {
@@ -92,6 +92,7 @@ impl UpdateOutputUntyped {
     }
 }
 
+/// Future for awaiting a [Resource] update operation.
 pub struct ResourceUpdateFuture<T: ?Sized + Send + Sync + 'static> {
     output: Arc<UpdateOutput<T>>,
     waker: Arc<AtomicWaker>,
@@ -150,16 +151,16 @@ impl Updates {
         })
     }
 
-    pub fn get_future<T>(&self, id: &ResourceId) -> Option<ResourceFutureInner<T>>
+    pub fn get_future<L>(&self, id: &ResourceId) -> Option<GetOrLoad<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ?Sized + ResourceLoader,
     {
         let inner = self.inner.read_blocking();
         let task = inner.get(id)?;
         if !task.is_stale() {
             match task.output.clone().into_typed() {
-                Ok(output) => Some(ResourceFutureInner::Updating(output.future())),
-                Err(error) => Some(ResourceFutureInner::Cached(Err(error))),
+                Ok(output) => Some(GetOrLoad::Updating(output.future())),
+                Err(error) => Some(GetOrLoad::Cached(Err(error))),
             }
         } else {
             // Update entry is stale; it has already modified the cache so there is no need to wait
@@ -842,7 +843,7 @@ mod tests {
         test_resource_ctx: TestResourceContext<1>,
         #[case] dependency_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
-        #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<Vec<String>, L, Vec<&'static str>>>,
+        #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<L, Vec<&'static str>>>,
         #[case] update: BulkUpdate,
         #[case] wait_update_count: usize,
         #[case] expected_update_load_count: usize,
@@ -850,7 +851,7 @@ mod tests {
         #[case] expected_graph: DependencyGraph,
     )
     where
-        L: ResourceLoader<Vec<String>>,
+        L: ResourceLoader<Output=Vec<String>>,
     {
         setup_dependency_data(&test_resource_ctx.data_maps[0], &dependency_graph);
         {

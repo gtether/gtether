@@ -237,7 +237,9 @@ impl GlyphFontLoader {
 }
 
 #[async_trait]
-impl ResourceLoader<dyn Font> for GlyphFontLoader {
+impl ResourceLoader for GlyphFontLoader {
+    type Output = dyn Font;
+
     async fn load(
         &self,
         mut data: ResourceReadData,

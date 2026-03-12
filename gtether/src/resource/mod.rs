@@ -22,7 +22,6 @@
 
 use async_trait::async_trait;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use smol::future;
 use smol::io::AsyncRead;
 use std::any::TypeId;
 use std::error::Error;
@@ -255,7 +254,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
         &self,
         loader: impl SubResourceLoader<S, T>,
     ) -> ResourceLoadResult<S> {
-        future::block_on(self.attach_sub_resource(loader))
+        smol::future::block_on(self.attach_sub_resource(loader))
     }
 
     /// Attach a callback to this resource, which is executed when this resource is updated.
@@ -277,7 +276,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
         F: (Fn(Arc<Resource<T>>) -> Fut) + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        future::block_on(self.attach_update_callback(callback))
+        smol::future::block_on(self.attach_update_callback(callback))
     }
 }
 
@@ -454,7 +453,9 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 /// struct StringLoader {}
 ///
 /// #[async_trait]
-/// impl ResourceLoader<String> for StringLoader {
+/// impl ResourceLoader for StringLoader {
+///     type Output = String;
+///
 ///     async fn load(
 ///         &self,
 ///         mut data: ResourceReadData,
@@ -473,7 +474,9 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 /// [rd]: ResourceReadData
 /// [rm]: manager::ResourceManager
 #[async_trait]
-pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'static {
+pub trait ResourceLoader: Send + Sync + 'static {
+    type Output: ?Sized + Send + Sync + 'static;
+
     /// Load and create a value from [raw data][rd].
     ///
     /// [rd]: ResourceReadData
@@ -481,7 +484,7 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
         &self,
         data: ResourceReadData,
         ctx: &ResourceLoadContext,
-    ) -> Result<Box<T>, ResourceLoadError>;
+    ) -> Result<Box<Self::Output>, ResourceLoadError>;
 
     /// Given a [mutable resource handle][rm], update a resource from a [loaded](Self::load) value.
     ///
@@ -493,10 +496,31 @@ pub trait ResourceLoader<T: ?Sized + Send + Sync + 'static>: Send + Sync + 'stat
     /// [rd]: ResourceReadData
     async fn update(
         &self,
-        resource: ResourceMut<T>,
-        new_value: Box<T>,
+        resource: ResourceMut<Self::Output>,
+        new_value: Box<Self::Output>,
     ) {
         resource.replace(new_value);
+    }
+}
+
+/// Simple [ResourceLoader] that yields the [ID](ResourceLoader) that was used to find data.
+///
+/// This resource loader is not often useful in practical applications, but can be used in doctests
+/// or other such examples where a placeholder resource loader is required.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct IdentityLoader;
+
+#[async_trait]
+impl ResourceLoader for IdentityLoader {
+    type Output = ResourceId;
+
+    #[inline]
+    async fn load(
+        &self,
+        _data: ResourceReadData,
+        ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError> {
+        Ok(Box::new(ctx.id()))
     }
 }
 
@@ -554,6 +578,15 @@ where
     }
 }
 
+impl ResourceDefaultLoader for ResourceId {
+    type Loader = IdentityLoader;
+
+    #[inline]
+    fn default_loader() -> Self::Loader {
+        IdentityLoader
+    }
+}
+
 /// Trait used to define a "default" [ResourceLoader] for a resource type.
 ///
 /// Any resource type that implements ResourceDefaultLoader can be loaded via
@@ -564,10 +597,56 @@ where
 /// arguments.
 pub trait ResourceDefaultLoader: Send + Sync + 'static {
     /// The concrete default [ResourceLoader] type.
-    type Loader: ResourceLoader<Self>;
+    type Loader: ResourceLoader<Output=Self>;
 
     /// Create a default [ResourceLoader] for this resource type.
     fn default_loader() -> Self::Loader;
+}
+
+/// Extension trait for defining a [ResourceLoader] that can provide a default value.
+///
+/// This trait is used with some resource loading [adapters](manager::future::OrLoaderDefault) in
+/// order to load a default value for a [resource ID](ResourceId) when no backing data can be found.
+#[async_trait]
+pub trait ResourceLoaderDefault: ResourceLoader {
+    /// Create a new default value using nothing but the [context](ResourceLoadContext).
+    async fn load_default(
+        &self,
+        ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError>;
+}
+
+/// Simple [ResourceLoader] that yields the [ID](ResourceLoader) that was used to find data, or
+/// `None`.
+///
+/// This loader functions identically to [IdentityLoader], except it yields IDs wrapped in an
+/// `Option<>`, which allows [ResourceLoaderDefault] to be implemented by yielding `None`.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct MaybeIdentityLoader;
+
+#[async_trait]
+impl ResourceLoader for MaybeIdentityLoader {
+    type Output = Option<ResourceId>;
+
+    #[inline]
+    async fn load(
+        &self,
+        _data: ResourceReadData,
+        ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError> {
+        Ok(Box::new(Some(ctx.id())))
+    }
+}
+
+#[async_trait]
+impl ResourceLoaderDefault for MaybeIdentityLoader {
+    #[inline]
+    async fn load_default(
+        &self,
+        _ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError> {
+        Ok(Box::new(None))
+    }
 }
 
 #[cfg(test)]

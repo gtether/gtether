@@ -32,6 +32,15 @@ If a simple all-purpose game engine is what you are looking for, you may be inte
 
 Take a look at the examples, especially the [Reversi example](examples/reversi/README.md).
 
+## Versioning
+
+While gTether is pre-1.0, in accordance with [semantic versioning](https://semver.org/#spec-item-4),
+any version change is allowed to be breaking. For this reason, it is recommended to use exact 
+versions when depending on gTether. While pre-1.0, minor version bumps will be used for brand new or
+overhauled systems, while patch version bumps will be used for all other lesser-scope changes.
+
+After 1.0 is released, versioning will continue to follow [SemVer](https://semver.org) as normal.
+
 ## Licensing
 
 gTether is free and open source. It is licensed under
