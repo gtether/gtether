@@ -383,11 +383,12 @@ impl<T: ?Sized + Send + Sync + 'static> EntryGetResult<T> {
         }
     }
 
-    fn try_result(self) -> Option<ResourceLoadResult<T>> {
-        match self {
-            Self::Ok(resource) => Some(Ok(resource)),
-            Self::Err(error) => Some(Err(error)),
-            Self::Expired => None,
+    fn try_result(self, force_retry: bool) -> Option<ResourceLoadResult<T>> {
+        match (self, force_retry) {
+            (Self::Ok(resource), _) => Some(Ok(resource)),
+            (Self::Err(error), false) => Some(Err(error)),
+            (Self::Err(_), true) => None,
+            (Self::Expired, _) => None,
         }
     }
 }
@@ -851,6 +852,7 @@ impl Cache {
             Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static>,
         load_params: &ResourceLoadParams<L>,
+        force_retry: bool,
         entries: &mut RwLockUpgradableReadGuard<HashMap<ResourceId, CacheEntry>>,
     ) -> Option<GetOrLoad<L>>
     where
@@ -858,7 +860,7 @@ impl Cache {
     {
         if let Some(entry) = entries.get(&id) {
             if let Some(get_result) = entry.try_get() {
-                if let Some(result) = get_result.try_result() {
+                if let Some(result) = get_result.try_result(force_retry) {
                     return Some(GetOrLoad::Cached(result))
                 } // else expired, start a new load task
             } else {
@@ -870,7 +872,7 @@ impl Cache {
                 });
                 match poll_result {
                     Poll::Ready(get_result) => {
-                        if let Some(result) = get_result.try_result() {
+                        if let Some(result) = get_result.try_result(force_retry) {
                             return Some(GetOrLoad::Cached(result))
                         } // else expired, start a new load task
                     },
@@ -900,7 +902,22 @@ impl Cache {
         L: ?Sized + ResourceLoader,
     {
         let load_fn = self.find_and_load_fn(id, &load_params);
-        self.get_or_load_impl(id, load_params, load_fn)
+        self.get_or_load_impl(id, load_params, load_fn, false)
+    }
+
+    pub fn load_default<L, DefaultFn>(
+        self: &Arc<Self>,
+        id: ResourceId,
+        load_params: ResourceLoadParams<L>,
+        default_fn: DefaultFn,
+    ) -> GetOrLoad<L>
+    where
+        L: ?Sized + ResourceLoader,
+        for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
+            -> BoxFuture<'any, Result<Box<L::Output>, ResourceLoadError>>) + Send + Sync + 'static,
+    {
+        let load_fn = self.load_default_fn(id, &load_params, default_fn);
+        self.get_or_load_impl(id, load_params, load_fn, true)
     }
 
     fn get_or_load_impl<L>(
@@ -911,6 +928,7 @@ impl Cache {
             ResourceLoadContext,
             Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static,
+        force_retry: bool,
     ) -> GetOrLoad<L>
     where
         L: ?Sized + ResourceLoader,
@@ -925,7 +943,9 @@ impl Cache {
 
         let load_fn = Arc::new(load_fn);
 
-        if let Some(future) = self.get(id, &load_fn, &load_params, &mut entries) {
+        // TODO: Force a retry if the loader is different that the previously used one
+        //  (or cache values by loader type ID as well)
+        if let Some(future) = self.get(id, &load_fn, &load_params, force_retry, &mut entries) {
             return future
         }
 
@@ -950,6 +970,59 @@ impl Cache {
                 load_params,
                 waker,
             })
+        }
+    }
+
+    fn load_default_fn<L, DefaultFn>(
+        self: &Arc<Self>,
+        id: ResourceId,
+        load_params: &ResourceLoadParams<L>,
+        load_default_fn: DefaultFn,
+    ) -> impl (Fn(
+        ResourceLoadContext,
+        Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
+    ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static
+    where
+        L: ?Sized + ResourceLoader,
+        for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
+            -> BoxFuture<'any, Result<Box<L::Output>, ResourceLoadError>>) + Send + Sync + 'static,
+    {
+        let sources = self.sources.clone();
+        let operation = load_params.operation;
+        let load_default_fn = Arc::new(load_default_fn);
+
+        move |ctx, hash_source_idx| {
+            let sources = sources.clone();
+            let load_default_fn = load_default_fn.clone();
+            async move {
+                let hash = "<default>".to_string();
+                let source_idx = SourceIndex::max();
+
+                if let Some(loading_hash_source_idx) = hash_source_idx {
+                    let mut lock = loading_hash_source_idx.lock();
+                    lock.0 = Some(hash.clone());
+                    // largest source index means everything will have priority over it
+                    lock.1 = source_idx.clone();
+                }
+
+                if operation == ResourceLoadOperation::Load {
+                    // If this is the original load, we need to start watching for updates
+                    sources.watch_n(&id, &source_idx);
+                }
+
+                match load_default_fn(&ctx).await {
+                    Ok(value) => {
+                        let dependencies = ctx.dependencies.into_inner();
+                        Ok(ResourceTaskData {
+                            value,
+                            dependencies,
+                            hash,
+                            source_idx,
+                        })
+                    },
+                    Err(e) => Err(e),
+                }
+            }.boxed()
         }
     }
 
@@ -1094,7 +1167,7 @@ impl Cache {
         entries.insert(id, entry);
 
         match poll_result {
-            Poll::Ready(get_result) => Poll::Ready(get_result.try_result()
+            Poll::Ready(get_result) => Poll::Ready(get_result.try_result(false)
                 .expect("Resource load task should not expire before first poll()")),
             Poll::Pending => Poll::Pending,
         }
@@ -1168,7 +1241,7 @@ where
             },
         };
 
-        match result.try_result() {
+        match result.try_result(false) {
             Some(result) => Poll::Ready(result),
             None => {
                 trace!(

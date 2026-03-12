@@ -489,11 +489,12 @@ pub mod tests {
     use smol::Timer;
     use smol_macros::test as smol_test;
     use std::time::Duration;
+    use futures_core::future::BoxFuture;
     use test_log::test as test_log;
 
     use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdate};
     use crate::resource::watcher::{ResourceHashProvider, ResourceWatcher};
-    use crate::resource::{Resource, ResourceLoadError, ResourceLoadResult, ResourceReadData};
+    use crate::resource::{Resource, ResourceLoadError, ResourceLoadResult, ResourceLoaderDefault, ResourceReadData};
 
     pub(in crate::resource) async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -709,6 +710,16 @@ pub mod tests {
         ) -> Result<Box<String>, ResourceLoadError> {
             assert_eq!(ctx.id(), self.expected_id);
             StringLoader::default().load(data, ctx).await
+        }
+    }
+
+    #[async_trait]
+    impl ResourceLoaderDefault for TestResLoader {
+        async fn load_default(
+            &self,
+            _ctx: &ResourceLoadContext,
+        ) -> Result<Box<Self::Output>, ResourceLoadError> {
+            Ok(Box::new(String::default()))
         }
     }
 
@@ -1194,6 +1205,13 @@ pub mod tests {
         ).await;
     }
 
+    enum AdapterInfo<L: ResourceLoader> {
+        OrGetOrLoad(TestLoadInfo<L>),
+        OrDefault,
+        OrLoaderDefault,
+        OrDefaultWith(Arc<dyn (Fn() -> BoxFuture<'static, Result<Box<L::Output>, ResourceLoadError>>) + Send + Sync + 'static>),
+    }
+
     #[rstest]
     #[case::first_ok(
         [
@@ -1201,10 +1219,10 @@ pub mod tests {
             TestDataEntry::new("b", b"value2", "h_b"),
             TestDataEntry::new("c", b"value3", "h_c"),
         ],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
         [
-            TestLoadInfo::new("a", TestResLoader::new("a")),
-            TestLoadInfo::new("b", TestResLoader::new("b")),
-            TestLoadInfo::new("c", TestResLoader::new("c")),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("c", TestResLoader::new("c"))),
         ],
         ExpectedLoadResult::Ok("value1".to_string()),
     )]
@@ -1213,10 +1231,10 @@ pub mod tests {
             TestDataEntry::new("b", b"value2", "h_b"),
             TestDataEntry::new("c", b"value3", "h_c"),
         ],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
         [
-            TestLoadInfo::new("a", TestResLoader::new("a")),
-            TestLoadInfo::new("b", TestResLoader::new("b")),
-            TestLoadInfo::new("c", TestResLoader::new("c")),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("c", TestResLoader::new("c"))),
         ],
         ExpectedLoadResult::Ok("value2".to_string()),
     )]
@@ -1224,27 +1242,57 @@ pub mod tests {
         [
             TestDataEntry::new("c", b"value3", "h_c"),
         ],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
         [
-            TestLoadInfo::new("a", TestResLoader::new("a")),
-            TestLoadInfo::new("b", TestResLoader::new("b")),
-            TestLoadInfo::new("c", TestResLoader::new("c")),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("c", TestResLoader::new("c"))),
         ],
         ExpectedLoadResult::Ok("value3".to_string()),
     )]
     #[case::none_found(
         [],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
         [
-            TestLoadInfo::new("a", TestResLoader::new("a")),
-            TestLoadInfo::new("b", TestResLoader::new("b")),
-            TestLoadInfo::new("c", TestResLoader::new("c")),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("c", TestResLoader::new("c"))),
         ],
         ExpectedLoadResult::NotFound(ResourceId::from("c")),
+    )]
+    #[case::default(
+        [],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
+        [
+            AdapterInfo::OrDefault,
+            //AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+        ],
+        ExpectedLoadResult::Ok("".to_string()),
+    )]
+    #[case::loader_default(
+        [],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
+        [
+            AdapterInfo::OrLoaderDefault,
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+        ],
+        ExpectedLoadResult::Ok("".to_string()),
+    )]
+    #[case::default_with(
+        [],
+        TestLoadInfo::new("a", TestResLoader::new("a")),
+        [
+            AdapterInfo::OrDefaultWith(Arc::new(|| async move {
+                Ok(Box::new("default".to_string()))
+            }.boxed())),
+            AdapterInfo::OrGetOrLoad(TestLoadInfo::new("b", TestResLoader::new("b"))),
+        ],
+        ExpectedLoadResult::Ok("default".to_string()),
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_future_or_get(
         test_resource_ctx: TestResourceContext<1>,
         #[case] initial_data: impl IntoIterator<Item=TestDataEntry>,
-        #[case] load_info: impl IntoIterator<Item=TestLoadInfo<TestResLoader>>,
+        #[case] load_info: TestLoadInfo<TestResLoader>,
+        #[case] adapter_info: impl IntoIterator<Item=AdapterInfo<TestResLoader>>,
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
         {
@@ -1254,14 +1302,30 @@ pub mod tests {
             }
         }
 
-        let mut load_info = load_info.into_iter();
-        let mut fut = {
-            let first = load_info.next().expect("'load_info' should have at least 1 item");
-            test_resource_ctx.manager.get_with_loader(first.key, first.loader).to_boxed()
-        };
+        let mut fut = test_resource_ctx.manager
+            .get_with_loader(load_info.key, load_info.loader)
+            .to_boxed();
 
-        for next in load_info {
-            fut = fut.or_get_with_loader(next.key, next.loader).to_boxed();
+        for adapter_info in adapter_info {
+            fut = match adapter_info {
+                AdapterInfo::OrGetOrLoad(load_info) => {
+                    fut.or_get_with_loader(load_info.key, load_info.loader).to_boxed()
+                },
+                AdapterInfo::OrDefault => {
+                    fut.or_default().to_boxed()
+                },
+                AdapterInfo::OrLoaderDefault => {
+                    fut.or_loader_default().to_boxed()
+                },
+                AdapterInfo::OrDefaultWith(f) => {
+                    fut.or_default_with(move |_| {
+                        let f = f.clone();
+                        async move {
+                            f().await
+                        }.boxed()
+                    }).to_boxed()
+                },
+            };
         };
 
         let result = fut.await;

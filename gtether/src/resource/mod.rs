@@ -603,6 +603,52 @@ pub trait ResourceDefaultLoader: Send + Sync + 'static {
     fn default_loader() -> Self::Loader;
 }
 
+/// Extension trait for defining a [ResourceLoader] that can provide a default value.
+///
+/// This trait is used with some resource loading [adapters](manager::future::OrLoaderDefault) in
+/// order to load a default value for a [resource ID](ResourceId) when no backing data can be found.
+#[async_trait]
+pub trait ResourceLoaderDefault: ResourceLoader {
+    /// Create a new default value using nothing but the [context](ResourceLoadContext).
+    async fn load_default(
+        &self,
+        ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError>;
+}
+
+/// Simple [ResourceLoader] that yields the [ID](ResourceLoader) that was used to find data, or
+/// `None`.
+///
+/// This loader functions identically to [IdentityLoader], except it yields IDs wrapped in an
+/// `Option<>`, which allows [ResourceLoaderDefault] to be implemented by yielding `None`.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct MaybeIdentityLoader;
+
+#[async_trait]
+impl ResourceLoader for MaybeIdentityLoader {
+    type Output = Option<ResourceId>;
+
+    #[inline]
+    async fn load(
+        &self,
+        _data: ResourceReadData,
+        ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError> {
+        Ok(Box::new(Some(ctx.id())))
+    }
+}
+
+#[async_trait]
+impl ResourceLoaderDefault for MaybeIdentityLoader {
+    #[inline]
+    async fn load_default(
+        &self,
+        _ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError> {
+        Ok(Box::new(None))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::manager::tests::*;

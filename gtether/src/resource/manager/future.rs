@@ -20,6 +20,7 @@
 //! adapter.
 
 use educe::Educe;
+use futures_core::future::BoxFuture;
 use futures_core::FusedFuture;
 use pin_project::pin_project;
 use smol::future::FutureExt;
@@ -31,7 +32,7 @@ use std::task::{ready, Context, Poll, Waker};
 use crate::resource::id::ResourceId;
 use crate::resource::manager::load::{Cache, ResourceLoadParams};
 use crate::resource::manager::{ResourceLoadContext, ResourceLoadFuture, ResourceUpdateFuture};
-use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader};
+use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceLoaderDefault};
 
 pub struct ResourceFutureMetadata {
     cache: Arc<Cache>,
@@ -243,6 +244,146 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
                 id: id.into(),
                 load_params: self.load_params.clone()
                     .with_loader(Arc::new(loader)),
+            }),
+        });
+
+        ResourceFuture {
+            adapter,
+            primary_id: self.primary_id,
+            metadata: self.metadata,
+            load_params: self.load_params,
+            ctx: self.ctx,
+        }
+    }
+
+    /// Compose this ResourceFuture with a fallback default.
+    ///
+    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it creates
+    /// a default value instead, using the resource values [Default] implementation.
+    ///
+    /// ```
+    /// use gtether::resource::MaybeIdentityLoader;
+    /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::worker::WorkerPool;
+    /// # use smol::future;
+    ///
+    /// let workers = WorkerPool::single().start();
+    /// let manager = ResourceManager::builder()
+    ///     .worker_config((), &workers)
+    ///     .build();
+    ///
+    /// # future::block_on(async move {
+    /// let id = manager.get_with_loader("a", MaybeIdentityLoader)
+    ///     .or_default()
+    ///     .await.expect("a default should be loaded");
+    /// assert_eq!(*id.read(), None);
+    /// # });
+    /// ```
+    pub fn or_default(self) -> ResourceFuture<'ctx, OrDefault<A>>
+    where
+        <A::BaseLoader as ResourceLoader>::Output: Default,
+    {
+        let adapter = OrDefault(AdapterState::Primary {
+            adapter: self.adapter,
+            data: Some(OrDefaultData {
+                id: self.primary_id,
+                load_params: self.load_params.clone(),
+            }),
+        });
+
+        ResourceFuture {
+            adapter,
+            primary_id: self.primary_id,
+            metadata: self.metadata,
+            load_params: self.load_params,
+            ctx: self.ctx,
+        }
+    }
+
+    /// Compose this ResourceFuture with a fallback default.
+    ///
+    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it creates
+    /// a default value instead, using the loader's [default implementation](ResourceLoaderDefault).
+    ///
+    /// ```
+    /// use gtether::resource::MaybeIdentityLoader;
+    /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::worker::WorkerPool;
+    /// # use smol::future;
+    ///
+    /// let workers = WorkerPool::single().start();
+    /// let manager = ResourceManager::builder()
+    ///     .worker_config((), &workers)
+    ///     .build();
+    ///
+    /// # future::block_on(async move {
+    /// let id = manager.get_with_loader("a", MaybeIdentityLoader)
+    ///     .or_loader_default()
+    ///     .await.expect("a default should be loaded");
+    /// assert_eq!(*id.read(), None);
+    /// # });
+    /// ```
+    pub fn or_loader_default(self) -> ResourceFuture<'ctx, OrLoaderDefault<A>>
+    where
+        A::BaseLoader: ResourceLoaderDefault,
+    {
+        let adapter = OrLoaderDefault(AdapterState::Primary {
+            adapter: self.adapter,
+            data: Some(OrLoaderDefaultData {
+                id: self.primary_id,
+                load_params: self.load_params.clone(),
+            }),
+        });
+
+        ResourceFuture {
+            adapter,
+            primary_id: self.primary_id,
+            metadata: self.metadata,
+            load_params: self.load_params,
+            ctx: self.ctx,
+        }
+    }
+
+    /// Compose this ResourceFuture with a fallback default.
+    ///
+    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it creates
+    /// a default value instead, using the loader's [default implementation](ResourceLoaderDefault).
+    ///
+    /// ```
+    /// use futures_util::FutureExt;
+    /// use gtether::resource::MaybeIdentityLoader;
+    /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::worker::WorkerPool;
+    /// # use smol::future;
+    ///
+    /// let workers = WorkerPool::single().start();
+    /// let manager = ResourceManager::builder()
+    ///     .worker_config((), &workers)
+    ///     .build();
+    ///
+    /// # future::block_on(async move {
+    /// let id = manager.get_with_loader("a", MaybeIdentityLoader)
+    ///     .or_default_with(|_| async move {
+    ///         Ok(Box::new(None))
+    ///     }.boxed())
+    ///     .await.expect("a default should be loaded");
+    /// assert_eq!(*id.read(), None);
+    /// # });
+    /// ```
+    pub fn or_default_with<DefaultFn>(
+        self,
+        default_fn: DefaultFn,
+    ) -> ResourceFuture<'ctx, OrDefaultWith<A, DefaultFn>>
+    where
+            for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
+        -> BoxFuture<'any, Result<Box<<A::BaseLoader as ResourceLoader>::Output>, ResourceLoadError>>) + Send + Sync + 'static,
+    {
+        let adapter = OrDefaultWith(AdapterState::Primary {
+            adapter: self.adapter,
+            data: Some(OrDefaultWithData {
+                id: self.primary_id,
+                load_params: self.load_params.clone(),
+                default_fn,
             }),
         });
 
@@ -549,6 +690,151 @@ impl<A, L> ResourceFutureAdapter for OrGetOrLoad<A, L>
 where
     A: ResourceFutureAdapter,
     L: ?Sized + ResourceLoader<Output=<A::BaseLoader as ResourceLoader>::Output>,
+{
+    impl_pinned_adapter_wrapper!();
+}
+
+struct OrDefaultData<L: ?Sized> {
+    id: ResourceId,
+    load_params: ResourceLoadParams<L>,
+}
+
+impl<L> AdapterData for OrDefaultData<L>
+where
+    L: ?Sized + ResourceLoader,
+    L::Output: Default,
+{
+    type Adapter = GetOrLoad<L>;
+
+    fn into_adapter(self, cache: &Arc<Cache>) -> Self::Adapter
+    where
+        Self: Sized,
+    {
+        cache.load_default(
+            self.id,
+            self.load_params,
+            |_| { async move {
+                Ok(Box::new(L::Output::default()))
+            }.boxed() },
+        )
+    }
+}
+
+/// Adapter future for [`ResourceFuture::or_default()`].
+///
+/// This future is not directly accessible, but is available for type naming with [ResourceFuture].
+#[pin_project]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct OrDefault<A: ResourceFutureAdapter>(#[pin] AdapterState<
+    A,
+    GetOrLoad<A::BaseLoader>,
+    OrDefaultData<A::BaseLoader>,
+>);
+
+impl<A> ResourceFutureAdapter for OrDefault<A>
+where
+    A: ResourceFutureAdapter,
+    <A::BaseLoader as ResourceLoader>::Output: Default,
+{
+    impl_pinned_adapter_wrapper!();
+}
+
+struct OrLoaderDefaultData<L: ?Sized> {
+    id: ResourceId,
+    load_params: ResourceLoadParams<L>,
+}
+
+impl<L> AdapterData for OrLoaderDefaultData<L>
+where
+    L: ?Sized + ResourceLoaderDefault,
+{
+    type Adapter = GetOrLoad<L>;
+
+    fn into_adapter(self, cache: &Arc<Cache>) -> Self::Adapter
+    where
+        Self: Sized,
+    {
+        let loader = self.load_params.loader.clone();
+        cache.load_default(
+            self.id,
+            self.load_params,
+            move |ctx| {
+                let loader = loader.clone();
+                async move {
+                    loader.load_default(ctx).await
+                }.boxed()
+            },
+        )
+    }
+}
+
+/// Adapter future for [`ResourceFuture::or_loader_default()`].
+///
+/// This future is not directly accessible, but is available for type naming with [ResourceFuture].
+#[pin_project]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct OrLoaderDefault<A: ResourceFutureAdapter>(#[pin] AdapterState<
+    A,
+    GetOrLoad<A::BaseLoader>,
+    OrLoaderDefaultData<A::BaseLoader>,
+>);
+
+impl<A> ResourceFutureAdapter for OrLoaderDefault<A>
+where
+    A: ResourceFutureAdapter,
+    A::BaseLoader: ResourceLoaderDefault,
+{
+    impl_pinned_adapter_wrapper!();
+}
+
+struct OrDefaultWithData<L: ?Sized, DefaultFn> {
+    id: ResourceId,
+    load_params: ResourceLoadParams<L>,
+    default_fn: DefaultFn,
+}
+
+impl<L, DefaultFn> AdapterData for OrDefaultWithData<L, DefaultFn>
+where
+    L: ?Sized + ResourceLoader,
+    for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
+        -> BoxFuture<'any, Result<Box<L::Output>, ResourceLoadError>>) + Send + Sync + 'static,
+{
+    type Adapter = GetOrLoad<L>;
+
+    fn into_adapter(self, cache: &Arc<Cache>) -> Self::Adapter
+    where
+        Self: Sized,
+    {
+        cache.load_default(
+            self.id,
+            self.load_params,
+            self.default_fn,
+        )
+    }
+}
+
+/// Adapter future for [`ResourceFuture::or_default_with()`].
+///
+/// This future is not directly accessible, but is available for type naming with [ResourceFuture].
+#[pin_project]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct OrDefaultWith<A: ResourceFutureAdapter, DefaultFn>(#[pin] AdapterState<
+    A,
+    GetOrLoad<A::BaseLoader>,
+    OrDefaultWithData<A::BaseLoader, DefaultFn>,
+>);
+
+impl<A, DefaultFn> ResourceFutureAdapter for OrDefaultWith<A, DefaultFn>
+where
+    A: ResourceFutureAdapter,
+    for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
+        -> BoxFuture<'any, Result<Box<<A::BaseLoader as ResourceLoader>::Output>, ResourceLoadError>>) + Send + Sync + 'static,
 {
     impl_pinned_adapter_wrapper!();
 }
