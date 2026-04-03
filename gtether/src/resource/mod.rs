@@ -21,12 +21,14 @@
 //! [eng]: crate::Engine
 
 use async_trait::async_trait;
+use educe::Educe;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use smol::io::AsyncRead;
 use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
@@ -521,6 +523,28 @@ impl ResourceLoader for IdentityLoader {
         ctx: &ResourceLoadContext,
     ) -> Result<Box<Self::Output>, ResourceLoadError> {
         Ok(Box::new(ctx.id()))
+    }
+}
+
+/// Simple [ResourceLoader] that always yield a [ReadError](ResourceLoadError::ReadError).
+///
+/// This resource loader is not often useful in practical applications, but can be used in doctests
+/// or other such examples where a placeholder resource loader is required.
+#[derive(Educe)]
+#[educe(Default, Debug, Copy, Clone)]
+pub struct ErrorLoader<T: ?Sized + Send + Sync + 'static>(#[educe(Debug(ignore))] PhantomData<T>);
+
+#[async_trait]
+impl<T: ?Sized + Send + Sync + 'static> ResourceLoader for ErrorLoader<T> {
+    type Output = T;
+
+    #[inline]
+    async fn load(
+        &self,
+        _data: ResourceReadData,
+        _ctx: &ResourceLoadContext,
+    ) -> Result<Box<Self::Output>, ResourceLoadError> {
+        Err(ResourceLoadError::from("ErrorLoader"))
     }
 }
 

@@ -34,6 +34,65 @@ use crate::resource::manager::load::{Cache, ResourceLoadParams};
 use crate::resource::manager::{ResourceLoadContext, ResourceLoadFuture, ResourceUpdateFuture};
 use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceLoaderDefault};
 
+/// Condition for when to retry a load using other adapters.
+///
+/// Defaults to [RetryIf::NotFound].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryIf {
+    /// Retry if the resource ID could not be found in source data.
+    ///
+    /// This is the default.
+    NotFound,
+
+    /// Retry if there was an error while loading the resource from source data.
+    ReadError,
+
+    /// Retry if any of the above is applicable.
+    ///
+    /// Note that this will *NOT* retry for unrecoverable errors, such as
+    /// [`ResourceLoadError::CyclicLoad`].
+    All,
+}
+
+impl Default for RetryIf {
+    #[inline]
+    fn default() -> Self {
+        Self::NotFound
+    }
+}
+
+impl RetryIf {
+    /// Check if a result should be retried.
+    ///
+    /// An output of `Ok(result)` means the result should *NOT* be retried, while an output of
+    /// `Err(())` means the result *should* be retried.
+    pub fn check_result<T: ?Sized + Send + Sync + 'static>(
+        self,
+        result: ResourceLoadResult<T>,
+    ) -> Result<ResourceLoadResult<T>, ()> {
+        match self {
+            Self::NotFound => {
+                match result {
+                    Err(ResourceLoadError::NotFound(_)) => Err(()),
+                    result => Ok(result),
+                }
+            },
+            Self::ReadError => {
+                match result {
+                    Err(ResourceLoadError::ReadError(_)) => Err(()),
+                    result => Ok(result),
+                }
+            },
+            Self::All => {
+                match result {
+                    Err(ResourceLoadError::NotFound(_) | ResourceLoadError::ReadError(_)) => Err(()),
+                    result => Ok(result),
+                }
+            }
+        }
+    }
+}
+
 pub struct ResourceFutureMetadata {
     cache: Arc<Cache>,
 }
@@ -156,6 +215,22 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
         }
     }
 
+    /// Compose this ResourceFuture with a fallback load configuration.
+    ///
+    /// Uses the default [RetryIf] configuration.
+    ///
+    /// See [`Self::or_get_when()`] for more.
+    #[inline]
+    pub fn or_get(
+        self,
+        id: impl Into<ResourceId>,
+    ) -> ResourceFuture<'ctx, OrGetOrLoad<A, A::BaseLoader>>
+    where
+        A::BaseLoader: Clone,
+    {
+        self.or_get_when(id, RetryIf::default())
+    }
+
     /// Compose this ResourceFuture with a fallback load configuration using a default
     /// [ResourceLoader].
     ///
@@ -165,8 +240,10 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     /// to load this fallback configuration instead.
     ///
     /// ```
+    /// use gtether::resource::ErrorLoader;
     /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::manager::future::RetryIf;
     /// use gtether::resource::source::constant::ConstantResourceSource;
     /// use gtether::worker::WorkerPool;
     /// # use smol::future;
@@ -184,31 +261,55 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     /// # future::block_on(async move {
     /// // This uses IdentityLoader based on ResourceDefaultLoader implemented for ResourceId
     /// let id = manager.get::<ResourceId>("a")
-    ///     .or_get("b")
+    ///     .or_get_when("b", RetryIf::NotFound)
+    ///     .await.expect("a resource should be found");
+    /// assert_eq!(*id.read(), ResourceId::from("b"));
+    ///
+    /// let id = manager.get_with_loader("b", ErrorLoader::<ResourceId>::default())
+    ///     .or_get_when("b", RetryIf::ReadError)
     ///     .await.expect("a resource should be found");
     /// assert_eq!(*id.read(), ResourceId::from("b"));
     /// # });
     /// ```
-    pub fn or_get(
+    pub fn or_get_when(
         self,
         id: impl Into<ResourceId>,
+        retry_if: RetryIf,
     ) -> ResourceFuture<'ctx, OrGetOrLoad<A, A::BaseLoader>>
     where
         A::BaseLoader: Clone,
     {
         let loader = (*self.load_params.loader).clone();
-        self.or_get_with_loader(id, loader)
+        self.or_get_with_loader_when(id, loader, retry_if)
     }
 
     /// Compose this ResourceFuture with a fallback load configuration.
     ///
-    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it attempts
-    /// to load this fallback configuration instead.
+    /// Uses the default [RetryIf] configuration.
+    ///
+    /// See [`Self::or_get_with_loader_when()`] for more.
+    #[inline]
+    pub fn or_get_with_loader<L>(
+        self,
+        id: impl Into<ResourceId>,
+        loader: L,
+    ) -> ResourceFuture<'ctx, OrGetOrLoad<A, L>>
+    where
+        L: ResourceLoader<Output=<A::BaseLoader as ResourceLoader>::Output>,
+    {
+        self.or_get_with_loader_when(id, loader, RetryIf::default())
+    }
+
+    /// Compose this ResourceFuture with a fallback load configuration.
+    ///
+    /// If this ResourceFuture would error in a way that matches the specified [RetryIf]
+    /// configuration, instead it attempts to load this fallback load configuration instead.
     ///
     /// ```
-    /// use gtether::resource::IdentityLoader;
+    /// use gtether::resource::{ErrorLoader, IdentityLoader};
     /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::manager::future::RetryIf;
     /// use gtether::resource::source::constant::ConstantResourceSource;
     /// use gtether::worker::WorkerPool;
     /// # use smol::future;
@@ -225,15 +326,21 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     ///
     /// # future::block_on(async move {
     /// let id = manager.get_with_loader("a", IdentityLoader)
-    ///     .or_get_with_loader("b", IdentityLoader)
+    ///     .or_get_with_loader_when("b", IdentityLoader, RetryIf::NotFound)
+    ///     .await.expect("a resource should be found");
+    /// assert_eq!(*id.read(), ResourceId::from("b"));
+    ///
+    /// let id = manager.get_with_loader("b", ErrorLoader::<ResourceId>::default())
+    ///     .or_get_with_loader_when("b", IdentityLoader, RetryIf::ReadError)
     ///     .await.expect("a resource should be found");
     /// assert_eq!(*id.read(), ResourceId::from("b"));
     /// # });
     /// ```
-    pub fn or_get_with_loader<L>(
+    pub fn or_get_with_loader_when<L>(
         self,
         id: impl Into<ResourceId>,
         loader: L,
+        retry_if: RetryIf,
     ) -> ResourceFuture<'ctx, OrGetOrLoad<A, L>>
     where
         L: ResourceLoader<Output=<A::BaseLoader as ResourceLoader>::Output>,
@@ -245,6 +352,7 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
                 load_params: self.load_params.clone()
                     .with_loader(Arc::new(loader)),
             }),
+            retry_if,
         });
 
         ResourceFuture {
@@ -258,12 +366,27 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
 
     /// Compose this ResourceFuture with a fallback default.
     ///
-    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it creates
-    /// a default value instead, using the resource values [Default] implementation.
+    /// Uses the default [RetryIf] configuration.
+    ///
+    /// See [`Self::or_default_when()`] for more.
+    #[inline]
+    pub fn or_default(self) -> ResourceFuture<'ctx, OrDefault<A>>
+    where
+        <A::BaseLoader as ResourceLoader>::Output: Default,
+    {
+        self.or_default_when(RetryIf::default())
+    }
+
+    /// Compose this ResourceFuture with a fallback default.
+    ///
+    /// If this ResourceFuture would error in a way that matches the specified [RetryIf]
+    /// configuration, instead it creates a default value using the resource value's [Default]
+    /// implementation.
     ///
     /// ```
     /// use gtether::resource::MaybeIdentityLoader;
     /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::manager::future::RetryIf;
     /// use gtether::worker::WorkerPool;
     /// # use smol::future;
     ///
@@ -274,12 +397,12 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     ///
     /// # future::block_on(async move {
     /// let id = manager.get_with_loader("a", MaybeIdentityLoader)
-    ///     .or_default()
+    ///     .or_default_when(RetryIf::NotFound)
     ///     .await.expect("a default should be loaded");
     /// assert_eq!(*id.read(), None);
     /// # });
     /// ```
-    pub fn or_default(self) -> ResourceFuture<'ctx, OrDefault<A>>
+    pub fn or_default_when(self, retry_if: RetryIf) -> ResourceFuture<'ctx, OrDefault<A>>
     where
         <A::BaseLoader as ResourceLoader>::Output: Default,
     {
@@ -289,6 +412,7 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
                 id: self.primary_id,
                 load_params: self.load_params.clone(),
             }),
+            retry_if,
         });
 
         ResourceFuture {
@@ -302,12 +426,27 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
 
     /// Compose this ResourceFuture with a fallback default.
     ///
-    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it creates
-    /// a default value instead, using the loader's [default implementation](ResourceLoaderDefault).
+    /// Uses the default [RetryIf] configuration.
+    ///
+    /// See [`Self::or_loader_default_when()`] for more.
+    #[inline]
+    pub fn or_loader_default(self) -> ResourceFuture<'ctx, OrLoaderDefault<A>>
+    where
+        A::BaseLoader: ResourceLoaderDefault,
+    {
+        self.or_loader_default_when(RetryIf::default())
+    }
+
+    /// Compose this ResourceFuture with a fallback default.
+    ///
+    /// If this ResourceFuture would error in a way that matches the specified [RetryIf]
+    /// configuration, instead it creates a default value using the loader's
+    /// [default implementation](ResourceLoaderDefault).
     ///
     /// ```
     /// use gtether::resource::MaybeIdentityLoader;
     /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::manager::future::RetryIf;
     /// use gtether::worker::WorkerPool;
     /// # use smol::future;
     ///
@@ -318,12 +457,12 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     ///
     /// # future::block_on(async move {
     /// let id = manager.get_with_loader("a", MaybeIdentityLoader)
-    ///     .or_loader_default()
+    ///     .or_loader_default_when(RetryIf::NotFound)
     ///     .await.expect("a default should be loaded");
     /// assert_eq!(*id.read(), None);
     /// # });
     /// ```
-    pub fn or_loader_default(self) -> ResourceFuture<'ctx, OrLoaderDefault<A>>
+    pub fn or_loader_default_when(self, retry_if: RetryIf) -> ResourceFuture<'ctx, OrLoaderDefault<A>>
     where
         A::BaseLoader: ResourceLoaderDefault,
     {
@@ -333,6 +472,7 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
                 id: self.primary_id,
                 load_params: self.load_params.clone(),
             }),
+            retry_if,
         });
 
         ResourceFuture {
@@ -346,13 +486,31 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
 
     /// Compose this ResourceFuture with a fallback default.
     ///
-    /// If this ResourceFuture would resolve to a [ResourceLoadError::NotFound], instead it creates
-    /// a default value instead, using the loader's [default implementation](ResourceLoaderDefault).
+    /// Uses the default [RetryIf] configuration.
+    ///
+    /// See [`Self::or_default_with_when()`] for more.
+    #[inline]
+    pub fn or_default_with<DefaultFn>(
+        self,
+        default_fn: DefaultFn,
+    ) -> ResourceFuture<'ctx, OrDefaultWith<A, DefaultFn>>
+    where
+            for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
+        -> BoxFuture<'any, Result<Box<<A::BaseLoader as ResourceLoader>::Output>, ResourceLoadError>>) + Send + Sync + 'static,
+    {
+        self.or_default_with_when(default_fn, RetryIf::default())
+    }
+
+    /// Compose this ResourceFuture with a fallback default.
+    ///
+    /// If this ResourceFuture would error in a way that matches the specified [RetryIf]
+    /// configuration, instead it creates a default value using the specified closure.
     ///
     /// ```
     /// use futures_util::FutureExt;
     /// use gtether::resource::MaybeIdentityLoader;
     /// use gtether::resource::manager::ResourceManager;
+    /// use gtether::resource::manager::future::RetryIf;
     /// use gtether::worker::WorkerPool;
     /// # use smol::future;
     ///
@@ -363,16 +521,17 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     ///
     /// # future::block_on(async move {
     /// let id = manager.get_with_loader("a", MaybeIdentityLoader)
-    ///     .or_default_with(|_| async move {
+    ///     .or_default_with_when(|_| async move {
     ///         Ok(Box::new(None))
-    ///     }.boxed())
+    ///     }.boxed(), RetryIf::NotFound)
     ///     .await.expect("a default should be loaded");
     /// assert_eq!(*id.read(), None);
     /// # });
     /// ```
-    pub fn or_default_with<DefaultFn>(
+    pub fn or_default_with_when<DefaultFn>(
         self,
         default_fn: DefaultFn,
+        retry_if: RetryIf,
     ) -> ResourceFuture<'ctx, OrDefaultWith<A, DefaultFn>>
     where
             for<'any> DefaultFn: (Fn(&'any ResourceLoadContext)
@@ -385,6 +544,7 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
                 load_params: self.load_params.clone(),
                 default_fn,
             }),
+            retry_if,
         });
 
         ResourceFuture {
@@ -561,6 +721,7 @@ enum AdapterState<A1, A2, D> {
     Primary {
         #[pin] adapter: A1,
         data: Option<D>,
+        retry_if: RetryIf,
     },
     Secondary {
         #[pin] adapter: A2,
@@ -610,10 +771,11 @@ where
             AdapterStateProj::Primary {
                 adapter,
                 data,
+                retry_if,
             } => {
                 let output = ready!(adapter.poll(cx, &metadata));
-                match output {
-                    Err(ResourceLoadError::NotFound(_)) => {
+                match retry_if.check_result(output) {
+                    Err(()) => {
                         let adapter = data.take()
                             .expect("transition from Primary => Secondary should only occur once")
                             .into_adapter(&metadata.cache);
@@ -626,7 +788,7 @@ where
                             _ => unreachable!(),
                         }
                     },
-                    result => {
+                    Ok(result) => {
                         match self.project_replace(Self::Complete) {
                             AdapterStateProjReplace::Primary { .. } => Poll::Ready(result),
                             _ => unreachable!(),
