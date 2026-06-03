@@ -1,24 +1,24 @@
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use educe::Educe;
 use futures_core::future::BoxFuture;
 use futures_util::task::AtomicWaker;
-use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use parking_lot::RwLock;
 use smol::future::FutureExt;
 use std::any::{Any, TypeId};
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::task::{Context, Poll};
-use tracing::{debug, error, info_span, trace, warn, Instrument};
+use std::task::{ready, Context, Poll, Waker};
+use tracing::{debug, info_span, trace, warn, Instrument};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::dependency::{DependencyGraph, DependencyGraphLayer};
 use crate::resource::manager::source::Sources;
 use crate::resource::manager::task::{ManagerExecutor, TaskPriority};
-use crate::resource::manager::update::{UpdateOutput, UpdateOutputUntyped, Updates};
+use crate::resource::manager::update::UpdateLock;
 use crate::resource::manager::{GetOrLoad, ManagerTask, ResourceFuture};
-use crate::resource::source::SourceIndex;
-use crate::resource::{Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceMut};
+use crate::resource::source::{ResourceUpdate, SourceIndex};
+use crate::resource::{res_key, BoxedResKey, ResKey, Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceMut};
 use crate::util::waker::MultiWaker;
 
 /// Priority for resource loading tasks.
@@ -77,7 +77,7 @@ impl From<LoadPriority> for TaskPriority {
 
 // This exists primarily to keep duplicate loads from expiring during complex
 // load dependency trees
-pub type ResourceLoadContextCache = HashMap<ResourceId, Arc<dyn Any + Send + Sync + 'static>>;
+pub type ResourceLoadContextCache = HashMap<Box<dyn ResKey>, Arc<dyn Any + Send + Sync + 'static>>;
 
 /// Contextual data for loading [Resources](Resource).
 ///
@@ -86,7 +86,7 @@ pub type ResourceLoadContextCache = HashMap<ResourceId, Arc<dyn Any + Send + Syn
 /// and allows for loading sub-resources as dependencies.
 pub struct ResourceLoadContext {
     cache: Arc<Cache>,
-    id: ResourceId,
+    key: Box<dyn ResKey>,
     priority: TaskPriority,
     dependencies: RwLock<DependencyGraphLayer>,
     resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
@@ -95,25 +95,26 @@ pub struct ResourceLoadContext {
 impl ResourceLoadContext {
     fn new(
         cache: Arc<Cache>,
-        id: ResourceId,
+        key: impl Into<Box<dyn ResKey>>,
         priority: TaskPriority,
-        parents: impl IntoIterator<Item=ResourceId>,
+        parents: impl IntoIterator<Item=impl Into<Box<dyn ResKey>>>,
         resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
     ) -> Self {
-        let dependencies = DependencyGraphLayer::new(id.clone(), parents);
+        let key = key.into();
+        let dependencies = DependencyGraphLayer::new(key.clone(), parents);
         Self {
             cache,
-            id,
+            key,
             priority,
             dependencies: RwLock::new(dependencies),
             resource_cache,
         }
     }
 
-    /// The resource [ID](ResourceId) that is currently being loaded.
+    /// The resource [key](ResKey) that is currently being loaded.
     #[inline]
-    pub fn id(&self) -> ResourceId {
-        self.id.clone()
+    pub fn key(&self) -> &dyn ResKey {
+        &*self.key
     }
 
     /// Mark a [Resource] as a dependency of the currently loading Resource.
@@ -121,8 +122,8 @@ impl ResourceLoadContext {
     /// Note that [`get()`](Self::get)/[`get_with_loader()`](Self::get_with_loader) automatically
     /// mark the loaded Resource as a dependency if it succeeds in loading.
     #[inline]
-    pub fn add_dependency(&self, id: impl Into<ResourceId>) {
-        self.dependencies.write().insert(id.into());
+    pub fn add_dependency(&self, key: impl AsRef<dyn ResKey>) {
+        self.dependencies.write().insert(key.as_ref().to_box());
     }
 
     #[inline]
@@ -131,7 +132,7 @@ impl ResourceLoadContext {
         T: ?Sized + Send + Sync + 'static,
     {
         self.resource_cache.write().insert(
-            resource.id().clone(),
+            resource.key().to_box(),
             resource as Arc<dyn Any + Send + Sync + 'static>,
         );
     }
@@ -180,11 +181,12 @@ impl ResourceLoadContext {
         L: ResourceLoader,
     {
         let id = id.into();
-        let parents: Vec<_> = {
+        let key = res_key(id, &loader);
+        let parents: HashSet<_> = {
             let deps = self.dependencies.read();
             deps.parents()
-                .chain([deps.id()])
                 .cloned()
+                .chain([deps.key().to_box()])
                 .collect()
         };
 
@@ -196,10 +198,10 @@ impl ResourceLoadContext {
             operation: ResourceLoadOperation::Load,
         };
 
-        if parents.contains(&id) {
+        if parents.contains(&key) {
             let result = Err(ResourceLoadError::CyclicLoad {
                 parents,
-                id,
+                key,
             });
             ResourceFuture::with_context(
                 GetOrLoad::Cached(result),
@@ -224,7 +226,7 @@ pub struct ResourceLoadParams<L: ?Sized> {
     #[educe(Debug(ignore))]
     pub loader: Arc<L>,
     pub priority: TaskPriority,
-    pub parents: Vec<ResourceId>,
+    pub parents: HashSet<Box<dyn ResKey>>,
     #[educe(Debug(ignore))]
     pub resource_cache: Arc<RwLock<ResourceLoadContextCache>>,
     pub operation: ResourceLoadOperation,
@@ -252,112 +254,288 @@ pub enum ResourceLoadOperation {
     Update,
 }
 
-type ManagerLoadTask<T> = ManagerTask<ResourceTaskDataResult<T>>;
+pub type ManagerLoadTask<T> = ManagerTask<Result<ResourceTaskData<T>, ResourceLoadError>>;
+pub type ManagerUpdateTask = ManagerTask<()>;
 
 pub struct ResourceTaskData<T: ?Sized + Send + Sync + 'static> {
     pub value: Box<T>,
     pub dependencies: DependencyGraphLayer,
-    pub hash: String,
-    pub source_idx: SourceIndex,
 }
 
-pub struct ResourceTaskDataResult<T: ?Sized + Send + Sync + 'static> {
-    pub id: ResourceId,
-    pub result: Result<ResourceTaskData<T>, ResourceLoadError>,
-    pub loader_update_fut_fn: LoaderUpdateFutFn<T>,
-    pub create_update_fut_fn: CreateUpdateFutFn,
-}
-
-pub struct UpdateParams {
-    pub prev_output: Option<UpdateOutputUntyped>,
-    #[cfg(test)]
-    pub sync_update: Arc<super::tests::SyncContext>,
-}
-
-pub type LoaderUpdateFutFn<T> = Box<dyn (
-    Fn(
-        ResourceMut<T>,
-        Box<T>,
-    ) -> BoxFuture<'static, ()>
-) + Send + Sync>;
-
-pub type CreateUpdateFutFn = Arc<dyn (
-    Fn(
-        &Arc<Cache>,
-        UpdateParams,
-    ) -> (BoxFuture<'static, ()>, UpdateOutputUntyped)
-) + Send + Sync>;
-
-#[derive(Debug)]
-pub enum CacheEntryMetadata {
-    Loading(CacheLoadingMetadata),
-    Cached(CachedValueMetadata),
-}
-
-impl CacheEntryMetadata {
-    #[inline]
-    pub fn create_update_future(
-        &self,
-        cache: &Arc<Cache>,
-        params: UpdateParams,
-    ) -> (BoxFuture<'static, ()>, UpdateOutputUntyped) {
-        match self {
-            Self::Loading(metadata) => (metadata.create_update_fut_fn)(
-                cache,
-                params,
-            ),
-            Self::Cached(metadata) => (metadata.create_update_fut_fn)(
-                cache,
-                params,
-            ),
-        }
-    }
-
-    #[inline]
-    pub fn hash(&self) -> Option<&str> {
-        match self {
-            Self::Loading(metadata) => metadata.hash.as_ref().map(String::as_str),
-            Self::Cached(metadata) => Some(&metadata.hash),
-        }
-    }
-
-    #[inline]
-    pub fn source_idx(&self) -> &SourceIndex {
-        match self {
-            Self::Loading(metadata) => &metadata.source_idx,
-            Self::Cached(metadata) => &metadata.source_idx,
-        }
-    }
-
-    #[inline]
-    pub fn valid_for_update(&self, new_hash: &str, new_source_idx: &SourceIndex) -> bool {
-        if let Some(hash) = self.hash() && hash == new_hash {
-            return false
-        }
-        new_source_idx <= self.source_idx()
-    }
-}
-
-#[derive(Educe)]
-#[educe(Debug)]
-pub struct CacheLoadingMetadata {
-    #[educe(Debug(ignore))]
-    create_update_fut_fn: CreateUpdateFutFn,
-    pub resource_type: TypeId,
+#[derive(Debug, Clone)]
+pub struct SourceMetadata {
     pub hash: Option<String>,
     pub source_idx: SourceIndex,
 }
 
-#[derive(Educe)]
-#[educe(Debug)]
-pub struct CachedValueMetadata {
-    #[educe(Debug(ignore))]
-    _resource: Option<Arc<dyn Any + Send + Sync>>,
-    #[educe(Debug(ignore))]
-    create_update_fut_fn: CreateUpdateFutFn,
-    pub resource_type: TypeId,
-    pub hash: String,
-    pub source_idx: SourceIndex,
+impl Default for SourceMetadata {
+    fn default() -> Self {
+        Self {
+            hash: None,
+            source_idx: SourceIndex::max(),
+        }
+    }
+}
+
+impl SourceMetadata {
+    #[inline]
+    pub fn valid_for_update(&self, new_hash: &str, new_source_idx: &SourceIndex) -> bool {
+        if let Some(hash) = &self.hash && hash == new_hash {
+            return false
+        }
+        new_source_idx <= &self.source_idx
+    }
+}
+
+struct UpdateWork<L: ?Sized + ResourceLoader> {
+    id: ResourceId,
+    source_idx: SourceIndex,
+    loader: Arc<L>,
+    load_params: ResourceLoadParams<L>,
+    load_fn: Arc<dyn (Fn(
+        ResourceLoadContext,
+    ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static>,
+    cache: Weak<Cache>,
+    wakers: Arc<MultiWaker>,
+    update_lock: Arc<UpdateLock>,
+}
+
+impl<L: ?Sized + ResourceLoader> UpdateWork<L> {
+    fn new(
+        id: ResourceId,
+        source_idx: SourceIndex,
+        loader: Arc<L>,
+        cache: &Arc<Cache>,
+        wakers: Arc<MultiWaker>,
+        update_lock: Arc<UpdateLock>,
+    ) -> Self {
+        let load_params = ResourceLoadParams {
+            loader: loader.clone(),
+            priority: TaskPriority::Update,
+            parents: HashSet::default(),
+            resource_cache: Arc::new(RwLock::new(HashMap::default())),
+            operation: ResourceLoadOperation::Update,
+        };
+        let load_fn = Arc::new(cache.find_and_load_fn::<L>(id, &load_params));
+
+        Self {
+            id,
+            source_idx,
+            loader,
+            load_params,
+            load_fn,
+            cache: Arc::downgrade(cache),
+            wakers,
+            update_lock,
+        }
+    }
+
+    fn check_output_requested(
+        group: &mut CacheGroup,
+        id: ResourceId,
+        loader: &Arc<L>,
+        task_data: ResourceTaskData<L::Output>,
+        wakers: &Arc<MultiWaker>,
+    ) {
+        if !wakers.is_empty() {
+            // Entry was expired, but there are update futures waiting on it, so re-cache
+            let resource = Arc::new(Resource::new(
+                (id, &**loader),
+                task_data.value,
+            ));
+            let entry = CacheEntryTyped::from_resource_loaded(
+                resource,
+                loader.clone(),
+            );
+            group.insert(entry);
+        } else {
+            group.remove(loader);
+        }
+    }
+
+    fn handle_expired(
+        group: &mut CacheGroup,
+        id: ResourceId,
+        loader: &Arc<L>,
+        task_data: ResourceTaskData<L::Output>,
+        wakers: &Arc<MultiWaker>,
+    ) {
+        debug!(%id, "Cache entry expired before resource finished updating");
+        Self::check_output_requested(group, id, loader, task_data, wakers);
+    }
+
+    async fn execute(self) {
+        let cache = match self.cache.upgrade() {
+            Some(cache) => cache,
+            None => {
+                // no cache left; nothing to update
+                return
+            },
+        };
+
+        let key = res_key(self.id, &*self.loader);
+
+        let _start_load_lock = self.update_lock.start_load().await;
+        let result = {
+            #[cfg(test)]
+            let _load_lock = self.update_lock.sync.load.run(key.clone()).await;
+            let ctx = ResourceLoadContext::new(
+                cache.clone(),
+                key.clone(),
+                self.load_params.priority,
+                self.load_params.parents,
+                self.load_params.resource_cache,
+            );
+            (self.load_fn)(ctx).await
+        };
+
+        #[cfg(test)]
+        let _update_lock = self.update_lock.sync.update.run(key).await;
+
+        let task_data = match result {
+            Ok(task_data) => task_data,
+            Err(error) => {
+                warn!(
+                    id = %self.id,
+                    ?error,
+                    "Resource failed to load while updating; will be left unchanged",
+                );
+                let entries = cache.entries.read().await;
+                if let Some(group) = entries.group(self.id) {
+                    let mut group = group.write().await;
+                    // check for cancellation before making a mutating change
+                    smol::future::yield_now().await;
+                    if let Some(entry) = group.get_mut(&self.loader) {
+                        if let CacheEntryTypedInner::Updating { weak, .. } = &entry.inner {
+                            entry.inner = CacheEntryTypedInner::Value { weak: weak.clone() };
+                        }
+                    }
+                }
+                return
+            }
+        };
+
+        let resource = {
+            let entries = cache.entries_with_group(self.id).await;
+            let group_lock = entries.group(self.id).unwrap();
+            let mut group = group_lock.write().await;
+            // check for cancellation before making any mutating changes
+            smol::future::yield_now().await;
+            let entry = match group.get_mut(&self.loader) {
+                Some(entry) => entry,
+                None => {
+                    Self::handle_expired(
+                        &mut group,
+                        self.id,
+                        &self.loader,
+                        task_data,
+                        &self.wakers,
+                    );
+                    return
+                }
+            };
+
+            match &mut entry.inner {
+                CacheEntryTypedInner::Loading { wakers, .. } => {
+                    self.wakers.extend(wakers);
+                    let resource = Arc::new(Resource::new(
+                        (self.id, &*self.loader),
+                        task_data.value,
+                    ));
+                    entry.inner = CacheEntryTypedInner::Loaded {
+                        strong: resource.clone(),
+                    };
+                    task_data.dependencies.apply(&mut cache.dependencies.write());
+                    cache.sources.watch_n(&self.id, &self.source_idx);
+
+                    entry.inner = if !self.wakers.is_empty() {
+                        // at least one future is waiting on this, so we can set a strong reference
+                        CacheEntryTypedInner::Loaded {
+                            strong: resource,
+                        }
+                    } else {
+                        CacheEntryTypedInner::Value {
+                            weak: Arc::downgrade(&resource),
+                        }
+                    };
+
+                    return
+                },
+                CacheEntryTypedInner::Loaded { strong } => {
+                    strong.clone()
+                },
+                CacheEntryTypedInner::Value { weak } |
+                CacheEntryTypedInner::Updating { weak, .. }=> {
+                    if let Some(strong) = weak.upgrade() {
+                        strong
+                    } else {
+                        Self::handle_expired(
+                            &mut group,
+                            self.id,
+                            &self.loader,
+                            task_data,
+                            &self.wakers,
+                        );
+                        return
+                    }
+                },
+                CacheEntryTypedInner::Error(_) => {
+                    debug!(
+                        id = %self.id,
+                        "Tried to update errored Resource, ignoring",
+                    );
+                    Self::check_output_requested(
+                        &mut group,
+                        self.id,
+                        &self.loader,
+                        task_data,
+                        &self.wakers,
+                    );
+                    return
+                },
+            }
+        };
+
+        task_data.dependencies.apply(&mut cache.dependencies.write());
+        cache.sources.watch_n(&self.id, &self.source_idx);
+
+        let (resource_mut, drop_checker) = ResourceMut::from_resource(resource.clone());
+        self.loader.update(resource_mut, task_data.value).await;
+
+        // Drop checker is used to wait until ResourceMut is no longer used, in case the update
+        // needed to be delayed beyond the resolution of loader.update()
+        match drop_checker.recv().await {
+            Ok(_) => { debug!("Drop-checker received an unexpected message"); },
+            Err(_) => { /* sender was dropped, this is expected */ },
+        }
+
+        resource.update_sub_resources().await;
+
+        let entries = cache.entries_with_group(self.id).await;
+        let group_lock = entries.group(self.id).unwrap();
+        let mut group = group_lock.write().await;
+        // check for cancellation before making a mutating change
+        smol::future::yield_now().await;
+
+        let entry = if !self.wakers.is_empty() {
+            // at least one future is waiting on this, so we can insert a strong reference
+            CacheEntryTyped::from_resource_loaded(
+                resource,
+                self.loader,
+            )
+        } else {
+            CacheEntryTyped::from_resource(
+                &resource,
+                self.loader,
+            )
+        };
+        if let Some(entry) = group.insert(entry) {
+            if let CacheEntryTypedInner::Updating { task, .. } = entry.inner {
+                // Let this task cleanly complete without being cancelled.
+                task.detach();
+            }
+        }
+    }
 }
 
 enum EntryGetResult<T: ?Sized + Send + Sync + 'static> {
@@ -368,17 +546,9 @@ enum EntryGetResult<T: ?Sized + Send + Sync + 'static> {
 
 impl<T: ?Sized + Send + Sync + 'static> EntryGetResult<T> {
     #[inline]
-    fn from_strong(strong: Arc<dyn Any + Send + Sync>, actual_resource_type: TypeId) -> Self {
-        match strong.downcast::<Resource<T>>() {
-            Ok(resource) => Self::Ok(resource),
-            Err(_) => Self::Err(ResourceLoadError::from_mismatch::<T>(actual_resource_type)),
-        }
-    }
-
-    #[inline]
-    fn from_weak(weak: &Weak<dyn Any + Send + Sync>, actual_resource_type: TypeId) -> Self {
+    fn from_weak(weak: &Weak<Resource<T>>) -> Self {
         match weak.upgrade() {
-            Some(strong) => Self::from_strong(strong, actual_resource_type),
+            Some(strong) => Self::Ok(strong),
             None => Self::Expired,
         }
     }
@@ -393,434 +563,518 @@ impl<T: ?Sized + Send + Sync + 'static> EntryGetResult<T> {
     }
 }
 
-enum CacheEntryInner {
+impl<T: ?Sized + Send + Sync + 'static> From<ResourceLoadResult<T>> for EntryGetResult<T> {
+    fn from(result: ResourceLoadResult<T>) -> Self {
+        match result {
+            Ok(resource) => Self::Ok(resource),
+            Err(error) => Self::Err(error),
+        }
+    }
+}
+
+enum CacheEntryTypedInner<L: ?Sized + ResourceLoader> {
     Loading {
-        task: Box<dyn Any + Send + Sync>, // Box<ManagerLoadTask<T>>
+        task: ManagerLoadTask<L::Output>, // Box<ManagerLoadTask<T>>
         wakers: Arc<MultiWaker>,
         dependencies: Arc<RwLock<DependencyGraph>>,
-        hash_source_idx: Arc<Mutex<(Option<String>, SourceIndex)>>,
     },
     // This is a special edge-case state where loading has been completed, but a strong reference
     // has not yet been retrieved, so we need to keep one to keep it from being dropped. This mostly
     // only occurs during certain race conditions when updating an actively loading resource.
     Loaded {
-        strong: Arc<dyn Any + Send + Sync>, // Arc<Resource<T>>,
-        hash: String,
-        source_idx: SourceIndex,
+        strong: Arc<Resource<L::Output>>, // Arc<Resource<T>>,
     },
     Value {
-        weak: Weak<dyn Any + Send + Sync>, // Weak<Resource<T>>,
-        hash: String,
-        source_idx: SourceIndex,
+        weak: Weak<Resource<L::Output>>, // Weak<Resource<T>>,
     },
     Error(ResourceLoadError),
+    Updating {
+        weak: Weak<Resource<L::Output>>,
+        task: ManagerUpdateTask,
+        wakers: Arc<MultiWaker>,
+    }
 }
 
-pub struct CacheEntry {
-    resource_type: TypeId,
-    inner: CacheEntryInner,
-    create_update_fut_fn: CreateUpdateFutFn,
+pub struct CacheEntryTyped<L: ?Sized + ResourceLoader> {
+    id: ResourceId,
+    loader: Arc<L>,
+    inner: CacheEntryTypedInner<L>,
 }
 
-impl CacheEntry {
-    // TODO: Can this move to the update module?
-    async fn update_entry<T>(
-        cache: Arc<Cache>,
-        result: ResourceTaskDataResult<T>,
-        output: Arc<UpdateOutput<T>>,
-        #[cfg(test)]
-        sync_update: Arc<super::tests::SyncContext>,
-    )
-    where
-        T: ?Sized + Send + Sync + 'static,
-    {
-        #[cfg(test)]
-        let _test_ctx_lock = sync_update.run().await;
-
-        let task_data = match result.result {
-            Ok(task_data) => task_data,
-            Err(error) => {
-                warn!(
-                    id = %result.id,
-                    ?error,
-                    "Resource failed to load while updating; will be left unchanged",
-                );
-                // TODO: Should the old value be used instead?
-                output.set(Err(error));
-                return
-            }
-        };
-
-        let check_output_requested = |
-            entries: &mut HashMap<ResourceId, CacheEntry>,
-            id: ResourceId,
-            task_data: ResourceTaskData<T>,
-            create_update_fut_fn: CreateUpdateFutFn,
-        | {
-            if output.has_futures() {
-                // Entry was expired, but there are update futures waiting on it, so re-cache
-                let resource = Arc::new(Resource::new(
-                    id.clone(),
-                    task_data.value,
-                ));
-                let entry = Self::from_resource(
-                    &resource,
-                    create_update_fut_fn,
-                    task_data.hash,
-                    task_data.source_idx,
-                );
-                entries.insert(id, entry);
-                output.set(Ok(resource));
-            }
-        };
-
-        let handle_expired = |
-            entries: &mut HashMap<ResourceId, CacheEntry>,
-            id: ResourceId,
-            task_data: ResourceTaskData<T>,
-            create_update_fut_fn: CreateUpdateFutFn,
-        | {
-            debug!(%id, "Cache entry expired before resource finished updating");
-            check_output_requested(entries, id, task_data, create_update_fut_fn);
-        };
-
-        let handle_mismatch = |id: ResourceId, actual: TypeId| {
-            let requested = TypeId::of::<T>();
-            warn!(
-                %id,
-                ?requested,
-                ?actual,
-                "Tried to update resource with mismatched types",
-            );
-            output.set(Err(ResourceLoadError::TypeMismatch { requested, actual }));
-        };
-
-        let resource = {
-            let mut entries = cache.entries.write();
-            let entry = match entries.get_mut(&result.id) {
-                Some(entry) => entry,
-                None => {
-                    handle_expired(&mut entries, result.id, task_data, result.create_update_fut_fn);
-                    return
-                }
-            };
-
-            match &mut entry.inner {
-                CacheEntryInner::Loading { .. } => {
-                    let resource = Arc::new(Resource::new(result.id.clone(), task_data.value));
-                    entry.inner = CacheEntryInner::Loaded {
-                        strong: resource.clone(),
-                        hash: task_data.hash,
-                        source_idx: task_data.source_idx.clone(),
-                    };
-                    task_data.dependencies.apply(&mut cache.dependencies.write());
-                    cache.sources.watch_n(&result.id, &task_data.source_idx);
-                    output.set(Ok(resource));
-                    return
-                },
-                CacheEntryInner::Loaded { strong, hash, source_idx } => {
-                    if let Ok(resource) = strong.clone().downcast::<Resource<T>>() {
-                        *hash = task_data.hash;
-                        *source_idx = task_data.source_idx.clone();
-                        resource
-                    } else {
-                        handle_mismatch(result.id, entry.resource_type);
-                        return
-                    }
-                },
-                CacheEntryInner::Value { weak, hash, source_idx } => {
-                    if let Some(strong) = weak.upgrade() {
-                        if let Ok(resource) = strong.downcast::<Resource<T>>() {
-                            *hash = task_data.hash;
-                            *source_idx = task_data.source_idx.clone();
-                            resource
-                        } else {
-                            handle_mismatch(result.id, entry.resource_type);
-                            return
-                        }
-                    } else {
-                        handle_expired(&mut entries, result.id, task_data, result.create_update_fut_fn);
-                        return
-                    }
-                },
-                CacheEntryInner::Error(_) => {
-                    debug!(
-                        id = %result.id,
-                        "Tried to update errored Resource, ignoring",
-                    );
-                    check_output_requested(&mut entries, result.id, task_data, result.create_update_fut_fn);
-                    return
-                },
-            }
-        };
-
-        task_data.dependencies.apply(&mut cache.dependencies.write());
-        cache.sources.watch_n(&result.id, &task_data.source_idx);
-
-        let (resource_mut, drop_checker) = ResourceMut::from_resource(resource.clone());
-        (result.loader_update_fut_fn)(resource_mut, task_data.value).await;
-
-        // Drop checker is used to wait until ResourceMut is no longer used, in case the update
-        // needed to be delayed beyond the resolution of loader.update()
-        match drop_checker.recv().await {
-            Ok(_) => { debug!("Drop-checker received an unexpected message"); },
-            Err(_) => { /* sender was dropped, this is expected */ },
-        }
-
-        resource.update_sub_resources().await;
-
-        output.set(Ok(resource));
-    }
-
-    fn loader_update_closure<L>(
-        loader: Arc<L>,
-    ) -> LoaderUpdateFutFn<L::Output>
-    where
-        L: ?Sized + ResourceLoader,
-    {
-        Box::new(move |
-            resource_mut,
-            new_value,
-        | {
-            let loader = loader.clone();
-            async move {
-                loader.update(resource_mut, new_value).await
-            }.boxed()
-        })
-    }
-
-    fn create_update_closure<L>(
-        id: ResourceId,
-        loader: Arc<L>,
-    ) -> CreateUpdateFutFn
-    where
-        L: ?Sized + ResourceLoader,
-    {
-        // Use a closure to type-erase T
-        Arc::new(move |
-            cache,
-            params,
-        | {
-            let load_params = ResourceLoadParams {
-                loader: loader.clone(),
-                priority: TaskPriority::Update,
-                parents: vec![], // TODO: Do parents need to be set for updates?
-                resource_cache: Arc::new(RwLock::new(HashMap::default())),
-                operation: ResourceLoadOperation::Update,
-            };
-            let load_fn = Arc::new(cache.find_and_load_fn(id, &load_params));
-            let load_task = cache.create_load_task(
-                id.clone(),
-                load_params,
-                None,
-                load_fn,
-            );
-
-            let output = match params.prev_output {
-                Some(prev_output) => match prev_output.into_typed() {
-                    Ok(prev_output) => prev_output,
-                    Err(error) => {
-                        error!(
-                            %id,
-                            ?error,
-                            "Mismatched types between previous update and current update; existing futures may be waiting indefinitely"
-                        );
-                        Arc::new(UpdateOutput::default())
-                    },
-                },
-                None => Arc::new(UpdateOutput::default()),
-            };
-            let async_output = output.clone();
-
-            let cache = cache.clone();
-            let fut = async move {
-                let result = load_task.await;
-                Self::update_entry(
-                    cache,
-                    result,
-                    async_output,
-                    #[cfg(test)]
-                    params.sync_update,
-                ).await;
-            };
-
-            (fut.boxed(), output.into())
-        })
-    }
-
-    fn from_load_task<L>(
+impl<L: ?Sized + ResourceLoader> CacheEntryTyped<L> {
+    fn from_load_task(
         task: ManagerLoadTask<L::Output>,
         id: ResourceId,
         loader: Arc<L>,
-        hash_source_idx: Arc<Mutex<(Option<String>, SourceIndex)>>,
         dependencies: Arc<RwLock<DependencyGraph>>,
-    ) -> Self
+    ) -> Self {
+        Self {
+            id,
+            loader,
+            inner: CacheEntryTypedInner::Loading {
+                task,
+                wakers: Arc::new(MultiWaker::default()),
+                dependencies,
+            },
+        }
+    }
+
+    fn from_resource(
+        resource: &Arc<Resource<L::Output>>,
+        loader: Arc<L>,
+    ) -> Self {
+        Self {
+            id: resource.key().id(),
+            loader,
+            inner: CacheEntryTypedInner::Value {
+                weak: Arc::downgrade(resource),
+            },
+        }
+    }
+
+    fn from_resource_loaded(
+        resource: Arc<Resource<L::Output>>,
+        loader: Arc<L>,
+    ) -> Self {
+        Self {
+            id: resource.key().id(),
+            loader,
+            inner: CacheEntryTypedInner::Loaded {
+                strong: resource,
+            },
+        }
+    }
+
+    fn try_get(&self) -> Option<EntryGetResult<L::Output>> {
+        match &self.inner {
+            CacheEntryTypedInner::Loading { .. } => None,
+            CacheEntryTypedInner::Value{ weak, .. } =>
+                Some(EntryGetResult::from_weak(weak)),
+            CacheEntryTypedInner::Error(error) =>
+                Some(EntryGetResult::Err(error.clone())),
+            // Technically these can be polled, but we need them to be mutated to transform into ::Value
+            CacheEntryTypedInner::Loaded { .. } | CacheEntryTypedInner::Updating { .. } => None,
+        }
+    }
+
+    fn poll(&mut self, new_waker: Option<&Arc<AtomicWaker>>) -> Poll<EntryGetResult<L::Output>> {
+        match &mut self.inner {
+            CacheEntryTypedInner::Loading {
+                task,
+                wakers,
+                dependencies,
+                ..
+            } => {
+                if let Some(new_waker) = new_waker {
+                    wakers.push(new_waker);
+                }
+                let waker = wakers.clone().into();
+                let mut cx = Context::from_waker(&waker);
+                match task.poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        match result {
+                            Ok(data) => {
+                                let resource = Arc::new(Resource::new(
+                                    (self.id, &*self.loader),
+                                    data.value,
+                                ));
+                                data.dependencies.apply(&mut dependencies.write());
+                                self.inner = CacheEntryTypedInner::Value {
+                                    weak: Arc::downgrade(&resource),
+                                };
+                                Poll::Ready(EntryGetResult::Ok(resource))
+                            },
+                            Err(error) => {
+                                self.inner = CacheEntryTypedInner::Error(error.clone());
+                                Poll::Ready(EntryGetResult::Err(error))
+                            },
+                        }
+                    },
+                    Poll::Pending => Poll::Pending,
+                }
+            },
+            CacheEntryTypedInner::Loaded {
+                strong,
+            } => {
+                let strong = strong.clone();
+                self.inner = CacheEntryTypedInner::Value {
+                    weak: Arc::downgrade(&strong),
+                };
+                Poll::Ready(EntryGetResult::Ok(strong))
+            },
+            CacheEntryTypedInner::Value{ weak, .. } =>
+                Poll::Ready(EntryGetResult::from_weak(weak)),
+            CacheEntryTypedInner::Error(error) =>
+                Poll::Ready(EntryGetResult::Err(error.clone())),
+            CacheEntryTypedInner::Updating {
+                weak,
+                task,
+                wakers,
+            } => {
+                if let Some(new_waker) = new_waker {
+                    wakers.push(new_waker);
+                }
+                let waker = wakers.clone().into();
+                let mut cx = Context::from_waker(&waker);
+                match task.poll(&mut cx) {
+                    Poll::Ready(()) => {
+                        // The task itself should replace the inner type with a different one, so
+                        // this should never be reachable
+                        unreachable!("update task should be replaced before completing")
+                    },
+                    Poll::Pending => {
+                        match weak.upgrade() {
+                            Some(resource)
+                                => Poll::Ready(EntryGetResult::Ok(resource)),
+                            None => Poll::Pending,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub trait CacheEntry: Send + Sync + 'static {
+    fn start_update(
+        &mut self,
+        cache: &Arc<Cache>,
+        src_idx: &SourceIndex,
+        update_lock: Arc<UpdateLock>,
+    ) -> bool;
+}
+
+impl<L: ?Sized + ResourceLoader> CacheEntry for CacheEntryTyped<L> {
+    fn start_update(
+        &mut self,
+        cache: &Arc<Cache>,
+        src_idx: &SourceIndex,
+        update_lock: Arc<UpdateLock>,
+    ) -> bool {
+        // Use an empty "Value" as a placeholder
+        let mut inner = CacheEntryTypedInner::Value { weak: Weak::default() };
+        std::mem::swap(&mut inner, &mut self.inner);
+
+        let (weak, prev_task, wakers) = match inner {
+            CacheEntryTypedInner::Loading { wakers, .. } =>
+                (Weak::default(), None, wakers),
+            CacheEntryTypedInner::Loaded { strong } =>
+                (Arc::downgrade(&strong), None, Arc::new(MultiWaker::default())),
+            CacheEntryTypedInner::Value { weak } => {
+                if let Some(_) = weak.upgrade() {
+                    (weak, None, Arc::new(MultiWaker::default()))
+                } else {
+                    // Nothing to update
+                    self.inner = CacheEntryTypedInner::Value { weak };
+                    #[cfg(test)]
+                    update_lock.sync.update.mark_attempt(res_key(self.id, &*self.loader));
+                    return false
+                }
+            },
+            CacheEntryTypedInner::Error(error) => {
+                // Nothing to update
+                self.inner = CacheEntryTypedInner::Error(error);
+                #[cfg(test)]
+                update_lock.sync.update.mark_attempt(res_key(self.id, &*self.loader));
+                return false
+            },
+            CacheEntryTypedInner::Updating { weak, task, wakers }
+                => (weak, Some(task), wakers),
+        };
+
+        let cancel_fut = match prev_task {
+            Some(prev_task) => {
+                let mut fut = Box::pin(prev_task.cancel());
+                let mut cx = Context::from_waker(Waker::noop());
+                // Poll once to ensure that the cancellation has been triggered while there is still
+                // a mutable lock on the entry (implied by this method taking `&mut self`)
+                match fut.poll(&mut cx) {
+                    Poll::Ready(_) => None,
+                    Poll::Pending => Some(fut),
+                }
+            },
+            None => None,
+        };
+
+        let work = UpdateWork::new(
+            self.id,
+            src_idx.clone(),
+            self.loader.clone(),
+            cache,
+            wakers.clone(),
+            update_lock,
+        );
+
+        let task = cache.executor.spawn(
+            TaskPriority::Update,
+            async move {
+                if let Some(cancel_fut) = cancel_fut {
+                    cancel_fut.await;
+                }
+                work.execute().await;
+            }.instrument(info_span!("resource_update", id = %self.id))
+        );
+
+        self.inner = CacheEntryTypedInner::Updating {
+            weak,
+            task,
+            wakers
+        };
+
+        true
+    }
+}
+
+#[derive(Educe)]
+#[educe(Default)]
+pub struct CacheSubGroupTyped<L: ?Sized + ResourceLoader> {
+    entries: HashMap<L::Key, CacheEntryTyped<L>>,
+}
+
+impl<L: ?Sized + ResourceLoader> CacheSubGroupTyped<L> {
+    #[inline]
+    pub fn get(&self, loader: &Arc<L>) -> Option<&CacheEntryTyped<L>> {
+        let key = loader.key();
+        self.entries.get(&key)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, loader: &Arc<L>) -> Option<&mut CacheEntryTyped<L>> {
+        let key = loader.key();
+        self.entries.get_mut(&key)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, new_entry: CacheEntryTyped<L>) -> Option<CacheEntryTyped<L>> {
+        let key = new_entry.loader.key();
+        self.entries.insert(key, new_entry)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, loader: &Arc<L>) -> Option<CacheEntryTyped<L>> {
+        let key = loader.key();
+        self.entries.remove(&key)
+    }
+}
+
+pub trait CacheSubGroup: Any + Send + Sync + 'static {
+    fn start_update(
+        &mut self,
+        cache: &Arc<Cache>,
+        src_idx: &SourceIndex,
+        update_lock: &Arc<UpdateLock>,
+    ) -> HashSet<BoxedResKey>;
+}
+
+impl<L: ?Sized + ResourceLoader> CacheSubGroup for CacheSubGroupTyped<L> {
+    fn start_update(
+        &mut self,
+        cache: &Arc<Cache>,
+        src_idx: &SourceIndex,
+        update_lock: &Arc<UpdateLock>,
+    ) -> HashSet<BoxedResKey> {
+        let mut keys = HashSet::default();
+        let mut remove = HashSet::default();
+        for (k, entry) in self.entries.iter_mut() {
+            if entry.start_update(cache, src_idx, update_lock.clone()) {
+                keys.insert(res_key(entry.id, &*entry.loader));
+            } else {
+                remove.insert(k.clone());
+            }
+        }
+        for k in remove {
+            self.entries.remove(&k);
+        }
+        keys
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheGroupUpdateResult {
+    Skipped,
+    Moved,
+    Updated(HashSet<BoxedResKey>),
+}
+
+#[derive(Default)]
+pub struct CacheGroup {
+    metadata: SourceMetadata,
+    sub_groups: HashMap<TypeId, Box<dyn CacheSubGroup>>,
+}
+
+impl CacheGroup {
+    pub fn sub_group<L>(&self) -> Option<&CacheSubGroupTyped<L>>
     where
         L: ?Sized + ResourceLoader,
     {
-        Self {
-            resource_type: TypeId::of::<L::Output>(),
-            inner: CacheEntryInner::Loading {
-                task: Box::new(task) as Box<dyn Any + Send + Sync>,
-                wakers: Arc::new(MultiWaker::default()),
-                dependencies,
-                hash_source_idx,
-            },
-            create_update_fut_fn: Self::create_update_closure(id, loader),
+        if let Some(sub_group) = self.sub_groups.get(&TypeId::of::<L>()) {
+            let sub_group = (&**sub_group as &dyn Any)
+                .downcast_ref::<CacheSubGroupTyped<L>>()
+                .expect("Cache entry type should match key type");
+            Some(sub_group)
+        } else {
+            None
         }
     }
 
-    fn from_resource<T>(
-        resource: &Arc<Resource<T>>,
-        create_update_fut_fn: CreateUpdateFutFn,
-        hash: String,
-        source_idx: SourceIndex,
-    ) -> Self
+    pub fn sub_group_mut<L>(&mut self) -> Option<&mut CacheSubGroupTyped<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ?Sized + ResourceLoader,
     {
-        Self {
-            resource_type: TypeId::of::<T>(),
-            inner: CacheEntryInner::Value {
-                weak: Arc::downgrade(resource) as Weak<dyn Any + Send + Sync>,
-                hash,
-                source_idx,
-            },
-            create_update_fut_fn,
+        if let Some(sub_group) = self.sub_groups.get_mut(&TypeId::of::<L>()) {
+            let sub_group = (&mut **sub_group as &mut dyn Any)
+                .downcast_mut::<CacheSubGroupTyped<L>>()
+                .expect("Cache entry type should match key type");
+            Some(sub_group)
+        } else {
+            None
         }
     }
 
-    fn try_get<T>(&self) -> Option<EntryGetResult<T>>
+    #[inline]
+    pub fn get<L>(&self, loader: &Arc<L>) -> Option<&CacheEntryTyped<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ?Sized + ResourceLoader,
     {
-        match &self.inner {
-            CacheEntryInner::Loading { .. } => None,
-            // Technically this can be polled, but we need it be mutated to transform into ::Value
-            CacheEntryInner::Loaded { .. } => None,
-            CacheEntryInner::Value{ weak, .. } =>
-                Some(EntryGetResult::from_weak(weak, self.resource_type)),
-            CacheEntryInner::Error(error) =>
-                Some(EntryGetResult::Err(error.clone())),
-        }
+        self.sub_group::<L>()
+            .and_then(|sub_group| sub_group.get(loader))
     }
 
-    fn poll<T>(&mut self, new_waker: Option<&Arc<AtomicWaker>>) -> Poll<EntryGetResult<T>>
+    #[inline]
+    pub fn get_mut<L>(&mut self, loader: &Arc<L>) -> Option<&mut CacheEntryTyped<L>>
     where
-        T: ?Sized + Send + Sync + 'static,
+        L: ?Sized + ResourceLoader,
     {
-        match &mut self.inner {
-            CacheEntryInner::Loading { task, wakers, dependencies, .. } => {
-                match task.downcast_mut::<ManagerLoadTask<T>>() {
-                    Some(task) => {
-                        if let Some(new_waker) = new_waker {
-                            wakers.push(new_waker);
-                        }
-                        let waker = wakers.clone().into();
-                        let mut cx = Context::from_waker(&waker);
-                        match task.poll(&mut cx) {
-                            Poll::Ready(result) => {
-                                match result.result {
-                                    Ok(data) => {
-                                        let resource = Arc::new(Resource::new(
-                                            result.id.clone(),
-                                            data.value,
-                                        ));
-                                        data.dependencies.apply(&mut dependencies.write());
-                                        self.inner = CacheEntryInner::Value {
-                                            weak: Arc::downgrade(&resource) as Weak<dyn Any + Send + Sync>,
-                                            hash: data.hash,
-                                            source_idx: data.source_idx,
-                                        };
-                                        Poll::Ready(EntryGetResult::Ok(resource))
-                                    },
-                                    Err(error) => {
-                                        self.inner = CacheEntryInner::Error(error.clone());
-                                        Poll::Ready(EntryGetResult::Err(error))
-                                    },
-                                }
-                            },
-                            Poll::Pending => Poll::Pending,
-                        }
-                    },
-                    None => Poll::Ready(EntryGetResult::Err(
-                        ResourceLoadError::from_mismatch::<T>(self.resource_type)
-                    )),
-                }
-            },
-            CacheEntryInner::Loaded { strong, hash, source_idx } => {
-                let strong = strong.clone();
-                self.inner = CacheEntryInner::Value {
-                    weak: Arc::downgrade(&strong),
-                    hash: hash.clone(),
-                    source_idx: source_idx.clone(),
-                };
-                Poll::Ready(EntryGetResult::from_strong(strong, self.resource_type))
-            },
-            CacheEntryInner::Value{ weak, .. } =>
-                Poll::Ready(EntryGetResult::from_weak(weak, self.resource_type)),
-            CacheEntryInner::Error(error) =>
-                Poll::Ready(EntryGetResult::Err(error.clone())),
+        self.sub_group_mut::<L>()
+            .and_then(|sub_group| sub_group.get_mut(loader))
+    }
+
+    pub fn insert<L: ?Sized + ResourceLoader>(
+        &mut self,
+        new_entry: CacheEntryTyped<L>,
+    ) -> Option<CacheEntryTyped<L>> {
+        let sub_group = self.sub_groups.entry(TypeId::of::<L>())
+            .or_insert_with(|| Box::new(CacheSubGroupTyped::<L>::default()));
+        let sub_group = (&mut **sub_group as &mut dyn Any)
+            .downcast_mut::<CacheSubGroupTyped<L>>()
+            .expect("Cache entry type should match key type");
+        sub_group.insert(new_entry)
+    }
+
+    pub fn remove<L>(&mut self, loader: &Arc<L>) -> Option<CacheEntryTyped<L>>
+    where
+        L: ?Sized + ResourceLoader
+    {
+        if let Some(sub_group) = self.sub_group_mut::<L>() {
+            sub_group.remove(loader)
+        } else {
+            None
         }
     }
 
-    fn metadata(&self) -> Option<CacheEntryMetadata> {
-        match &self.inner {
-            CacheEntryInner::Loading { hash_source_idx, .. } => {
-                let lock = hash_source_idx.lock();
-                Some(CacheEntryMetadata::Loading(CacheLoadingMetadata {
-                    create_update_fut_fn: self.create_update_fut_fn.clone(),
-                    resource_type: self.resource_type,
-                    hash: lock.0.clone(),
-                    source_idx: lock.1.clone(),
-                }))
-            },
-            CacheEntryInner::Loaded { strong, hash, source_idx } => {
-                Some(CacheEntryMetadata::Cached(CachedValueMetadata {
-                    _resource: Some(strong.clone()),
-                    create_update_fut_fn: self.create_update_fut_fn.clone(),
-                    resource_type: self.resource_type,
-                    hash: hash.clone(),
-                    source_idx: source_idx.clone(),
-                }))
-            },
-            CacheEntryInner::Value{ weak, hash, source_idx } => {
-                weak.upgrade().map(|value| CacheEntryMetadata::Cached(CachedValueMetadata {
-                    _resource: Some(value),
-                    create_update_fut_fn: self.create_update_fut_fn.clone(),
-                    resource_type: self.resource_type,
-                    hash: hash.clone(),
-                    source_idx: source_idx.clone(),
-                }))
-            },
-            CacheEntryInner::Error(_) => None,
+    pub fn start_update(
+        &mut self,
+        id: ResourceId,
+        update: Option<ResourceUpdate>,
+        source_idx: &SourceIndex,
+        sources: &Sources,
+        update_lock: &Arc<UpdateLock>,
+        cache: &Arc<Cache>,
+    ) -> CacheGroupUpdateResult {
+        if let Some(update) = update {
+            let (hash, source_idx) = match update {
+                ResourceUpdate::Added(hash) | ResourceUpdate::Modified(hash) => {
+                    if !self.metadata.valid_for_update(&hash, source_idx) {
+                        return CacheGroupUpdateResult::Skipped
+                    }
+
+                    (hash, source_idx.clone())
+                },
+                ResourceUpdate::Removed => {
+                    let new_source = match sources.find_hash(&id) {
+                        Some(new_source) => new_source,
+                        // Data was removed, but there isn't a backup. Leave existing
+                        // entry alone for now
+                        None => {
+                            warn!(%id, "All valid data sources have been removed for active resource");
+                            return CacheGroupUpdateResult::Skipped
+                        },
+                    };
+
+                    (new_source.hash, new_source.idx)
+                },
+                ResourceUpdate::MovedSourceIndex(old_source_idx) => {
+                    let result = if self.metadata.source_idx == old_source_idx {
+                        self.metadata.source_idx = source_idx.clone();
+                        CacheGroupUpdateResult::Moved
+                    } else {
+                        CacheGroupUpdateResult::Skipped
+                    };
+                    return result
+                },
+            };
+
+            self.metadata.hash = Some(hash);
+            self.metadata.source_idx = source_idx;
         }
+
+        let mut keys = HashSet::default();
+        for sub_group in self.sub_groups.values_mut() {
+            keys.extend(sub_group.start_update(
+                cache,
+                &self.metadata.source_idx,
+                update_lock,
+            ));
+        }
+        CacheGroupUpdateResult::Updated(keys)
     }
 
-    fn move_source_index(&mut self, new_source_index: SourceIndex) -> bool {
-        match &mut self.inner {
-            CacheEntryInner::Loading { hash_source_idx, .. } => {
-                hash_source_idx.lock().1 = new_source_index;
-                true
-            },
-            CacheEntryInner::Loaded { source_idx, .. } |
-            CacheEntryInner::Value { source_idx, .. } => {
-                *source_idx = new_source_index;
-                true
-            },
-            _ => false,
+    pub fn start_dependent_update(
+        &mut self,
+        key: &BoxedResKey,
+        update_lock: &Arc<UpdateLock>,
+        cache: &Arc<Cache>,
+    ) -> CacheGroupUpdateResult {
+        if let Some(sub_group) = self.sub_groups.get_mut(&key.loader_type()) {
+            let keys = sub_group.start_update(
+                cache,
+                &self.metadata.source_idx,
+                update_lock,
+            );
+            CacheGroupUpdateResult::Updated(keys)
+        } else {
+            CacheGroupUpdateResult::Skipped
         }
+    }
+}
+
+#[derive(Default)]
+pub struct CacheEntries(HashMap<ResourceId, smol::lock::RwLock<CacheGroup>>);
+
+impl CacheEntries {
+    #[inline]
+    pub fn group(&self, id: ResourceId) -> Option<&smol::lock::RwLock<CacheGroup>> {
+        self.0.get(&id)
+    }
+
+    #[inline]
+    pub fn init_group(&mut self, id: ResourceId) {
+        self.0.entry(id).or_default();
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
 pub(in crate::resource) struct Cache {
-    entries: RwLock<HashMap<ResourceId, CacheEntry>>,
+    entries: smol::lock::RwLock<CacheEntries>,
     executor: Arc<ManagerExecutor>,
     sources: Arc<Sources>,
     dependencies: Arc<RwLock<DependencyGraph>>,
-    updates: Arc<Updates>,
     #[cfg(test)]
-    sync_load: Arc<super::tests::SyncContext>,
+    sync_load: Arc<super::tests::SyncContext<BoxedResKey>>,
 }
 
 impl Cache {
@@ -829,56 +1083,102 @@ impl Cache {
         executor: Arc<ManagerExecutor>,
         sources: Arc<Sources>,
         dependencies: Arc<RwLock<DependencyGraph>>,
-        updates: Arc<Updates>,
         #[cfg(test)]
-        sync_load: Arc<super::tests::SyncContext>,
+        sync_load: Arc<super::tests::SyncContext<BoxedResKey>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            entries: RwLock::new(Default::default()),
+            entries: smol::lock::RwLock::new(CacheEntries::default()),
             executor,
             sources,
             dependencies,
-            updates,
             #[cfg(test)]
             sync_load,
         })
     }
 
-    fn get<L>(
+    #[inline]
+    pub fn entries(&self) -> &smol::lock::RwLock<CacheEntries> {
+        &self.entries
+    }
+
+    pub async fn entries_with_group(
+        &self,
+        id: ResourceId,
+    ) -> smol::lock::RwLockReadGuard<'_, CacheEntries> {
+        let entries = self.entries.upgradable_read().await;
+        match entries.group(id) {
+            Some(_) => smol::lock::RwLockUpgradableReadGuard::downgrade(entries),
+            None => {
+                let mut entries = smol::lock::RwLockUpgradableReadGuard::upgrade(entries).await;
+                entries.init_group(id);
+                smol::lock::RwLockWriteGuard::downgrade(entries)
+            }
+        }
+    }
+
+    pub fn entries_with_group_blocking(
+        &self,
+        id: ResourceId,
+    ) -> smol::lock::RwLockReadGuard<'_, CacheEntries> {
+        let entries = self.entries.upgradable_read_blocking();
+        match entries.group(id) {
+            Some(_) => smol::lock::RwLockUpgradableReadGuard::downgrade(entries),
+            None => {
+                let mut entries = smol::lock::RwLockUpgradableReadGuard::upgrade_blocking(entries);
+                entries.init_group(id);
+                smol::lock::RwLockWriteGuard::downgrade(entries)
+            }
+        }
+    }
+
+    async fn update_metadata(
+        &self,
+        id: ResourceId,
+        hash: String,
+        source_idx: SourceIndex,
+    ) {
+        let entries = self.entries.read().await;
+        if let Some(group) = entries.group(id) {
+            let mut group = group.write().await;
+            if source_idx < group.metadata.source_idx {
+                group.metadata.source_idx = source_idx;
+                group.metadata.hash = Some(hash);
+            }
+        }
+    }
+
+    fn get<'lock, L>(
         self: &Arc<Self>,
         id: ResourceId,
         load_fn: &Arc<impl (Fn(
             ResourceLoadContext,
-            Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static>,
         load_params: &ResourceLoadParams<L>,
         force_retry: bool,
-        entries: &mut RwLockUpgradableReadGuard<HashMap<ResourceId, CacheEntry>>,
-    ) -> Option<GetOrLoad<L>>
+        group: smol::lock::RwLockUpgradableReadGuard<'lock, CacheGroup>,
+    ) -> Result<GetOrLoad<L>, smol::lock::RwLockWriteGuard<'lock, CacheGroup>>
     where
         L: ?Sized + ResourceLoader,
     {
-        if let Some(entry) = entries.get(&id) {
+        if let Some(entry) = group.get(&load_params.loader) {
             if let Some(get_result) = entry.try_get() {
                 if let Some(result) = get_result.try_result(force_retry) {
-                    return Some(GetOrLoad::Cached(result))
+                    return Ok(GetOrLoad::Cached(result))
                 } // else expired, start a new load task
             } else {
                 // Entry exists, but needs to be mutated or is still loading
                 let waker = Arc::new(AtomicWaker::new());
-                let poll_result = entries.with_upgraded(|entries| {
-                    let entry = entries.get_mut(&id).unwrap();
-                    entry.poll(Some(&waker))
-                });
-                match poll_result {
+                let mut group = smol::lock::RwLockUpgradableReadGuard::upgrade_blocking(group);
+                let entry = group.get_mut(&load_params.loader).unwrap();
+                match entry.poll(Some(&waker)) {
                     Poll::Ready(get_result) => {
                         if let Some(result) = get_result.try_result(force_retry) {
-                            return Some(GetOrLoad::Cached(result))
+                            return Ok(GetOrLoad::Cached(result))
                         } // else expired, start a new load task
                     },
                     Poll::Pending => {
                         // Yield future for existing load task
-                        return Some(GetOrLoad::Loading(ResourceLoadFuture {
+                        return Ok(GetOrLoad::Loading(ResourceLoadFuture {
                             cache: self.clone(),
                             id,
                             load_fn: load_fn.clone(),
@@ -887,10 +1187,11 @@ impl Cache {
                         }))
                     },
                 }
+                return Err(group)
             }
         }
 
-        None
+        Err(smol::lock::RwLockUpgradableReadGuard::upgrade_blocking(group))
     }
 
     pub fn get_or_load<L>(
@@ -926,40 +1227,37 @@ impl Cache {
         load_params: ResourceLoadParams<L>,
         load_fn: impl (Fn(
             ResourceLoadContext,
-            Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static,
         force_retry: bool,
     ) -> GetOrLoad<L>
     where
         L: ?Sized + ResourceLoader,
     {
-        if load_params.operation == ResourceLoadOperation::Update {
-            if let Some(fut) = self.updates.get_future(&id) {
-                return fut
-            }
-        }
-
-        let mut entries = self.entries.upgradable_read();
+        let entries = self.entries_with_group_blocking(id);
 
         let load_fn = Arc::new(load_fn);
 
-        // TODO: Force a retry if the loader is different that the previously used one
-        //  (or cache values by loader type ID as well)
-        if let Some(future) = self.get(id, &load_fn, &load_params, force_retry, &mut entries) {
-            return future
-        }
+        let group = entries.group(id).unwrap();
+        let mut group_lock = match self.get(
+            id,
+            &load_fn,
+            &load_params,
+            force_retry,
+            group.upgradable_read_blocking(),
+        ) {
+            Ok(future) => return future,
+            Err(group) => group,
+        };
 
         // Expired or otherwise doesn't exist, start a new load task
         let waker = Arc::new(AtomicWaker::new());
-        let poll = entries.with_upgraded(|entries| {
-            self.start_load_task(
-                id,
-                load_params.clone(),
-                load_fn.clone(),
-                &waker,
-                entries,
-            )
-        });
+        let poll = self.start_load_task(
+            id,
+            load_params.clone(),
+            load_fn.clone(),
+            &waker,
+            &mut group_lock,
+        );
 
         match poll {
             Poll::Ready(result) => GetOrLoad::Cached(result),
@@ -980,7 +1278,6 @@ impl Cache {
         load_default_fn: DefaultFn,
     ) -> impl (Fn(
         ResourceLoadContext,
-        Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
     ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static
     where
         L: ?Sized + ResourceLoader,
@@ -991,23 +1288,13 @@ impl Cache {
         let operation = load_params.operation;
         let load_default_fn = Arc::new(load_default_fn);
 
-        move |ctx, hash_source_idx| {
+        move |ctx| {
             let sources = sources.clone();
             let load_default_fn = load_default_fn.clone();
             async move {
-                let hash = "<default>".to_string();
-                let source_idx = SourceIndex::max();
-
-                if let Some(loading_hash_source_idx) = hash_source_idx {
-                    let mut lock = loading_hash_source_idx.lock();
-                    lock.0 = Some(hash.clone());
-                    // largest source index means everything will have priority over it
-                    lock.1 = source_idx.clone();
-                }
-
                 if operation == ResourceLoadOperation::Load {
                     // If this is the original load, we need to start watching for updates
-                    sources.watch_n(&id, &source_idx);
+                    sources.watch_n(&id, &SourceIndex::max());
                 }
 
                 match load_default_fn(&ctx).await {
@@ -1016,8 +1303,6 @@ impl Cache {
                         Ok(ResourceTaskData {
                             value,
                             dependencies,
-                            hash,
-                            source_idx,
                         })
                     },
                     Err(e) => Err(e),
@@ -1032,16 +1317,17 @@ impl Cache {
         load_params: &ResourceLoadParams<L>,
     ) -> impl (Fn(
         ResourceLoadContext,
-        Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
     ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static
     where
         L: ?Sized + ResourceLoader,
     {
+        let cache = Arc::downgrade(self);
         let sources = self.sources.clone();
         let operation = load_params.operation;
         let loader = load_params.loader.clone();
 
-        move |ctx, hash_source_idx| {
+        move |ctx| {
+            let cache = cache.clone();
             let sources = sources.clone();
             let loader = loader.clone();
             async move {
@@ -1052,10 +1338,12 @@ impl Cache {
                         hash = ?data.source.hash,
                         "Found source data"
                     );
-                        if let Some(loading_hash_source_idx) = hash_source_idx {
-                            let mut lock = loading_hash_source_idx.lock();
-                            lock.0 = Some(data.source.hash.clone());
-                            lock.1 = data.source.idx.clone();
+                        if let Some(cache) = cache.upgrade() {
+                            cache.update_metadata(
+                                id,
+                                data.source.hash,
+                                data.source.idx.clone(),
+                            ).await;
                         }
 
                         if operation == ResourceLoadOperation::Load {
@@ -1069,8 +1357,6 @@ impl Cache {
                                 Ok(ResourceTaskData {
                                     value,
                                     dependencies,
-                                    hash: data.source.hash,
-                                    source_idx: data.source.idx,
                                 })
                             },
                             Err(e) => Err(e),
@@ -1087,10 +1373,8 @@ impl Cache {
         self: &Arc<Self>,
         id: ResourceId,
         load_params: ResourceLoadParams<L>,
-        hash_source_idx: Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         load_fn: Arc<impl (Fn(
             ResourceLoadContext,
-            Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + ?Sized + Send + Sync + 'static>,
     ) -> ManagerLoadTask<L::Output>
     where
@@ -1103,31 +1387,25 @@ impl Cache {
         let sync_load = self.sync_load.clone();
 
         let span = if load_params.parents.is_empty() {
-            info_span!("resource_load", id = %id.clone(), priority = %load_params.priority)
+            info_span!("resource_load", id = %id, priority = %load_params.priority)
         } else {
-            info_span!("sub_load", id = %id.clone())
+            info_span!("sub_load", id = %id)
         };
 
         self.executor.spawn(load_params.priority, async move {
+            let key = res_key(id, &*load_params.loader);
             #[cfg(test)]
-            let _test_ctx_lock = sync_load.run().await;
+            let _test_ctx_lock = sync_load.run(key.clone()).await;
 
             let ctx = ResourceLoadContext::new(
                 cache,
-                id,
+                key,
                 load_params.priority,
                 load_params.parents,
                 load_params.resource_cache,
             );
 
-            let result = load_fn(ctx, hash_source_idx).await;
-
-            ResourceTaskDataResult {
-                id,
-                result,
-                loader_update_fut_fn: CacheEntry::loader_update_closure(load_params.loader.clone()),
-                create_update_fut_fn: CacheEntry::create_update_closure(id, load_params.loader),
-            }
+            load_fn(ctx).await
         }.instrument(span))
     }
 
@@ -1137,34 +1415,30 @@ impl Cache {
         load_params: ResourceLoadParams<L>,
         load_fn: Arc<impl (Fn(
             ResourceLoadContext,
-            Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
         ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + ?Sized + Send + Sync + 'static>,
         waker: &Arc<AtomicWaker>,
-        entries: &mut HashMap<ResourceId, CacheEntry>,
+        group: &mut CacheGroup,
     ) -> Poll<ResourceLoadResult<L::Output>>
     where
         L: ?Sized + ResourceLoader,
     {
         let loader = load_params.loader.clone();
-        let hash_source_idx = Arc::new(Mutex::new((None, SourceIndex::min())));
         let task = self.create_load_task(
-            id.clone(),
+            id,
             load_params,
-            Some(hash_source_idx.clone()),
             load_fn,
         );
 
-        let mut entry = CacheEntry::from_load_task(
+        let mut entry = CacheEntryTyped::<L>::from_load_task(
             task,
-            id.clone(),
+            id,
             loader,
-            hash_source_idx,
             self.dependencies.clone(),
         );
 
         // Poll immediately so that the waker can be properly installed in the LoadTask
         let poll_result = entry.poll(Some(waker));
-        entries.insert(id, entry);
+        group.insert(entry);
 
         match poll_result {
             Poll::Ready(get_result) => Poll::Ready(get_result.try_result(false)
@@ -1174,26 +1448,8 @@ impl Cache {
     }
 
     #[inline]
-    pub fn metadata(&self, id: &ResourceId) -> Option<CacheEntryMetadata> {
-        self.entries.read().get(id).and_then(CacheEntry::metadata)
-    }
-
-    pub fn move_source_index(&self, id: &ResourceId, new_source_idx: SourceIndex) -> bool {
-        if let Some(entry) = self.entries.write().get_mut(id) {
-            entry.move_source_index(new_source_idx)
-        } else {
-            false
-        }
-    }
-
-    #[inline]
-    pub fn remove(&self, id: &ResourceId) -> bool {
-        self.entries.write().remove(id).is_some()
-    }
-
-    #[inline]
     pub fn clear(&self) {
-        self.entries.write().clear();
+        self.entries.write_blocking().clear();
     }
 }
 
@@ -1203,7 +1459,6 @@ pub struct ResourceLoadFuture<L: ?Sized + ResourceLoader> {
     id: ResourceId,
     load_fn: Arc<dyn (Fn(
         ResourceLoadContext,
-        Option<Arc<Mutex<(Option<String>, SourceIndex)>>>,
     ) -> BoxFuture<'static, Result<ResourceTaskData<L::Output>, ResourceLoadError>>) + Send + Sync + 'static>,
     load_params: ResourceLoadParams<L>,
     waker: Arc<AtomicWaker>,
@@ -1218,27 +1473,26 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.waker.register(cx.waker());
 
-        let mut entries = self.cache.entries.upgradable_read();
+        let entries = self.cache.entries_with_group_blocking(self.id);
+        let group_lock = entries.group(self.id).unwrap();
+        let group = group_lock.upgradable_read_blocking();
 
-        let maybe_result = match entries.get(&self.id) {
+        let maybe_result = match group.get(&self.load_params.loader) {
             Some(entry) => entry.try_get(),
             None => Some(EntryGetResult::Expired),
         };
 
-        let result = match maybe_result {
-            Some(result) => result,
+        let (group, result) = match maybe_result {
+            Some(result) => (group, result),
             None => {
-                let poll_result = entries.with_upgraded(|entries| {
-                    match entries.get_mut(&self.id) {
-                        Some(entry) => entry.poll(None),
-                        None => Poll::Ready(EntryGetResult::Expired),
-                    }
-                });
-                match poll_result {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => return Poll::Pending,
-                }
-            },
+                let mut group = smol::lock::RwLockUpgradableReadGuard::upgrade_blocking(group);
+                let poll_result = match group.get_mut(&self.load_params.loader) {
+                    Some(entry) => entry.poll(None),
+                    None => Poll::Ready(EntryGetResult::Expired),
+                };
+                let result = ready!(poll_result);
+                (smol::lock::RwLockWriteGuard::downgrade_to_upgradable(group), result)
+            }
         };
 
         match result.try_result(false) {
@@ -1249,15 +1503,14 @@ where
                     "Entry expired, starting new load task",
                 );
                 // Expired, start a new load task
-                entries.with_upgraded(|entries| {
-                    self.cache.start_load_task(
-                        self.id.clone(),
-                        self.load_params.clone(),
-                        self.load_fn.clone(),
-                        &self.waker,
-                        entries,
-                    )
-                })
+                let mut group = smol::lock::RwLockUpgradableReadGuard::upgrade_blocking(group);
+                self.cache.start_load_task(
+                    self.id,
+                    self.load_params.clone(),
+                    self.load_fn.clone(),
+                    &self.waker,
+                    &mut group,
+                )
             }
         }
     }
@@ -1277,7 +1530,7 @@ mod tests {
     use test_log::test as test_log;
 
     use crate::resource::manager::tests::prelude::*;
-    use crate::resource::ResourceReadData;
+    use crate::resource::{IdentityLoader, ResourceReadData};
 
     #[rstest]
     #[test_attr(test_log(apply(smol_test)))]
@@ -1307,7 +1560,7 @@ mod tests {
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load(
         test_resource_ctx: TestResourceContext<1>,
-        #[case] key: &str,
+        #[case] id: &str,
         #[case] start_data: Option<TestDataEntry>,
         #[case] expected_load_result: ExpectedLoadResult<String>,
     ) {
@@ -1315,23 +1568,24 @@ mod tests {
             test_resource_ctx.data_maps[0].lock().insert(start_data.id, start_data.data, start_data.hash);
         }
 
+        let key = res_key(id, &TestResLoader::new(id));
         let fut = {
             let _lock = test_resource_ctx.manager.test_ctx().sync_load.block().await;
-            let fut = test_resource_ctx.manager.get_with_loader(key, TestResLoader::new(key));
+            let fut = test_resource_ctx.manager.get_with_loader(id, TestResLoader::new(id));
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
         let result = fut.await;
         // Hold a reference to keep possibly loaded values from expiring
         let _maybe_value = expected_load_result.assert_matches(result);
-        test_resource_ctx.manager.test_ctx().sync_load.assert_count(1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, 1);
 
-        let result = test_resource_ctx.manager.get_with_loader(key, TestResLoader::new(key))
+        let result = test_resource_ctx.manager.get_with_loader(id, TestResLoader::new(id))
             .check()
             .expect("Result should be cached and pollable");
         expected_load_result.assert_matches(result);
         // No extra loads should have been made
-        test_resource_ctx.manager.test_ctx().sync_load.assert_count(1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, 1);
     }
 
     #[rstest]
@@ -1342,8 +1596,8 @@ mod tests {
         test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
 
         test_resource_ctx.data_maps[0].assert_watch("key", false);
+        let key = res_key("key", &TestResLoader::new("key"));
         let (fut1, fut2) = {
-            debug!("1");
             let _lock = test_resource_ctx.manager.test_ctx().sync_load.block().await;
             let fut1 = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key"));
             let fut2 = test_resource_ctx.manager.get_with_loader("key", TestResLoader::new("key"));
@@ -1353,13 +1607,13 @@ mod tests {
         let value = fut1.await.expect("Resource should load for 'key'");
         assert_eq!(*value.read(), "value".to_owned());
         test_resource_ctx.data_maps[0].assert_watch("key", true);
-        test_resource_ctx.manager.test_ctx().sync_load.assert_count(1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, 1);
 
         drop(value);
 
         let value = fut2.await.expect("Resource should reload for 'key' after first handle was dropped");
         assert_eq!(*value.read(), "value".to_owned());
-        test_resource_ctx.manager.test_ctx().sync_load.assert_count(2);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, 2);
     }
 
     #[rstest]
@@ -1382,33 +1636,100 @@ mod tests {
     }
 
     #[rstest]
+    #[test_attr(test_log(apply(smol_test)))]
+    async fn test_load_multiple_types(
+        test_resource_ctx: TestResourceContext<1>,
+    ) {
+        test_resource_ctx.data_maps[0].lock().insert("key", b"value", "h_value");
+
+        let string_value = test_resource_ctx.manager.get_with_loader(
+            "key",
+            TestResLoader::new("key"),
+        ).await.expect("String resource should load for 'key'");
+        let id_value = test_resource_ctx.manager.get::<ResourceId>("key")
+            .await.expect("ResourceId resource should load for 'key'");
+
+        assert_eq!(*string_value.read(), "value".to_owned());
+        assert_eq!(*id_value.read(), ResourceId::from("key"));
+
+        let string_loader_key = res_key("key", &TestResLoader::new("key"));
+        let id_loader_key = res_key("key", &IdentityLoader);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&string_loader_key, 1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&id_loader_key, 1);
+    }
+
+    #[rstest]
     #[case::single(
-        DependencyGraph::builder().add("a", ["b"]).build(),
+        DependencyGraph::builder()
+            .add(
+                res_key("a", &ref_loader!(():TestResLoader::new("b"))),
+                [res_key("b", &TestResLoader::new("b"))]
+            )
+            .build(),
         [TestDataEntry::new("b", b"value", "h_value")],
         [ExpectedLoadInfo {
-            load_info: TestLoadInfo::new("a", TestRefLoader::new(TestResLoader::new("b"))),
+            load_info: TestLoadInfo::new("a", ref_loader!(():TestResLoader::new("b"))),
             expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec!["value"])),
         }],
-        2,
+        [
+            (res_key("a", &ref_loader!(():TestResLoader::new("b"))), 1),
+            (res_key("b", &TestResLoader::new("b")), 1),
+        ],
     )]
     #[case::linear(
-        DependencyGraph::builder().add("a", ["b"]).add("b", ["c"]).build(),
+        DependencyGraph::builder()
+            .add(
+                res_key("a", &ref_loader!(():():TestResLoader::new("c"))),
+                [res_key("b", &ref_loader!(():TestResLoader::new("c")))]
+            )
+            .add(
+                res_key("b", &ref_loader!(():TestResLoader::new("c"))),
+                [res_key("c", &TestResLoader::new("c"))]
+            )
+            .build(),
         [TestDataEntry::new("c", b"value", "h_value")],
         [ExpectedLoadInfo {
-            load_info: TestLoadInfo::new(
-                "a",
-                TestRefLoader::new(TestRefLoader::new(TestResLoader::new("c"))),
-            ),
+            load_info: TestLoadInfo::new("a", ref_loader!(():():TestResLoader::new("c"))),
             expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec![
                 ExpectedResourceRef::new(vec!["value"]),
             ])),
         }],
-        3,
+        [
+            (res_key("a", &ref_loader!(():():TestResLoader::new("c"))), 1),
+            (res_key("b", &ref_loader!(():TestResLoader::new("c"))), 1),
+            (res_key("c", &TestResLoader::new("c")), 1),
+        ],
     )]
     #[case::tree(
         DependencyGraph::builder()
-            .add("a1", ["b1", "b2"]).add("a2", ["b1", "b2"])
-            .add("b1", ["c1", "c2"]).add("b2", ["c2", "c3"])
+            .add(
+                res_key("a1", &ref_loader!(():():StringLoader)),
+                [
+                    res_key("b1", &ref_loader!(():StringLoader)),
+                    res_key("b2", &ref_loader!(():StringLoader)),
+                ],
+            )
+            .add(
+                res_key("a2", &ref_loader!(():():StringLoader)),
+                [
+                    res_key("b1", &ref_loader!(():StringLoader)),
+                    res_key("b2", &ref_loader!(():StringLoader)),
+                ],
+            )
+            .add(
+                res_key("b1", &ref_loader!(():StringLoader)),
+                [
+                    res_key("c1", &StringLoader),
+                    res_key("c2", &StringLoader),
+                ],
+            )
+            .add(
+                res_key("b2", &ref_loader!(():StringLoader)),
+                [
+                    res_key("c2", &StringLoader),
+                    res_key("c3", &StringLoader),
+                ],
+            )
             .build(),
         [
             TestDataEntry::new("c1", b"value1", "h_c1"),
@@ -1417,32 +1738,45 @@ mod tests {
         ],
         [
             ExpectedLoadInfo {
-                load_info: TestLoadInfo::new(
-                    "a1",
-                    TestRefLoader::new(TestRefLoader::new(StringLoader::default())),
-                ),
+                load_info: TestLoadInfo::new("a1", ref_loader!(():():StringLoader)),
                 expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec![
                     ExpectedResourceRef::new(vec!["value1", "value2"]),
                     ExpectedResourceRef::new(vec!["value2", "value3"]),
                 ])),
             },
             ExpectedLoadInfo {
-                load_info: TestLoadInfo::new(
-                    "a2",
-                    TestRefLoader::new(TestRefLoader::new(StringLoader::default())),
-                ),
+                load_info: TestLoadInfo::new("a2", ref_loader!(():():StringLoader)),
                 expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec![
                     ExpectedResourceRef::new(vec!["value1", "value2"]),
                     ExpectedResourceRef::new(vec!["value2", "value3"]),
                 ])),
             },
         ],
-        7,
+        [
+            // TestRefLoader returns resources that hold a reference to their sub-resource,
+            // preventing them from expiring. This means all loads should be cached.
+            (res_key("a1", &ref_loader!(():():StringLoader)), 1),
+            (res_key("a2", &ref_loader!(():():StringLoader)), 1),
+            (res_key("b1", &ref_loader!(():StringLoader)), 1),
+            (res_key("b2", &ref_loader!(():StringLoader)), 1),
+            (res_key("c1", &StringLoader), 1),
+            (res_key("c2", &StringLoader), 1),
+            (res_key("c3", &StringLoader), 1),
+        ],
     )]
     #[case::diamond(
         DependencyGraph::builder()
-            .add("a", ["b1", "b2", "b3"])
-            .add("b1", ["c"]).add("b2", ["c"]).add("b3", ["c"])
+            .add(
+                res_key("a", &TestResChainLoader),
+                [
+                    res_key("b1", &TestResChainLoader),
+                    res_key("b2", &TestResChainLoader),
+                    res_key("b3", &TestResChainLoader),
+                ],
+            )
+            .add(res_key("b1", &TestResChainLoader), [res_key("c", &TestResChainLoader)])
+            .add(res_key("b2", &TestResChainLoader), [res_key("c", &TestResChainLoader)])
+            .add(res_key("b3", &TestResChainLoader), [res_key("c", &TestResChainLoader)])
             .build(),
         [TestDataEntry::new("c", b"value", "h_c")],
         [ExpectedLoadInfo {
@@ -1453,7 +1787,14 @@ mod tests {
                 "a:b3:c:value",
             ]),
         }],
-        6, // TestResChainLoader attempts to load 'value' as well, generating an extra load count
+        [
+            (res_key("a", &TestResChainLoader), 1),
+            (res_key("b1", &TestResChainLoader), 1),
+            (res_key("b2", &TestResChainLoader), 1),
+            (res_key("b3", &TestResChainLoader), 1),
+            // Even though b1..b3 loads this, it _should_ be cached during the overall "a" load
+            (res_key("c", &TestResChainLoader), 1),
+        ],
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_dependencies<L, A>(
@@ -1461,7 +1802,7 @@ mod tests {
         #[case] expected_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
         #[case] expected_entries: impl IntoIterator<Item=ExpectedLoadInfo<L, A>>,
-        #[case] expected_load_count: usize,
+        #[case] expected_load_counts: impl IntoIterator<Item=(BoxedResKey, usize)>,
     )
     where
         L: ResourceLoader,
@@ -1484,9 +1825,11 @@ mod tests {
             ).await;
             values.push(entry.expected.assert_matches(result));
         }
-        test_resource_ctx.manager.test_ctx().sync_load.assert_count(expected_load_count);
 
         assert_eq!(&*test_resource_ctx.manager.dependencies.read(), &expected_graph);
+        for (key, expected_count) in expected_load_counts.into_iter() {
+            test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, expected_count);
+        }
 
         // Drop any held resources and check again
         drop(values);
@@ -1494,11 +1837,12 @@ mod tests {
     }
 
     #[derive(Default)]
-    pub struct TestResourceCyclicRefLoader(());
+    pub struct TestResourceCyclicRefLoader;
 
     #[async_trait]
     impl ResourceLoader for TestResourceCyclicRefLoader {
         type Output = ();
+        type Key = ();
 
         async fn load(
             &self,
@@ -1515,6 +1859,9 @@ mod tests {
 
             Ok(Box::new(()))
         }
+
+        #[inline(always)]
+        fn key(&self) -> Self::Key { () }
     }
 
     #[rstest]
@@ -1530,16 +1877,18 @@ mod tests {
             data_map.insert("d", b"b", "h_d");
         }
 
-        let err = test_resource_ctx.manager.get_with_loader("a", TestResourceCyclicRefLoader::default()).await
+        let err = test_resource_ctx.manager.get_with_loader("a", TestResourceCyclicRefLoader).await
             .expect_err("Cyclic load should be detected");
-        assert_matches!(err, ResourceLoadError::CyclicLoad { parents, id } => {
-            assert_eq!(id, ResourceId::from("b"));
-            assert_eq!(parents, vec![
-                ResourceId::from("a"),
-                ResourceId::from("b"),
-                ResourceId::from("c"),
-                ResourceId::from("d"),
-            ]);
+        let expected_key = res_key("b", &TestResourceCyclicRefLoader);
+        let expected_parents = [
+            res_key("a", &TestResourceCyclicRefLoader),
+            res_key("b", &TestResourceCyclicRefLoader),
+            res_key("c", &TestResourceCyclicRefLoader),
+            res_key("d", &TestResourceCyclicRefLoader),
+        ].into_iter().collect::<HashSet<_>>();
+        assert_matches!(err, ResourceLoadError::CyclicLoad { parents, key } => {
+            assert_eq!(&key, &expected_key);
+            assert_eq!(parents, expected_parents);
         });
     }
 }

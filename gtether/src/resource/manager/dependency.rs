@@ -10,6 +10,7 @@ use educe::Educe;
 use std::iter::FusedIterator;
 
 use crate::resource::id::ResourceId;
+use crate::resource::{BoxedResKey, ResKey};
 
 /// A graph of dependency relations between resources.
 ///
@@ -20,9 +21,11 @@ use crate::resource::id::ResourceId;
 #[derive(Educe, Default, Clone, PartialEq, Eq)]
 #[educe(Debug)]
 pub struct DependencyGraph {
-    dependencies: HashMap<ResourceId, HashSet<ResourceId>>,
-    #[educe(Debug(ignore))]
-    dependents: HashMap<ResourceId, HashSet<ResourceId>>,
+    dependencies: HashMap<Box<dyn ResKey>, HashSet<Box<dyn ResKey>>>,
+    //#[educe(Debug(ignore))]
+    dependents: HashMap<Box<dyn ResKey>, HashSet<Box<dyn ResKey>>>,
+    //#[educe(Debug(ignore))]
+    key_map: HashMap<ResourceId, HashSet<Box<dyn ResKey>>>,
 }
 
 impl DependencyGraph {
@@ -37,30 +40,53 @@ impl DependencyGraph {
     /// Clear all dependency relations for a particular resource in this graph.
     ///
     /// ```
-    /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
     ///
-    /// let mut graph = DependencyGraph::builder().add("a", ["b", "c"]).add("b", ["c"]).build();
-    /// let expected_graph = DependencyGraph::builder().add("b", ["c"]).build();
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
     ///
-    /// let id = ResourceId::from("a");
-    /// graph.clear_dependencies(&id);
+    /// let mut graph = DependencyGraph::builder()
+    ///     .add(&a, [&b, &c])
+    ///     .add(&b, [&c])
+    ///     .build();
+    /// let expected_graph = DependencyGraph::builder()
+    ///     .add(&b, [&c])
+    ///     .build();
+    ///
+    /// graph.clear_dependencies(&a);
     /// assert_eq!(graph, expected_graph);
-    /// assert_eq!(graph.get(&id), None);
+    /// assert_eq!(graph.get(&a), None);
     /// ```
-    pub fn clear_dependencies(&mut self, id: &ResourceId) {
-        if let Some(dependencies) = self.dependencies.remove(id) {
+    pub fn clear_dependencies(&mut self, key: impl AsRef<dyn ResKey>) {
+        let key = key.as_ref();
+        if let Some(dependencies) = self.dependencies.remove(key) {
             for dependency in dependencies {
                 let mut remove = false;
                 if let Some(dependents) = self.dependents.get_mut(&dependency) {
-                    dependents.remove(id);
+                    dependents.remove(key);
                     if dependents.is_empty() {
                         remove = true;
                     }
                 }
                 if remove {
                     self.dependents.remove(&dependency);
+                    if !self.dependencies.contains_key(&dependency)
+                        && let Some(keys) = self.key_map.get_mut(&dependency.id())
+                    {
+                        keys.remove(&dependency);
+                        if keys.is_empty() {
+                            self.key_map.remove(&dependency.id());
+                        }
+                    }
                 }
+            }
+        }
+        if let Some(keys) = self.key_map.get_mut(&key.id()) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.key_map.remove(&key.id());
             }
         }
     }
@@ -68,46 +94,77 @@ impl DependencyGraph {
     /// Add a dependency relation for a particular resource in this graph.
     ///
     /// ```
-    /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
     ///
-    /// let mut graph = DependencyGraph::builder().add("a", ["b"]).build();
-    /// let expected_graph = DependencyGraph::builder().add("a", ["b", "c"]).build();
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
     ///
-    /// graph.add_dependency(ResourceId::from("a"), ResourceId::from("c"));
+    /// let mut graph = DependencyGraph::builder().add(&a, [&b]).build();
+    /// let expected_graph = DependencyGraph::builder().add(&a, [&b, &c]).build();
+    ///
+    /// graph.add_dependency(&a, &c);
     /// assert_eq!(graph, expected_graph);
     /// ```
-    pub fn add_dependency(&mut self, id: ResourceId, dependency: ResourceId) {
-        self.dependencies.entry(id.clone())
+    pub fn add_dependency(&mut self, key: impl AsRef<dyn ResKey>, dependency: impl AsRef<dyn ResKey>) {
+        let key = key.as_ref();
+        let dependency = dependency.as_ref();
+        self.dependencies.entry(key.to_box())
             .or_default()
-            .insert(dependency.clone());
-        self.dependents.entry(dependency)
+            .insert(dependency.to_box());
+        self.dependents.entry(dependency.to_box())
             .or_default()
-            .insert(id);
+            .insert(key.to_box());
+        self.key_map.entry(key.id())
+            .or_default()
+            .insert(key.to_box());
+        self.key_map.entry(dependency.id())
+            .or_default()
+            .insert(dependency.to_box());
     }
 
     /// Set the dependency relations for a particular resource in this graph.
     ///
     /// ```
-    /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
     ///
-    /// let mut graph = DependencyGraph::builder().add("a", ["b", "c"]).build();
-    /// let expected_graph = DependencyGraph::builder().add("a", ["d", "e"]).build();
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
+    /// let d = res_key("d", &IdentityLoader);
+    /// let e = res_key("e", &IdentityLoader);
     ///
-    /// graph.set_dependencies(ResourceId::from("a"), [ResourceId::from("d"), ResourceId::from("e")]);
+    /// let mut graph = DependencyGraph::builder().add(&a, [&b, &c]).build();
+    /// let expected_graph = DependencyGraph::builder().add(&a, [&d, &e]).build();
+    ///
+    /// graph.set_dependencies(&a, [&d, &e]);
     /// assert_eq!(graph, expected_graph);
     /// ```
-    pub fn set_dependencies(&mut self, id: ResourceId, dependencies: impl IntoIterator<Item=ResourceId>) {
-        self.clear_dependencies(&id);
-        let dependencies = dependencies.into_iter().collect::<HashSet<ResourceId>>();
+    pub fn set_dependencies(
+        &mut self,
+        key: impl AsRef<dyn ResKey>,
+        dependencies: impl IntoIterator<Item=impl AsRef<dyn ResKey>>,
+    ) {
+        let key = key.as_ref();
+        self.clear_dependencies(key);
+        let dependencies = dependencies.into_iter()
+            .map(|k| k.as_ref().to_box())
+            .collect::<HashSet<_>>();
         if !dependencies.is_empty() {
             for dependency in &dependencies {
-                self.dependents.entry(dependency.clone())
+                self.dependents.entry(dependency.to_box())
                     .or_default()
-                    .insert(id.clone());
+                    .insert(key.to_box());
+                self.key_map.entry(dependency.id())
+                    .or_default()
+                    .insert(dependency.to_box());
             }
-            self.dependencies.insert(id, dependencies);
+            self.dependencies.insert(key.to_box(), dependencies);
+            self.key_map.entry(key.id())
+                .or_default()
+                .insert(key.to_box());
         }
     }
 
@@ -117,32 +174,87 @@ impl DependencyGraph {
     /// graph, and so this method will return `None`.
     ///
     /// ```
-    /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
     ///
-    /// let graph = DependencyGraph::builder().add("a", ["b"]).build();
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
     ///
-    /// let id_a = ResourceId::from("a");
-    /// let id_b = ResourceId::from("b");
-    /// let id_c = ResourceId::from("c");
+    /// let graph = DependencyGraph::builder().add(&a, [&b]).build();
     ///
-    /// assert_eq!(graph.get(&id_a).unwrap().id(), &id_a);
-    /// assert_eq!(graph.get(&id_b).unwrap().id(), &id_b);
-    /// assert_eq!(graph.get(&id_c), None);
+    /// assert_eq!(graph.get(&a).unwrap().key(), &*a);
+    /// assert_eq!(graph.get(&b).unwrap().key(), &*b);
+    /// assert_eq!(graph.get(&c), None);
     /// ```
-    pub fn get(&self, id: &ResourceId) -> Option<DependencyNode<'_>> {
-        if let Some((id, _)) = self.dependencies.get_key_value(id) {
+    pub fn get(&self, key: impl AsRef<dyn ResKey>) -> Option<DependencyNode<'_>> {
+        let key = key.as_ref();
+        if let Some((key, _)) = self.dependencies.get_key_value(key) {
             Some(DependencyNode {
                 graph: self,
-                id,
+                key: &**key,
             })
-        } else if let Some((id, _)) = self.dependents.get_key_value(id) {
+        } else if let Some((key, _)) = self.dependents.get_key_value(key) {
             Some(DependencyNode {
                 graph: self,
-                id,
+                key: &**key,
             })
         } else {
             None
+        }
+    }
+
+    /// Get all known resource [keys](ResKey) for a particular [ID](ResourceId).
+    ///
+    /// ```
+    /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
+    /// use std::collections::HashSet;
+    ///
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    ///
+    /// let mut graph = DependencyGraph::builder().add(&a, [&b]).build();
+    ///
+    /// assert_eq!(HashSet::<_>::from_iter(graph.keys_for_id("a")), HashSet::from([&a]));
+    /// graph.clear_dependencies(&a);
+    /// assert_eq!(HashSet::<_>::from_iter(graph.keys_for_id("a")), HashSet::from([]));
+    /// ```
+    #[inline]
+    pub fn keys_for_id(
+        &self,
+        id: impl Into<ResourceId>,
+    ) -> std::collections::hash_set::Iter<'_, Box<dyn ResKey>> {
+        if let Some(keys) = self.key_map.get(&id.into()) {
+            keys.iter()
+        } else {
+            Default::default()
+        }
+    }
+
+    /// Iterate over all nodes in the graph that have the given [ID](ResourceId).
+    ///
+    /// ```
+    /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
+    /// use std::collections::HashSet;
+    ///
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    ///
+    /// let graph = DependencyGraph::builder().add(&a, [&b]).build();
+    /// let expected_keys = HashSet::from([a.clone()]);
+    ///
+    /// let keys = graph.iter()
+    ///     .map(|node| node.key().to_box())
+    ///     .collect::<HashSet<_>>();
+    /// assert_eq!(keys, expected_keys);
+    /// ```
+    #[inline]
+    pub fn nodes_for_id(&self, id: impl Into<ResourceId>) -> NodesForId<'_> {
+        NodesForId {
+            graph: self,
+            keys: self.keys_for_id(id),
         }
     }
 
@@ -153,18 +265,20 @@ impl DependencyGraph {
     ///
     /// ```
     /// use std::collections::HashSet;
-    /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
     ///
-    /// let graph = DependencyGraph::builder().add("a", ["b", "c"]).add("b", ["c"]).build();
-    /// let expected_ids = ["a", "b"].into_iter()
-    ///     .map(ResourceId::from)
-    ///     .collect::<HashSet<_>>();
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
     ///
-    /// let ids = graph.iter()
-    ///     .map(|node| node.id().clone())
+    /// let graph = DependencyGraph::builder().add(&a, [&b, &c]).add(&b, [&c]).build();
+    /// let expected_keys = HashSet::from([a.clone(), b.clone()]);
+    ///
+    /// let keys = graph.iter()
+    ///     .map(|node| node.key().to_box())
     ///     .collect::<HashSet<_>>();
-    /// assert_eq!(ids, expected_ids);
+    /// assert_eq!(keys, expected_keys);
     /// ```
     #[inline]
     pub fn iter(&self) -> Iter<'_> {
@@ -175,13 +289,40 @@ impl DependencyGraph {
     }
 }
 
+/// Iterator for all [nodes](DependencyNode) for a given [ID](ResourceId).
+///
+/// See [`DependencyGraph::nodes_for_id()`].
+pub struct NodesForId<'a> {
+    graph: &'a DependencyGraph,
+    keys: std::collections::hash_set::Iter<'a, Box<dyn ResKey>>,
+}
+
+impl<'a> Iterator for NodesForId<'a> {
+    type Item = DependencyNode<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let key = self.keys.next()?;
+            if let Some(node) = self.graph.get(key) {
+                return Some(node)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.keys.len()))
+    }
+}
+
+impl<'a> FusedIterator for NodesForId<'a> {}
+
 /// Iterator for all [DependencyNodes](DependencyNode) in a [DependencyGraph].
 ///
 /// See [`DependencyGraph::iter()`].
 #[derive(Debug, Clone)]
 pub struct Iter<'a> {
     graph: &'a DependencyGraph,
-    inner: std::collections::hash_map::Keys<'a, ResourceId, HashSet<ResourceId>>,
+    inner: std::collections::hash_map::Keys<'a, Box<dyn ResKey>, HashSet<Box<dyn ResKey>>>,
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -189,9 +330,9 @@ impl<'a> Iterator for Iter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|id| DependencyNode {
+        self.inner.next().map(|key| DependencyNode {
             graph: self.graph,
-            id,
+            key: &**key,
         })
     }
 
@@ -216,7 +357,7 @@ impl<'a> FusedIterator for Iter<'a> {}
 pub struct DependencyNode<'a> {
     #[educe(Debug(ignore))]
     graph: &'a DependencyGraph,
-    id: &'a ResourceId,
+    key: &'a dyn ResKey,
 }
 
 impl<'a> PartialEq for DependencyNode<'a> {
@@ -224,23 +365,23 @@ impl<'a> PartialEq for DependencyNode<'a> {
         if !std::ptr::eq(self.graph, other.graph) {
             return false
         }
-        self.id == other.id
+        self.key == other.key
     }
 }
 
 impl<'a> Eq for DependencyNode<'a> {}
 
 impl<'a> DependencyNode<'a> {
-    /// The [ResourceId] for this particular node.
+    /// The [key](DepKey) for this particular node.
     #[inline]
-    pub fn id(&self) -> &'a ResourceId {
-        self.id
+    pub fn key(&self) -> &'a dyn ResKey {
+        self.key
     }
 
     /// Whether this node is a root node (has no dependents).
     #[inline]
     pub fn is_root(&self) -> bool {
-        if let Some(dependents) = self.graph.dependents.get(self.id) {
+        if let Some(dependents) = self.graph.dependents.get(self.key) {
             dependents.is_empty()
         } else {
             true
@@ -250,7 +391,7 @@ impl<'a> DependencyNode<'a> {
     /// Whether this node is a leaf node (has no dependencies).
     #[inline]
     pub fn is_leaf(&self) -> bool {
-        if let Some(dependencies) = self.graph.dependencies.get(self.id) {
+        if let Some(dependencies) = self.graph.dependencies.get(self.key) {
             dependencies.is_empty()
         } else {
             true
@@ -266,33 +407,38 @@ impl<'a> DependencyNode<'a> {
     /// use std::collections::HashSet;
     /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
     ///
-    /// let graph = DependencyGraph::builder().add("a", ["b", "c"]).add("b", ["d"]).build();
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
+    /// let d = res_key("d", &IdentityLoader);
+    ///
+    /// let graph = DependencyGraph::builder()
+    ///     .add(&a, [&b, &c])
+    ///     .add(&b, [&d])
+    ///     .build();
     ///
     /// // Flat
-    /// let expected_ids = ["b", "c"].into_iter()
-    ///     .map(ResourceId::from)
-    ///     .collect::<HashSet<_>>();
-    /// let ids = graph.get(&ResourceId::from("a")).unwrap()
+    /// let expected_keys = HashSet::from([b.clone(), c.clone()]);
+    /// let keys = graph.get(&a).unwrap()
     ///     .dependencies()
-    ///     .map(|node| node.id().clone())
+    ///     .map(|node| node.key().to_box())
     ///     .collect::<HashSet<_>>();
-    /// assert_eq!(ids, expected_ids);
+    /// assert_eq!(keys, expected_keys);
     ///
     /// // Recursive
-    /// let expected_ids = ["b", "c", "d"].into_iter()
-    ///     .map(ResourceId::from)
-    ///     .collect::<HashSet<_>>();
-    /// let ids = graph.get(&ResourceId::from("a")).unwrap()
+    /// let expected_keys = HashSet::from([b.clone(), c.clone(), d.clone()]);
+    /// let keys = graph.get(&a).unwrap()
     ///     .dependencies()
     ///     .recursive()
-    ///     .map(|node| node.id().clone())
+    ///     .map(|node| node.key().to_box())
     ///     .collect::<HashSet<_>>();
-    /// assert_eq!(ids, expected_ids);
+    /// assert_eq!(keys, expected_keys);
     /// ```
     #[inline]
     pub fn dependencies(&self) -> NodeIter<'a> {
-        if let Some(dependencies) = self.graph.dependencies.get(self.id) {
+        if let Some(dependencies) = self.graph.dependencies.get(self.key) {
             NodeIter {
                 graph: self.graph,
                 inner: dependencies.iter(),
@@ -316,37 +462,39 @@ impl<'a> DependencyNode<'a> {
     /// use std::collections::HashSet;
     /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
+    ///
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
+    /// let d = res_key("d", &IdentityLoader);
     ///
     /// let graph = DependencyGraph::builder()
-    ///     .add("a", ["b"])
-    ///     .add("b", ["d"])
-    ///     .add("c", ["d"])
+    ///     .add(&a, [&b])
+    ///     .add(&b, [&d])
+    ///     .add(&c, [&d])
     ///     .build();
     ///
     /// // Flat
-    /// let expected_ids = ["b", "c"].into_iter()
-    ///     .map(ResourceId::from)
-    ///     .collect::<HashSet<_>>();
-    /// let ids = graph.get(&ResourceId::from("d")).unwrap()
+    /// let expected_keys = HashSet::from([b.clone(), c.clone()]);
+    /// let keys = graph.get(&d).unwrap()
     ///     .dependents()
-    ///     .map(|node| node.id().clone())
+    ///     .map(|node| node.key().to_box())
     ///     .collect::<HashSet<_>>();
-    /// assert_eq!(ids, expected_ids);
+    /// assert_eq!(keys, expected_keys);
     ///
     /// // Recursive
-    /// let expected_ids = ["a", "b", "c"].into_iter()
-    ///     .map(ResourceId::from)
-    ///     .collect::<HashSet<_>>();
-    /// let ids = graph.get(&ResourceId::from("d")).unwrap()
+    /// let expected_keys = HashSet::from([a.clone(), b.clone(), c.clone()]);
+    /// let keys = graph.get(&d).unwrap()
     ///     .dependents()
     ///     .recursive()
-    ///     .map(|node| node.id().clone())
+    ///     .map(|node| node.key().to_box())
     ///     .collect::<HashSet<_>>();
-    /// assert_eq!(ids, expected_ids);
+    /// assert_eq!(keys, expected_keys);
     /// ```
     #[inline]
     pub fn dependents(&self) -> NodeIter<'a> {
-        if let Some(dependents) = self.graph.dependents.get(self.id) {
+        if let Some(dependents) = self.graph.dependents.get(self.key) {
             NodeIter {
                 graph: self.graph,
                 inner: dependents.iter(),
@@ -374,7 +522,7 @@ enum NodeIterDirection {
 #[derive(Debug, Clone)]
 pub struct NodeIter<'a> {
     graph: &'a DependencyGraph,
-    inner: std::collections::hash_set::Iter<'a, ResourceId>,
+    inner: std::collections::hash_set::Iter<'a, Box<dyn ResKey>>,
     direction: NodeIterDirection,
 }
 
@@ -399,9 +547,9 @@ impl<'a> Iterator for NodeIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|id| DependencyNode {
+        self.inner.next().map(|key| DependencyNode {
             graph: self.graph,
-            id,
+            key: &**key,
         })
     }
 
@@ -460,12 +608,20 @@ impl<'a> FusedIterator for NodeRecursiveIter<'a> {}
 ///
 /// # Examples
 /// ```
+/// use gtether::resource::id::ResourceId;
 /// use gtether::resource::manager::dependency::DependencyGraph;
+/// use gtether::resource::{IdentityLoader, res_key};
+///
+/// let a = res_key("a", &IdentityLoader);
+/// let b = res_key("b", &IdentityLoader);
+/// let c = res_key("c", &IdentityLoader);
+/// let d = res_key("d", &IdentityLoader);
+/// let e = res_key("e", &IdentityLoader);
 ///
 /// let graph = DependencyGraph::builder()
-///     .add("a", ["b", "c"])
-///     .add("b", ["d"])
-///     .add("c", ["d", "e"])
+///     .add(&a, [&b, &c])
+///     .add(&b, [&d])
+///     .add(&c, [&d, &e])
 ///     .build();
 /// ```
 #[derive(Default)]
@@ -476,24 +632,30 @@ pub struct DependencyGraphBuilder {
 impl DependencyGraphBuilder {
     /// Add a dependency relation.
     ///
-    /// Overrides any existing relation for the given `id`.
+    /// Overrides any existing relation for the given `key`.
     ///
     /// ```
+    /// use gtether::resource::id::ResourceId;
     /// use gtether::resource::manager::dependency::DependencyGraph;
+    /// use gtether::resource::{IdentityLoader, res_key};
+    ///
+    /// let a = res_key("a", &IdentityLoader);
+    /// let b = res_key("b", &IdentityLoader);
+    /// let c = res_key("c", &IdentityLoader);
     ///
     /// let graph = DependencyGraph::builder()
     ///     // "a" depends on both "b" and "c"
-    ///     .add("a", ["b", "c"])
+    ///     .add(a, [b, c])
     ///     .build();
     /// ```
     #[inline]
     pub fn add(
         &mut self,
-        id: impl Into<ResourceId>,
-        dependencies: impl IntoIterator<Item=impl Into<ResourceId>>,
+        key: impl AsRef<dyn ResKey>,
+        dependencies: impl IntoIterator<Item=impl Into<BoxedResKey>>,
     ) -> &mut Self {
         self.graph.set_dependencies(
-            id.into(),
+            key,
             dependencies.into_iter().map(Into::into),
         );
         self
@@ -507,38 +669,41 @@ impl DependencyGraphBuilder {
 }
 
 pub(in crate::resource) struct DependencyGraphLayer {
-    parents: Vec<ResourceId>,
-    id: ResourceId,
-    dependencies: HashSet<ResourceId>,
+    parents: Vec<Box<dyn ResKey>>,
+    key: Box<dyn ResKey>,
+    dependencies: HashSet<Box<dyn ResKey>>,
 }
 
 impl DependencyGraphLayer {
     #[inline]
-    pub fn new(id: ResourceId, parents: impl IntoIterator<Item=ResourceId>) -> Self {
+    pub fn new(
+        key: Box<dyn ResKey>,
+        parents: impl IntoIterator<Item=impl Into<Box<dyn ResKey>>>,
+    ) -> Self {
         Self {
-            parents: parents.into_iter().collect(),
-            id,
+            parents: parents.into_iter().map(Into::into).collect(),
+            key,
             dependencies: Default::default(),
         }
     }
 
     #[inline]
-    pub fn parents(&self) -> std::slice::Iter<'_, ResourceId> {
+    pub fn parents(&self) -> std::slice::Iter<'_, Box<dyn ResKey>> {
         self.parents.iter()
     }
 
     #[inline]
-    pub fn id(&self) -> &ResourceId {
-        &self.id
+    pub fn key(&self) -> &dyn ResKey {
+        &*self.key
     }
 
     #[inline]
-    pub fn insert(&mut self, dependency: ResourceId) {
+    pub fn insert(&mut self, dependency: Box<dyn ResKey>) {
         self.dependencies.insert(dependency);
     }
 
     #[inline]
     pub fn apply(self, graph: &mut DependencyGraph) {
-        graph.set_dependencies(self.id, self.dependencies);
+        graph.set_dependencies(&self.key, self.dependencies);
     }
 }

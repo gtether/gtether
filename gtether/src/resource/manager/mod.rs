@@ -46,9 +46,11 @@
 //! # #[async_trait]
 //! # impl ResourceLoader for MyLoader {
 //! #     type Output = ();
+//! #     type Key = ();
 //! #     async fn load(&self, data: ResourceReadData, ctx: &ResourceLoadContext) -> Result<Box<()>, ResourceLoadError> {
 //! #         Ok(Box::new(()))
 //! #     }
+//! #     fn key(&self) -> Self::Key { () }
 //! # }
 //! #
 //! # let workers = WorkerPool::single().start();
@@ -74,9 +76,11 @@
 //! # #[async_trait]
 //! # impl ResourceLoader for MyLoader {
 //! #     type Output = ();
+//! #     type Key = ();
 //! #     async fn load(&self, data: ResourceReadData, ctx: &ResourceLoadContext) -> Result<Box<()>, ResourceLoadError> {
 //! #         Ok(Box::new(()))
 //! #     }
+//! #     fn key(&self) -> Self::Key { () }
 //! # }
 //! #
 //! # let workers = WorkerPool::single().start();
@@ -142,7 +146,7 @@
 //! [res]: Resource
 //! [rp]: ResourceId
 //! [rf]: ResourceFutureOld
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -177,7 +181,6 @@ pub use load::{
     ResourceLoadFuture,
 };
 pub use task::{FallibleManagerTask, ManagerTask};
-pub use update::ResourceUpdateFuture;
 
 /// Centralized management of resource loading and caching.
 ///
@@ -316,7 +319,7 @@ impl ResourceManager {
         let load_params = ResourceLoadParams {
             loader: Arc::new(loader),
             priority: load_priority.into(),
-            parents: vec![],
+            parents: HashSet::default(),
             resource_cache: Arc::new(RwLock::new(HashMap::default())),
             operation: ResourceLoadOperation::Load,
         };
@@ -446,7 +449,6 @@ impl<'a> ResourceManagerBuilder<'a> {
             executor.clone(),
             sources.clone(),
             dependencies.clone(),
-            update_manager.updates().clone(),
             #[cfg(test)]
             test_ctx.sync_load.clone(),
         );
@@ -456,7 +458,11 @@ impl<'a> ResourceManagerBuilder<'a> {
             cache.clone(),
             dependencies.clone(),
             #[cfg(test)]
-            test_ctx.sync_update.clone(),
+            Arc::new(update::UpdateManagerSyncContext {
+                load: test_ctx.sync_load.clone(),
+                update_block: test_ctx.sync_update_block.clone(),
+                update: test_ctx.sync_update.clone(),
+            }),
         );
 
         Arc::new(ResourceManager {
@@ -481,6 +487,7 @@ pub mod tests {
     use ahash::HashMap;
     use async_trait::async_trait;
     use educe::Educe;
+    use futures_core::future::BoxFuture;
     use itertools::Itertools;
     use macro_rules_attribute::apply;
     use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
@@ -488,13 +495,16 @@ pub mod tests {
     use smol::prelude::*;
     use smol::Timer;
     use smol_macros::test as smol_test;
+    use std::borrow::Borrow;
+    use std::hash::Hash;
+    use std::ops::RangeBounds;
     use std::time::Duration;
-    use futures_core::future::BoxFuture;
     use test_log::test as test_log;
+    use tracing::trace;
 
     use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdate};
     use crate::resource::watcher::{ResourceHashProvider, ResourceWatcher};
-    use crate::resource::{Resource, ResourceLoadError, ResourceLoadResult, ResourceLoaderDefault, ResourceReadData};
+    use crate::resource::{BoxedResKey, Resource, ResourceLoadError, ResourceLoadResult, ResourceLoaderDefault, ResourceReadData};
 
     pub(in crate::resource) async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -522,17 +532,28 @@ pub mod tests {
         assert_eq!(weak_executor.strong_count(), 0);
     }
 
-    pub struct SyncContextReadGuard<'a>{
+    pub struct SyncContextReadGuard<'a, K: Debug + Clone + Eq + Hash>{
+        name: &'a str,
+        key: K,
         #[allow(unused)]
         inner: smol::lock::RwLockReadGuard<'a, ()>,
-        count: &'a Mutex<(usize, usize)>,
+        counts: &'a Mutex<HashMap<K, (usize, usize)>>,
     }
 
-    impl Drop for SyncContextReadGuard<'_> {
+    impl<K: Debug + Clone + Eq + Hash> Drop for SyncContextReadGuard<'_, K> {
         fn drop(&mut self) {
-            let mut count = self.count.lock();
+            let mut counts = self.counts.lock();
+            let count = counts.entry(self.key.clone())
+                .or_default();
             count.0 += 1;
             count.1 += 1;
+            trace!(
+                name = ?self.name,
+                key = ?self.key,
+                attempts = %count.1,
+                count = %count.0,
+                "Incrementing SyncContext",
+            );
         }
     }
 
@@ -549,21 +570,21 @@ pub mod tests {
     /// execute, but otherwise bails (e.g. the resource doesn't need to be updated because hashes
     /// are the same). A 'count' is where a code block actually executes. Each 'count' also
     /// generates an 'attempt'.
-    pub struct SyncContext {
+    pub struct SyncContext<K> {
+        name: String,
         inner: smol::lock::RwLock<()>,
-        count: Mutex<(usize, usize)>,
+        counts: Mutex<HashMap<K, (usize, usize)>>,
     }
 
-    impl Default for SyncContext {
-        fn default() -> Self {
+    impl<K: Debug + Clone + Eq + Hash> SyncContext<K> {
+        pub fn new(name: impl Into<String>) -> Self {
             Self {
+                name: name.into(),
                 inner: smol::lock::RwLock::new(()),
-                count: Mutex::new((0, 0)),
+                counts: Default::default(),
             }
         }
-    }
 
-    impl SyncContext {
         /// Marks where the code segment is intended to run.
         ///
         /// The returned guard should be held for the duration of the code segment. When the guard
@@ -573,18 +594,20 @@ pub mod tests {
         /// use std::sync::Arc;
         /// use gtether::resource::manager::tests::SyncContext;
         ///
-        /// let sync_context = Arc::new(SyncContext::default());
+        /// let sync_context = Arc::new(SyncContext::<String>::new("some-context"));
         /// let async_sync_ctx = sync_context.clone();
         /// let fut = async move {
-        ///     let _guard = async_sync_ctx.run().await;
+        ///     let _guard = async_sync_ctx.run("section-a").await;
         ///
         ///     // execute relevant code...
         /// };
         /// ```
-        pub async fn run(&self) -> SyncContextReadGuard<'_> {
+        pub async fn run(&self, key: impl Into<K>) -> SyncContextReadGuard<'_, K> {
             SyncContextReadGuard {
+                name: &self.name,
+                key: key.into(),
                 inner: self.inner.read().await,
-                count: &self.count,
+                counts: &self.counts,
             }
         }
 
@@ -594,7 +617,7 @@ pub mod tests {
         /// use std::sync::Arc;
         /// use gtether::resource::manager::tests::SyncContext;
         ///
-        /// let sync_context = Arc::new(SyncContext::default());
+        /// let sync_context = Arc::new(SyncContext::new("some-context"));
         /// // Give a copy of `sync_context` to logic that needs to be tested...
         ///
         /// // In the test:
@@ -612,33 +635,100 @@ pub mod tests {
 
         /// Mark that an 'attempt' has been tried.
         #[inline]
-        pub fn mark_attempt(&self) {
-            self.count.lock().1 += 1;
+        pub fn mark_attempt(&self, key: impl Into<K>) {
+            self.counts.lock().entry(key.into())
+                .or_default()
+                .1 += 1;
         }
 
         /// Assert that 'count' equals a certain amount.
         #[inline]
-        pub fn assert_count(&self, count: usize) {
-            let actual = self.count.lock().0;
-            assert_eq!(self.count.lock().0, count, "Expected {count} executions; was actually {actual}");
+        pub fn assert_count<Q>(&self, k: &Q, count: usize)
+        where
+            K: Borrow<Q>,
+            Q: Debug + Eq + Hash + ?Sized,
+        {
+            let actual = self.counts.lock().get(k).cloned().unwrap_or_default().0;
+            assert_eq!(
+                actual, count,
+                "Expected {} \"{}\" executions for {:?}; was actually {}",
+                count,
+                &self.name,
+                k,
+                actual,
+            );
+        }
+
+        #[inline]
+        pub fn assert_count_range<Q>(&self, k: &Q, range: impl RangeBounds<usize> + Debug)
+        where
+            K: Borrow<Q>,
+            Q: Debug + Eq + Hash + ?Sized,
+        {
+            let actual = self.counts.lock().get(k).cloned().unwrap_or_default().0;
+            assert!(
+                range.contains(&actual),
+                "Expected {:?} \"{}\" executions for {:?}; was actually {}",
+                range,
+                &self.name,
+                k,
+                actual,
+            );
         }
 
         /// Assert that 'attempts' equals a certain amount.
         #[inline]
-        pub fn assert_attempts(&self, attempts: usize) {
-            assert_eq!(self.count.lock().1, attempts);
+        pub fn assert_attempts<Q>(&self, k: &Q, attempts: usize)
+        where
+            K: Borrow<Q>,
+            Q: Debug + Eq + Hash + ?Sized,
+        {
+            let actual = self.counts.lock().get(k).cloned().unwrap_or_default().1;
+            assert_eq!(
+                actual, attempts,
+                "Expected {} \"{}\" attempts for {:?}; was actually {}",
+                attempts,
+                &self.name,
+                k,
+                actual,
+            );
+        }
+
+        #[inline]
+        pub fn assert_attempts_range<Q>(&self, k: &Q, range: impl RangeBounds<usize> + Debug)
+        where
+            K: Borrow<Q>,
+            Q: Debug + Eq + Hash + ?Sized,
+        {
+            let actual = self.counts.lock().get(k).cloned().unwrap_or_default().1;
+            assert!(
+                range.contains(&actual),
+                "Expected {:?} \"{}\" attempts for {:?}; was actually {}",
+                range,
+                &self.name,
+                k,
+                actual,
+            );
         }
 
         /// Wait for 'count' to reach at least the given amount.
-        pub async fn wait_count(&self, count: usize) {
-            while self.count.lock().0 < count {
+        pub async fn wait_count<Q>(&self, k: &Q, count: usize)
+        where
+            K: Borrow<Q>,
+            Q: Eq + Hash + ?Sized,
+        {
+            while self.counts.lock().get(k).cloned().unwrap_or_default().0 < count {
                 Timer::after(Duration::from_millis(50)).await;
             }
         }
 
         /// Wait for 'attempts' to reach at least the given amount.
-        pub async fn wait_attempts(&self, attempts: usize) {
-            while self.count.lock().1 < attempts {
+        pub async fn wait_attempts<Q>(&self, k: &Q, attempts: usize)
+        where
+            K: Borrow<Q>,
+            Q: Eq + Hash + ?Sized,
+        {
+            while self.counts.lock().get(k).cloned().unwrap_or_default().1 < attempts {
                 Timer::after(Duration::from_millis(50)).await;
             }
         }
@@ -646,33 +736,45 @@ pub mod tests {
         /// Clear both 'count' and 'attempts'.
         #[inline]
         pub fn clear(&self) {
-            *self.count.lock() = (0, 0);
+            self.counts.lock().clear();
         }
     }
 
     /// Test context for the [ResourceManager].
     ///
     /// Bundles both a 'load' and 'update' [SyncContext].
-    #[derive(Default)]
     pub struct ResourceManagerTestContext {
-        pub sync_load: Arc<SyncContext>,
-        pub sync_update: Arc<SyncContext>,
+        pub sync_load: Arc<SyncContext<BoxedResKey>>,
+        pub sync_update_block: Arc<SyncContext<()>>,
+        pub sync_update: Arc<SyncContext<BoxedResKey>>,
+    }
+
+    impl Default for ResourceManagerTestContext {
+        fn default() -> Self {
+            Self {
+                sync_load: Arc::new(SyncContext::new("load")),
+                sync_update_block: Arc::new(SyncContext::new("update-block")),
+                sync_update: Arc::new(SyncContext::new("update")),
+            }
+        }
     }
 
     impl ResourceManagerTestContext {
         /// Clear all [SyncContexts](SyncContext).
         pub fn clear(&self) {
             self.sync_load.clear();
+            self.sync_update_block.clear();
             self.sync_update.clear();
         }
     }
 
     #[derive(Default, Clone)]
-    pub(in crate::resource) struct StringLoader(());
+    pub(in crate::resource) struct StringLoader;
 
     #[async_trait]
     impl ResourceLoader for StringLoader {
         type Output = String;
+        type Key = ();
 
         async fn load(
             &self,
@@ -683,6 +785,9 @@ pub mod tests {
             data.read_to_string(&mut output).await?;
             Ok(Box::new(output))
         }
+
+        #[inline(always)]
+        fn key(&self) -> Self::Key { () }
     }
 
     #[derive(Clone)]
@@ -702,14 +807,20 @@ pub mod tests {
     #[async_trait]
     impl ResourceLoader for TestResLoader {
         type Output = String;
+        type Key = ResourceId;
 
         async fn load(
             &self,
             data: ResourceReadData,
             ctx: &ResourceLoadContext,
         ) -> Result<Box<String>, ResourceLoadError> {
-            assert_eq!(ctx.id(), self.expected_id);
+            assert_eq!(ctx.key().id(), self.expected_id);
             StringLoader::default().load(data, ctx).await
+        }
+
+        #[inline]
+        fn key(&self) -> Self::Key {
+            self.expected_id
         }
     }
 
@@ -748,6 +859,7 @@ pub mod tests {
         L: ResourceLoader + Clone,
     {
         type Output = TestResRef<L::Output>;
+        type Key = L::Key;
 
         async fn load(
             &self,
@@ -769,14 +881,26 @@ pub mod tests {
                 resources,
             }))
         }
+
+        #[inline]
+        fn key(&self) -> Self::Key {
+            self.loader.key()
+        }
     }
 
+    macro_rules! ref_loader {
+        ( $final:expr ) => { $final };
+        ( ():$($rem:tt)* ) => { crate::resource::manager::tests::TestRefLoader::new(ref_loader!($($rem)*)) };
+    }
+    pub(in crate::resource) use ref_loader;
+
     #[derive(Default, Clone)]
-    pub(in crate::resource) struct TestResChainLoader(());
+    pub(in crate::resource) struct TestResChainLoader;
 
     #[async_trait]
     impl ResourceLoader for TestResChainLoader {
         type Output = Vec<String>;
+        type Key = ();
 
         async fn load(
             &self,
@@ -791,11 +915,11 @@ pub mod tests {
                 match ctx.get_with_loader(value, Self::default()).await {
                     Ok(resource) => {
                         for sub_value in &*resource.read() {
-                            values.push(ctx.id().to_string() + ":" + sub_value);
+                            values.push(ctx.key().id().to_string() + ":" + sub_value);
                         }
                     },
                     Err(ResourceLoadError::NotFound(_)) => {
-                        values.push(ctx.id().to_string() + ":" + value);
+                        values.push(ctx.key().id().to_string() + ":" + value);
                     },
                     Err(error) => return Err(error),
                 }
@@ -803,6 +927,9 @@ pub mod tests {
 
             Ok(Box::new(values))
         }
+
+        #[inline(always)]
+        fn key(&self) -> Self::Key { () }
     }
 
     #[derive(Debug)]
@@ -991,6 +1118,8 @@ pub mod tests {
     #[fixture]
     pub fn test_resource_ctx<const N: usize>() -> TestResourceContext<N> {
         let worker_pool = WorkerPool::<isize>::builder()
+            // 1 worker is important, as it allows us to avoid race conditions when checking
+            // specific details
             .worker_count(1.try_into().unwrap())
             .start();
 
@@ -1149,10 +1278,10 @@ pub mod tests {
 
         for node in dependency_graph.iter() {
             let dep_str = node.dependencies()
-                .map(|n| n.id())
+                .map(|n| n.key().id())
                 .sorted()
                 .join(":");
-            data_map.insert(node.id().clone(), dep_str.as_bytes(), format!("h_{}", node.id()));
+            data_map.insert(node.key().id(), dep_str.as_bytes(), format!("h_{}", node.key().id()));
         }
     }
 
@@ -1342,6 +1471,7 @@ pub mod tests {
 
         pub(in crate::resource) use super::{
             assert_manager_drops,
+            ref_loader,
             setup_dependency_data,
             timeout,
             BulkUpdate,
@@ -1350,9 +1480,9 @@ pub mod tests {
             ExpectedLoadResult,
             ExpectedResourceRef,
             StringLoader,
-            TestDataEntry,
+            TestDataEntry
+            ,
             TestLoadInfo,
-            TestRefLoader,
             TestResChainLoader,
             TestResLoader,
             Update,

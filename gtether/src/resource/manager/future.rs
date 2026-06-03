@@ -31,8 +31,8 @@ use std::task::{ready, Context, Poll, Waker};
 
 use crate::resource::id::ResourceId;
 use crate::resource::manager::load::{Cache, ResourceLoadParams};
-use crate::resource::manager::{ResourceLoadContext, ResourceLoadFuture, ResourceUpdateFuture};
-use crate::resource::{ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceLoaderDefault};
+use crate::resource::manager::{ResourceLoadContext, ResourceLoadFuture};
+use crate::resource::{ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceLoaderDefault};
 
 /// Condition for when to retry a load using other adapters.
 ///
@@ -224,9 +224,12 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     pub fn or_get(
         self,
         id: impl Into<ResourceId>,
-    ) -> ResourceFuture<'ctx, OrGetOrLoad<A, A::BaseLoader>>
+    ) -> ResourceFuture<'ctx, OrGetOrLoad<
+        A,
+        <<A::BaseLoader as ResourceLoader>::Output as ResourceDefaultLoader>::Loader,
+    >>
     where
-        A::BaseLoader: Clone,
+        <A::BaseLoader as ResourceLoader>::Output: ResourceDefaultLoader,
     {
         self.or_get_when(id, RetryIf::default())
     }
@@ -262,12 +265,12 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
     /// // This uses IdentityLoader based on ResourceDefaultLoader implemented for ResourceId
     /// let id = manager.get::<ResourceId>("a")
     ///     .or_get_when("b", RetryIf::NotFound)
-    ///     .await.expect("a resource should be found");
+    ///     .await.expect("resource 'b' should be found after 'a'");
     /// assert_eq!(*id.read(), ResourceId::from("b"));
     ///
     /// let id = manager.get_with_loader("b", ErrorLoader::<ResourceId>::default())
     ///     .or_get_when("b", RetryIf::ReadError)
-    ///     .await.expect("a resource should be found");
+    ///     .await.expect("resource 'b' should load after failing");
     /// assert_eq!(*id.read(), ResourceId::from("b"));
     /// # });
     /// ```
@@ -275,11 +278,14 @@ impl<'ctx, A: ResourceFutureAdapter> ResourceFuture<'ctx, A> {
         self,
         id: impl Into<ResourceId>,
         retry_if: RetryIf,
-    ) -> ResourceFuture<'ctx, OrGetOrLoad<A, A::BaseLoader>>
+    ) -> ResourceFuture<'ctx, OrGetOrLoad<
+        A,
+        <<A::BaseLoader as ResourceLoader>::Output as ResourceDefaultLoader>::Loader,
+    >>
     where
-        A::BaseLoader: Clone,
+        <A::BaseLoader as ResourceLoader>::Output: ResourceDefaultLoader,
     {
-        let loader = (*self.load_params.loader).clone();
+        let loader = <A::BaseLoader as ResourceLoader>::Output::default_loader();
         self.or_get_with_loader_when(id, loader, retry_if)
     }
 
@@ -565,7 +571,7 @@ impl<'ctx, A: ResourceFutureAdapter> Future for ResourceFuture<'ctx, A> {
         let result = ready!(this.adapter.poll(cx, &this.metadata));
 
         if let Ok(resource) = &result && let Some(ctx) = this.ctx {
-            ctx.add_dependency(resource.id().clone());
+            ctx.add_dependency(resource.key());
             ctx.cache_resource(resource.clone());
         }
 
@@ -641,7 +647,6 @@ macro_rules! impl_pinned_adapter_wrapper {
 pub enum GetOrLoad<Loader: ?Sized + ResourceLoader> {
     Cached(ResourceLoadResult<Loader::Output>),
     Loading(#[pin] ResourceLoadFuture<Loader>),
-    Updating(#[pin] ResourceUpdateFuture<Loader::Output>),
     Complete,
 }
 
@@ -649,14 +654,13 @@ impl<Loader: ?Sized + ResourceLoader> Debug for GetOrLoad<Loader> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "GetOrLoad::")?;
         match self {
-            Self::Cached(Ok(res)) => write!(f, "Cached(Ok({}))", res.id())?,
+            Self::Cached(Ok(res)) => write!(f, "Cached(Ok({:?}))", res.key())?,
             Self::Cached(Err(e)) => {
                 write!(f, "Cached(Err(")?;
                 Debug::fmt(e, f)?;
                 write!(f, "))")?
             },
             Self::Loading(_) => write!(f, "Loading(<load-future>)")?,
-            Self::Updating(_) => write!(f, "Updating(<update-future>)")?,
             Self::Complete => write!(f, "Complete")?,
         }
         Ok(())
@@ -684,13 +688,6 @@ impl<Loader: ?Sized + ResourceLoader> ResourceFutureAdapter for GetOrLoad<Loader
                 let output = ready!(fut.poll(cx));
                 match self.project_replace(Self::Complete) {
                     GetOrLoadProjReplace::Loading(_) => Poll::Ready(output),
-                    _ => unreachable!(),
-                }
-            },
-            GetOrLoadProj::Updating(fut) => {
-                let output = ready!(fut.poll(cx));
-                match self.project_replace(Self::Complete) {
-                    GetOrLoadProjReplace::Updating(_) => Poll::Ready(output),
                     _ => unreachable!(),
                 }
             },

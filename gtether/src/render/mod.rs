@@ -1,8 +1,8 @@
+use parking_lot::RwLock;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing::trace;
 
 use vulkano::buffer::{AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -12,19 +12,20 @@ use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, Standar
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Features, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
+use vulkano::image::AllocateImageError;
 use vulkano::instance::{Instance as VKInstance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::swapchain::{Surface, SurfaceCapabilities};
 use vulkano::sync::GpuFuture;
 use vulkano::{Validated, VulkanError, VulkanLibrary};
-use vulkano::image::AllocateImageError;
 
 use crate::app::driver::AppDriver;
 use crate::event::{EventBus, EventBusRegistry, EventCancellable};
+use crate::macros::impl_id_counter;
+use crate::render::frame::FrameManager;
 use crate::render::render_pass::{EngineRenderPass, NoOpEngineRenderPass};
 use crate::render::swapchain::EngineSwapchain;
-use crate::render::frame::FrameManager;
 
 pub mod attachment;
 pub mod descriptor_set;
@@ -181,6 +182,7 @@ pub trait AppDriverGraphicsVulkan: AppDriver {
 /// them.
 #[derive(Debug)]
 pub struct EngineDevice {
+    id: EngineDeviceId,
     physical_device: Arc<PhysicalDevice>,
     vk_device: Arc<Device>,
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -188,6 +190,8 @@ pub struct EngineDevice {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     queue: Arc<Queue>,
 }
+
+impl_id_counter!(EngineDevice, pub EngineDeviceId);
 
 impl EngineDevice {
     /// Constructs an EngineDevice for the given Vulkano Instance and Surface.
@@ -200,6 +204,8 @@ impl EngineDevice {
         device_features: Features,
         surface: Arc<Surface>,
     ) -> Self {
+        let id = Self::next_id();
+
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
             ..device_extensions
@@ -249,6 +255,7 @@ impl EngineDevice {
         ));
 
         EngineDevice {
+            id,
             physical_device,
             vk_device,
             memory_allocator,
@@ -428,11 +435,14 @@ struct RendererState {
 /// The Renderer also manages its own lifecycle events for e.g. pre-/post-rendering and stale
 /// recreation, which can be [registered to](Renderer::event_bus).
 pub struct Renderer {
+    id: RendererId,
     target: Arc<dyn RenderTarget>,
     device: Arc<EngineDevice>,
     event_bus: Arc<EventBus>,
     state: RwLock<RendererState>,
 }
+
+impl_id_counter!(Renderer, pub RendererId);
 
 impl Renderer {
     /// Create a new renderer for a particular [RenderTarget] and [EngineDevice].
@@ -527,6 +537,7 @@ impl Renderer {
             .build());
 
         Ok(Self {
+            id: Self::next_id(),
             target,
             device,
             event_bus: event_bus.clone(),

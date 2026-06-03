@@ -20,17 +20,19 @@
 //! [rm]: manager
 //! [eng]: crate::Engine
 
+use ahash::{HashSet, RandomState};
 use async_trait::async_trait;
 use educe::Educe;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use smol::io::AsyncRead;
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing::debug;
 
 use crate::resource::id::ResourceId;
@@ -189,16 +191,16 @@ pub type ResourceMutLock<'a, T> = MappedRwLockWriteGuard<'a, T>;
 /// [ar]: Resource::attach_sub_resource
 #[derive(Debug)]
 pub struct Resource<T: ?Sized + Send + Sync + 'static> {
-    id: ResourceId,
+    key: Box<dyn ResKey>,
     value: RwLock<Box<T>>,
     sub_resources: smol::lock::Mutex<Vec<SubResourceRef<T>>>,
 }
 
 impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     #[inline]
-    pub(in crate::resource) fn new(id: ResourceId, value: Box<T>) -> Self {
+    pub(in crate::resource) fn new(key: impl Into<BoxedResKey>, value: Box<T>) -> Self {
         Self {
-            id,
+            key: key.into(),
             value: RwLock::new(value),
             sub_resources: smol::lock::Mutex::new(Vec::new()),
         }
@@ -210,7 +212,7 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
             match sub_resource.update(self.clone()).await {
                 Ok(_) => {},
                 Err(error) => debug!(
-                    parent_id = %self.id,
+                    parent_key = ?self.key,
                     %error,
                     "Failed to update sub-resource",
                 ),
@@ -219,8 +221,8 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     }
 
     #[inline]
-    pub fn id(&self) -> &ResourceId {
-        &self.id
+    pub fn key(&self) -> &dyn ResKey {
+        &*self.key
     }
 
     /// Retrieve a read-only [lock guard][lg] for this Resource.
@@ -240,8 +242,12 @@ impl<T: ?Sized + Send + Sync + 'static> Resource<T> {
     ) -> ResourceLoadResult<S> {
         let sub_value = loader.load(&self.read()).await?;
         let mut sub_resources = self.sub_resources.lock().await;
-        let sub_id = format!("{}/<sub-{}>", self.id, sub_resources.len()).into();
-        let sub_resource = Arc::new(Resource::new(sub_id, sub_value));
+        let sub_key = self.key.with_id(ResourceId::from(format!(
+            "{}/<sub-{}>",
+            self.key.id(),
+            sub_resources.len(),
+        )));
+        let sub_resource = Arc::new(Resource::new(sub_key, sub_value));
         sub_resources.push(SubResourceRef::from_sub_resource(&sub_resource, Arc::new(loader)));
         Ok(sub_resource)
     }
@@ -358,16 +364,10 @@ pub enum ResourceLoadError {
     /// [id]: ResourceId
     NotFound(ResourceId),
 
-    /// The existing resource type did not match the requested resource type.
-    TypeMismatch{
-        requested: TypeId,
-        actual: TypeId,
-    },
-
     /// There was an attempt to create a cyclic load, which would have resulted in a deadlock.
     CyclicLoad {
-        parents: Vec<ResourceId>,
-        id: ResourceId,
+        parents: HashSet<Box<dyn ResKey>>,
+        key: Box<dyn ResKey>,
     },
 
     /// Some other error occurred while reading/loading resource data.
@@ -375,12 +375,6 @@ pub enum ResourceLoadError {
 }
 
 impl ResourceLoadError {
-    /// Convenience method for creating a [ResourceLoadError::TypeMismatch].
-    #[inline]
-    pub fn from_mismatch<T: ?Sized + Send + Sync + 'static>(actual: TypeId) -> Self {
-        Self::TypeMismatch { actual, requested: TypeId::of::<T>() }
-    }
-
     /// Convenience method for creating a [ResourceLoadError::ReadError].
     #[inline]
     pub fn from_error(e: impl Error + Send + Sync + 'static) -> Self {
@@ -414,10 +408,8 @@ impl Display for ResourceLoadError {
         match self {
             Self::NotFound(id) =>
                 write!(f, "No resource found that is associated with ID: '{id}'"),
-            Self::TypeMismatch { requested, actual } =>
-                write!(f, "Requested type ({requested:?}) does not match previously loaded type ({actual:?})"),
-            Self::CyclicLoad { parents, id } =>
-                write!(f, "Cyclic load detected: {parents:?} => {id}"),
+            Self::CyclicLoad { parents, key } =>
+                write!(f, "Cyclic load detected: {parents:?} => {key:?}"),
             Self::ReadError(err) =>
                 std::fmt::Display::fmt(&err, f),
         }
@@ -444,19 +436,20 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 /// so both should be idempotent actions.
 ///
 /// # Examples
-/// ```
-/// use std::sync::Arc;
-/// use async_trait::async_trait;
-/// use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
-/// use smol::prelude::*;
-/// use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
-/// use gtether::resource::id::ResourceId;
 ///
-/// struct StringLoader {}
+/// Basic String-based resource loader.
+/// ```
+/// use async_trait::async_trait;
+/// use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+/// use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
+/// use smol::prelude::*;
+///
+/// struct StringLoader;
 ///
 /// #[async_trait]
 /// impl ResourceLoader for StringLoader {
 ///     type Output = String;
+///     type Key = ();
 ///
 ///     async fn load(
 ///         &self,
@@ -469,6 +462,51 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 ///     }
 ///
 ///     // update() does not need to be implemented if you don't have any custom synchronization logic
+///
+///     #[inline(always)]
+///     fn key(&self) -> Self::Key { () }
+/// }
+/// ```
+///
+/// Resource loader that utilizes `Key` due to having different behavior with different loaders.
+/// ```
+/// use async_trait::async_trait;
+/// use gtether::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+/// use gtether::resource::manager::{ResourceLoadContext, ResourceManager};
+/// use smol::prelude::*;
+///
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// enum Case {
+///     Unchanged,
+///     Lower,
+///     Upper,
+/// }
+///
+/// struct CasedStringLoader(Case);
+///
+/// #[async_trait]
+/// impl ResourceLoader for CasedStringLoader {
+///     type Output = String;
+///     // This loader yields different values based on `Case`, so it must use it as the key
+///     type Key = Case;
+///
+///     async fn load(
+///         &self,
+///         mut data: ResourceReadData,
+///         _ctx: &ResourceLoadContext,
+///     ) -> Result<Box<String>, ResourceLoadError> {
+///         let mut output = String::new();
+///         data.read_to_string(&mut output).await?;
+///         let output = match self.0 {
+///             Case::Unchanged => output,
+///             Case::Lower => output.to_lowercase(),
+///             Case::Upper => output.to_uppercase(),
+///         };
+///         Ok(Box::new(output))
+///     }
+///
+///     #[inline(always)]
+///     fn key(&self) -> Self::Key { self.0 }
 /// }
 /// ```
 ///
@@ -478,6 +516,7 @@ pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 #[async_trait]
 pub trait ResourceLoader: Send + Sync + 'static {
     type Output: ?Sized + Send + Sync + 'static;
+    type Key: Debug + Clone + PartialEq + Eq + Hash + Send + Sync + 'static;
 
     /// Load and create a value from [raw data][rd].
     ///
@@ -503,6 +542,8 @@ pub trait ResourceLoader: Send + Sync + 'static {
     ) {
         resource.replace(new_value);
     }
+
+    fn key(&self) -> Self::Key;
 }
 
 /// Simple [ResourceLoader] that yields the [ID](ResourceLoader) that was used to find data.
@@ -515,6 +556,7 @@ pub struct IdentityLoader;
 #[async_trait]
 impl ResourceLoader for IdentityLoader {
     type Output = ResourceId;
+    type Key = ();
 
     #[inline]
     async fn load(
@@ -522,8 +564,11 @@ impl ResourceLoader for IdentityLoader {
         _data: ResourceReadData,
         ctx: &ResourceLoadContext,
     ) -> Result<Box<Self::Output>, ResourceLoadError> {
-        Ok(Box::new(ctx.id()))
+        Ok(Box::new(ctx.key().id()))
     }
+
+    #[inline(always)]
+    fn key(&self) -> Self::Key { () }
 }
 
 /// Simple [ResourceLoader] that always yield a [ReadError](ResourceLoadError::ReadError).
@@ -537,6 +582,7 @@ pub struct ErrorLoader<T: ?Sized + Send + Sync + 'static>(#[educe(Debug(ignore))
 #[async_trait]
 impl<T: ?Sized + Send + Sync + 'static> ResourceLoader for ErrorLoader<T> {
     type Output = T;
+    type Key = ();
 
     #[inline]
     async fn load(
@@ -546,6 +592,9 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceLoader for ErrorLoader<T> {
     ) -> Result<Box<Self::Output>, ResourceLoadError> {
         Err(ResourceLoadError::from("ErrorLoader"))
     }
+
+    #[inline(always)]
+    fn key(&self) -> Self::Key { () }
 }
 
 /// User-defined interface for loading [Resources][res] from parent [Resources][res].
@@ -586,6 +635,7 @@ impl<T: ?Sized + Send + Sync + 'static> ResourceLoader for ErrorLoader<T> {
 /// [res]: Resource
 /// [rl]: ResourceLoader
 /// [asr]: Resource::attach_sub_resource
+// TODO: deprecate and remove this
 #[async_trait]
 pub trait SubResourceLoader<T, P>: Send + Sync + 'static
 where
@@ -651,6 +701,7 @@ pub struct MaybeIdentityLoader;
 #[async_trait]
 impl ResourceLoader for MaybeIdentityLoader {
     type Output = Option<ResourceId>;
+    type Key = ();
 
     #[inline]
     async fn load(
@@ -658,8 +709,11 @@ impl ResourceLoader for MaybeIdentityLoader {
         _data: ResourceReadData,
         ctx: &ResourceLoadContext,
     ) -> Result<Box<Self::Output>, ResourceLoadError> {
-        Ok(Box::new(Some(ctx.id())))
+        Ok(Box::new(Some(ctx.key().id())))
     }
+
+    #[inline(always)]
+    fn key(&self) -> Self::Key { () }
 }
 
 #[async_trait]
@@ -671,6 +725,177 @@ impl ResourceLoaderDefault for MaybeIdentityLoader {
     ) -> Result<Box<Self::Output>, ResourceLoadError> {
         Ok(Box::new(None))
     }
+}
+
+pub trait ResKey: Any + Debug + Send + Sync + 'static {
+    fn id(&self) -> ResourceId;
+    fn loader_type(&self) -> TypeId;
+    fn key_hash(&self) -> u64;
+    fn eq_dyn(&self, other: &dyn ResKey) -> bool;
+    fn to_box(&self) -> Box<dyn ResKey>;
+    fn with_id(&self, id: ResourceId) -> Box<dyn ResKey>;
+}
+
+impl PartialEq for dyn ResKey {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.eq_dyn(other)
+    }
+}
+
+impl Eq for dyn ResKey {}
+
+impl Hash for dyn ResKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+        self.loader_type().hash(state);
+        self.key_hash().hash(state);
+    }
+}
+
+impl AsRef<dyn ResKey> for dyn ResKey {
+    #[inline(always)]
+    fn as_ref(&self) -> &dyn ResKey {
+        self
+    }
+}
+
+impl Clone for Box<dyn ResKey> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        self.to_box()
+    }
+}
+
+impl dyn ResKey {
+    #[inline]
+    pub fn try_key<L>(&self) -> Option<&L::Key>
+    where
+        L: ?Sized + ResourceLoader,
+    {
+        (self as &dyn Any)
+            .downcast_ref::<ResKeyTyped<L>>()
+            .map(|k| &k.key)
+    }
+}
+
+#[derive(Educe, Eq, Hash)]
+#[educe(Clone, PartialEq)]
+struct ResKeyTyped<L: ?Sized + ResourceLoader> {
+    id: ResourceId,
+    key: L::Key,
+    key_hash: u64,
+}
+
+impl<L: ?Sized + ResourceLoader> Debug for ResKeyTyped<L> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResKeyTyped")
+            .field("id", &self.id.as_str())
+            .field("loader_type", &TypeId::of::<L>())
+            .field("key", &self.key)
+            .field("key_hash", &self.key_hash)
+            .finish()
+    }
+}
+
+impl<L: ?Sized + ResourceLoader> PartialEq<dyn ResKey> for ResKeyTyped<L> {
+    fn eq(&self, other: &dyn ResKey) -> bool {
+        if let Some(other) = (other as &dyn Any).downcast_ref::<Self>() {
+            <Self as PartialEq<Self>>::eq(self, other)
+        } else {
+            false
+        }
+    }
+}
+
+impl<L: ?Sized + ResourceLoader> AsRef<dyn ResKey> for ResKeyTyped<L> {
+    #[inline(always)]
+    fn as_ref(&self) -> &dyn ResKey {
+        self
+    }
+}
+
+impl<L: ?Sized + ResourceLoader> ResKey for ResKeyTyped<L> {
+    #[inline(always)]
+    fn id(&self) -> ResourceId {
+        self.id
+    }
+
+    #[inline(always)]
+    fn loader_type(&self) -> TypeId {
+        TypeId::of::<L>()
+    }
+
+    #[inline(always)]
+    fn key_hash(&self) -> u64 {
+        self.key_hash
+    }
+
+    #[inline(always)]
+    fn eq_dyn(&self, other: &dyn ResKey) -> bool {
+        self.eq(other)
+    }
+
+    #[inline(always)]
+    fn to_box(&self) -> Box<dyn ResKey> {
+        Box::new(self.clone())
+    }
+
+    #[inline]
+    fn with_id(&self, id: ResourceId) -> Box<dyn ResKey> {
+        Box::new(Self {
+            id,
+            key: self.key.clone(),
+            key_hash: self.key_hash,
+        })
+    }
+}
+
+pub type BoxedResKey = Box<dyn ResKey>;
+
+impl<L: ?Sized + ResourceLoader> From<ResKeyTyped<L>> for BoxedResKey {
+    #[inline(always)]
+    fn from(value: ResKeyTyped<L>) -> Self {
+        Box::new(value)
+    }
+}
+
+impl<L: ?Sized + ResourceLoader> From<(ResourceId, &L)> for BoxedResKey {
+    #[inline(always)]
+    fn from(pair: (ResourceId, &L)) -> Self {
+        res_key(pair.0, pair.1)
+    }
+}
+
+impl From<&dyn ResKey> for BoxedResKey {
+    #[inline(always)]
+    fn from(value: &dyn ResKey) -> Self {
+        value.to_box()
+    }
+}
+
+impl From<&BoxedResKey> for BoxedResKey {
+    #[inline(always)]
+    fn from(value: &BoxedResKey) -> Self {
+        value.clone()
+    }
+}
+
+pub fn res_key<L>(id: impl Into<ResourceId>, loader: &L) -> BoxedResKey
+where
+    L: ?Sized + ResourceLoader,
+{
+    // Use a static RandomState to ensure hashing is consistent across a program's execution.
+    // This is required in order for PartialEq/Hash implementations to be consistent
+    static RANDOM_STATE: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+    let id = id.into();
+    let key = loader.key();
+    let key_hash = RANDOM_STATE.hash_one(&key);
+    Box::new(ResKeyTyped::<L> {
+        id,
+        key,
+        key_hash,
+    })
 }
 
 #[cfg(test)]
@@ -791,9 +1016,10 @@ mod tests {
             sub_resources.push(sub_resource);
         }
 
+        let key = res_key("key", &TestResLoader::new("key"));
         test_resource_ctx.data_maps[0].lock().insert("key", b"new_value", "h_new_value");
         timeout(
-            test_resource_ctx.manager.test_ctx().sync_update.wait_count(1),
+            test_resource_ctx.manager.test_ctx().sync_update.wait_count(&key, 1),
             Duration::from_millis(200),
         ).await;
 
@@ -820,9 +1046,10 @@ mod tests {
             .expect("Sub-sub-resource should load");
         assert_eq!(&*sub_sub_resource.read(), "value-subvalue-subsubvalue");
 
+        let key = res_key("key", &TestResLoader::new("key"));
         test_resource_ctx.data_maps[0].lock().insert("key", b"new_value", "h_new_value");
         timeout(
-            test_resource_ctx.manager.test_ctx().sync_update.wait_count(1),
+            test_resource_ctx.manager.test_ctx().sync_update.wait_count(&key, 1),
             Duration::from_millis(200)
         ).await;
         assert_eq!(&*sub_sub_resource.read(), "new_value-subvalue-subsubvalue");

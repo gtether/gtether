@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use itertools::{izip, Itertools};
 use smol::io::BufReader;
+use std::any::TypeId;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tobj::futures::load_obj_buf;
@@ -8,9 +9,15 @@ use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano::Validated;
 
 use crate::render::model::{Model, ModelVertex, ModelVertexNormal, ModelVertexNormalColor, ModelVertexNormalTex};
-use crate::render::EngineDevice;
-use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+use crate::render::{EngineDevice, EngineDeviceId};
 use crate::resource::manager::ResourceLoadContext;
+use crate::resource::{ResourceLoadError, ResourceLoader, ResourceReadData};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelObjLoaderKey {
+    device_id: EngineDeviceId,
+    vertex_type: TypeId,
+}
 
 pub struct ModelObjLoader<V: Vertex> {
     device: Arc<EngineDevice>,
@@ -92,6 +99,7 @@ impl<V: Vertex> ModelObjLoader<V> {
 #[async_trait]
 impl ResourceLoader for ModelObjLoader<ModelVertex> {
     type Output = Model<ModelVertex>;
+    type Key = ModelObjLoaderKey;
 
     async fn load(
         &self,
@@ -109,11 +117,20 @@ impl ResourceLoader for ModelObjLoader<ModelVertex> {
             .map(Box::new)
             .map_err(Validated::unwrap).map_err(ResourceLoadError::from_error)
     }
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        ModelObjLoaderKey {
+            device_id: self.device.id(),
+            vertex_type: TypeId::of::<ModelVertex>(),
+        }
+    }
 }
 
 #[async_trait]
 impl ResourceLoader for ModelObjLoader<ModelVertexNormal> {
     type Output = Model<ModelVertexNormal>;
+    type Key = ModelObjLoaderKey;
 
     async fn load(
         &self,
@@ -136,11 +153,20 @@ impl ResourceLoader for ModelObjLoader<ModelVertexNormal> {
             .map(Box::new)
             .map_err(Validated::unwrap).map_err(ResourceLoadError::from_error)
     }
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        ModelObjLoaderKey {
+            device_id: self.device.id(),
+            vertex_type: TypeId::of::<ModelVertexNormal>(),
+        }
+    }
 }
 
 #[async_trait]
 impl ResourceLoader for ModelObjLoader<ModelVertexNormalColor> {
     type Output = Model<ModelVertexNormalColor>;
+    type Key = ModelObjLoaderKey;
 
     async fn load(
         &self,
@@ -166,11 +192,20 @@ impl ResourceLoader for ModelObjLoader<ModelVertexNormalColor> {
             .map(Box::new)
             .map_err(Validated::unwrap).map_err(ResourceLoadError::from_error)
     }
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        ModelObjLoaderKey {
+            device_id: self.device.id(),
+            vertex_type: TypeId::of::<ModelVertexNormalColor>(),
+        }
+    }
 }
 
 #[async_trait]
 impl ResourceLoader for ModelObjLoader<ModelVertexNormalTex> {
     type Output = Model<ModelVertexNormalTex>;
+    type Key = ModelObjLoaderKey;
 
     async fn load(
         &self,
@@ -195,5 +230,13 @@ impl ResourceLoader for ModelObjLoader<ModelVertexNormalTex> {
         Model::from_raw(&self.device, vertices, Some(model.mesh.indices))
             .map(Box::new)
             .map_err(Validated::unwrap).map_err(ResourceLoadError::from_error)
+    }
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        ModelObjLoaderKey {
+            device_id: self.device.id(),
+            vertex_type: TypeId::of::<ModelVertexNormalTex>(),
+        }
     }
 }

@@ -1,22 +1,23 @@
 use ab_glyph::{Font as _Font, OutlinedGlyph, ScaleFont as _ScaleFont};
+use async_trait::async_trait;
+use glm::TVec2;
 use image::{DynamicImage, Rgba};
+use smol::io::AsyncReadExt;
 use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
-use async_trait::async_trait;
-use glm::TVec2;
-use smol::io::AsyncReadExt;
 use tracing::warn;
 
-pub use ab_glyph::InvalidFont;
 use crate::event::Event;
 use crate::render::font::sheet::FontSheetMap;
-use crate::render::font::{CharImgData, Font};
-use crate::render::{Renderer, RendererPostEvent};
 use crate::render::font::size::{FontSizer, ScaledFontSize};
-use crate::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+use crate::render::font::{CharImgData, Font};
+use crate::render::{Renderer, RendererId, RendererPostEvent};
 use crate::resource::manager::ResourceLoadContext;
+use crate::resource::{ResourceLoadError, ResourceLoader, ResourceMut, ResourceReadData};
+
+pub use ab_glyph::InvalidFont;
 
 /// A glyph based font.
 ///
@@ -239,6 +240,7 @@ impl GlyphFontLoader {
 #[async_trait]
 impl ResourceLoader for GlyphFontLoader {
     type Output = dyn Font;
+    type Key = RendererId;
 
     async fn load(
         &self,
@@ -261,5 +263,10 @@ impl ResourceLoader for GlyphFontLoader {
         let _ = self.renderer.event_bus().register_once(move |_event: &mut Event<RendererPostEvent>| {
             resource.replace(new_value);
         }).unwrap().await;
+    }
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        self.renderer.id()
     }
 }

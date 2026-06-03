@@ -28,6 +28,7 @@ pub mod console;
 pub mod event;
 #[cfg(feature = "gui")]
 pub mod gui;
+mod macros;
 pub mod net;
 #[cfg(feature = "graphics")]
 pub mod render;

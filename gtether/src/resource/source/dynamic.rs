@@ -214,6 +214,7 @@ mod tests {
 
     use crate::resource::manager::tests::{timeout, ExpectedDataEntry, ExpectedLoadResult, TestDataEntry, TestResLoader, TestResourceSource};
     use crate::resource::manager::{ResourceManager, ResourceManagerWorkerPriorityConfig};
+    use crate::resource::res_key;
     use crate::worker::WorkerPool;
 
     struct TestResourceDynamicContext<S: ResourceSource> {
@@ -253,27 +254,28 @@ mod tests {
 
     async fn assert_manager_load(
         manager: &Arc<ResourceManager>,
-        key: &str,
+        id: &str,
         expected_load_result: ExpectedLoadResult<String>,
         load_count: usize,
     ) {
+        let key = res_key(id, &TestResLoader::new(id));
         let fut = {
             let _lock = manager.test_ctx().sync_load.block().await;
-            let fut = manager.get_with_loader(key, TestResLoader::new(key));
+            let fut = manager.get_with_loader(id, TestResLoader::new(id));
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
         let result = fut.await;
         // Hold a reference to keep possibly loaded values from expiring
         let _maybe_value = expected_load_result.assert_matches(result);
-        manager.test_ctx().sync_load.assert_count(load_count);
+        manager.test_ctx().sync_load.assert_count(&key, load_count);
 
-        let result = manager.get_with_loader(key, TestResLoader::new(key))
+        let result = manager.get_with_loader(id, TestResLoader::new(id))
             .check()
             .expect("Result should be cached and pollable");
         expected_load_result.assert_matches(result);
         // No extra loads should have been made
-        manager.test_ctx().sync_load.assert_count(load_count);
+        manager.test_ctx().sync_load.assert_count(&key, load_count);
     }
 
     #[rstest]
@@ -330,40 +332,40 @@ mod tests {
 
     #[rstest]
     #[case::lower_priority_value_to_value(
-        false, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::ok_new("key")),
+        false, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::ok_new("key")), 0,
     )]
     #[case::lower_priority_value_to_error(
-        false, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::read_error_new("key")),
+        false, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::read_error_new("key")), 0,
     )]
     #[case::lower_priority_value_to_none(
-        false, ExpectedDataEntry::ok("key"), None,
+        false, ExpectedDataEntry::ok("key"), None, 0,
     )]
     #[case::lower_priority_error_to_value(
-        false, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::ok_new("key")),
+        false, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::ok_new("key")), 0,
     )]
     #[case::lower_priority_error_to_error(
-        false, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::read_error_new("key")),
+        false, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::read_error_new("key")), 0,
     )]
     #[case::lower_priority_error_to_none(
-        false, ExpectedDataEntry::read_error("key"), None,
+        false, ExpectedDataEntry::read_error("key"), None, 0,
     )]
     #[case::higher_priority_value_to_value(
-        true, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::ok_new("key")),
+        true, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::ok_new("key")), 1,
     )]
     #[case::higher_priority_value_to_error(
-        true, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::read_error_new("key")),
+        true, ExpectedDataEntry::ok("key"), Some(ExpectedDataEntry::read_error_new("key")), 1,
     )]
     #[case::higher_priority_value_to_none(
-        true, ExpectedDataEntry::ok("key"), None,
+        true, ExpectedDataEntry::ok("key"), None, 0,
     )]
     #[case::higher_priority_error_to_value(
-        true, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::ok_new("key")),
+        true, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::ok_new("key")), 1,
     )]
     #[case::higher_priority_error_to_error(
-        true, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::read_error_new("key")),
+        true, ExpectedDataEntry::read_error("key"), Some(ExpectedDataEntry::read_error_new("key")), 1,
     )]
     #[case::higher_priority_error_to_none(
-        true, ExpectedDataEntry::read_error("key"), None,
+        true, ExpectedDataEntry::read_error("key"), None, 0,
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_dynamic_update_insert(
@@ -371,6 +373,7 @@ mod tests {
         #[case] insert_before: bool,
         #[case] start: ExpectedDataEntry<String>,
         #[case] end: Option<ExpectedDataEntry<String>>,
+        #[case] wait_update_attempts: usize,
     ) {
         let (main_source, main_data_map) = TestResourceSource::new();
         main_data_map.lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
@@ -383,16 +386,17 @@ mod tests {
         });
 
         main_data_map.assert_watch(start.entry.id.clone(), false);
+        let key = res_key(start.entry.id, &TestResLoader::new(start.entry.id));
         let result = test_resource_dynamic_ctx.manager.get_with_loader(
-            start.entry.id.clone(),
-            TestResLoader::new(start.entry.id.clone()),
+            start.entry.id,
+            TestResLoader::new(start.entry.id),
         ).await;
         let value = start.expected.assert_matches(result);
         main_data_map.assert_watch(start.entry.id.clone(), true);
-        test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(0);
+        test_resource_dynamic_ctx.manager.test_ctx().sync_update_block.assert_count(&(), 0);
 
         {
-            let _lock = test_resource_dynamic_ctx.manager.test_ctx().sync_update.block().await;
+            let _lock = test_resource_dynamic_ctx.manager.test_ctx().sync_update_block.block().await;
             if insert_before {
                 test_resource_dynamic_ctx.handle.write().insert_dyn(0, new_source);
             } else {
@@ -405,21 +409,21 @@ mod tests {
         }
 
         if insert_before {
-            timeout(
-                test_resource_dynamic_ctx.manager.test_ctx().sync_update.wait_attempts(1),
-                Duration::from_millis(500),
-            ).await;
+            timeout(async {
+                test_resource_dynamic_ctx.manager.test_ctx().sync_update_block.wait_count(&(), 1).await;
+                test_resource_dynamic_ctx.manager.test_ctx().sync_update.wait_attempts(&key, wait_update_attempts).await;
+            }, Duration::from_millis(500)).await;
 
             if let Some((end_id, end_expected)) = end {
                 match end_expected {
                     ExpectedLoadResult::Ok(expected_value) => {
                         match value {
                             Some(value) => {
-                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(1);
+                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, 1);
                                 assert_eq!(*value.read(), expected_value.to_owned());
                             },
                             None => {
-                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(0);
+                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, 0);
                                 let value = test_resource_dynamic_ctx.manager.get_with_loader(
                                     end_id.clone(),
                                     TestResLoader::new(end_id.clone()),
@@ -434,7 +438,7 @@ mod tests {
                     ExpectedLoadResult::ReadErr => {
                         match start.expected {
                             ExpectedLoadResult::Ok(expected_value) => {
-                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(1);
+                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, 1);
                                 let value = value.as_ref().unwrap();
                                 assert_eq!(*value.read(), expected_value);
                                 new_data_map.assert_watch(end_id.clone(), true);
@@ -442,7 +446,7 @@ mod tests {
                             },
                             ExpectedLoadResult::NotFound(_) => unimplemented!(),
                             ExpectedLoadResult::ReadErr => {
-                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(0);
+                                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, 0);
                                 test_resource_dynamic_ctx.manager.get_with_loader(
                                     end_id.clone(),
                                     TestResLoader::new(end_id.clone()),
@@ -454,13 +458,13 @@ mod tests {
                     },
                 }
             } else {
-                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(0);
+                test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, 0);
                 new_data_map.assert_watch(start.entry.id.clone(), true);
                 main_data_map.assert_watch(start.entry.id.clone(), true);
             }
         } else {
             // Nothing to await on
-            test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(0);
+            test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, 0);
             new_data_map.assert_watch(start.entry.id.clone(), false);
             main_data_map.assert_watch(start.entry.id.clone(), true);
         }
@@ -476,7 +480,7 @@ mod tests {
         test_resource_dynamic_ctx: TestResourceDynamicContext<Box<dyn ResourceSource>>,
         #[case] remove_idx: usize,
         #[case] expected_value: &str,
-        #[case] wait_update_attempts: usize,
+        #[case] wait_update_block: usize,
         #[case] expected_update_count: usize,
         #[case] expected_watches: [Option<bool>; 4],
     ) {
@@ -489,18 +493,18 @@ mod tests {
         data_maps[1].lock().insert("key", b"value_1", "h_value_1");
         data_maps[2].lock().insert("key", b"value_2", "h_value_2");
 
+        let key = res_key("key", &TestResLoader::new("key"));
         let value = test_resource_dynamic_ctx.manager.get_with_loader("key", TestResLoader::new("key")).await
             .expect("resource should load");
         assert_eq!(*value.read(), "value_1".to_owned());
-        test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(0);
+        test_resource_dynamic_ctx.manager.test_ctx().sync_update_block.assert_count(&(), 0);
 
         test_resource_dynamic_ctx.handle.write().remove(remove_idx);
 
-        timeout(
-            test_resource_dynamic_ctx.manager.test_ctx().sync_update.wait_attempts(wait_update_attempts),
-            Duration::from_millis(500),
-        ).await;
-        test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(expected_update_count);
+        timeout(async {
+            test_resource_dynamic_ctx.manager.test_ctx().sync_update_block.wait_count(&(), wait_update_block).await;
+        }, Duration::from_millis(500)).await;
+        test_resource_dynamic_ctx.manager.test_ctx().sync_update.assert_count(&key, expected_update_count);
 
         assert_eq!(*value.read(), expected_value.to_owned());
 
