@@ -486,7 +486,6 @@ pub mod tests {
 
     use ahash::HashMap;
     use async_trait::async_trait;
-    use educe::Educe;
     use futures_core::future::BoxFuture;
     use itertools::Itertools;
     use macro_rules_attribute::apply;
@@ -498,13 +497,14 @@ pub mod tests {
     use std::borrow::Borrow;
     use std::hash::Hash;
     use std::ops::RangeBounds;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use test_log::test as test_log;
     use tracing::trace;
 
     use crate::resource::source::{ResourceData, ResourceDataResult, ResourceDataSource, ResourceSource, ResourceUpdate};
     use crate::resource::watcher::{ResourceHashProvider, ResourceWatcher};
-    use crate::resource::{BoxedResKey, Resource, ResourceLoadError, ResourceLoadResult, ResourceLoaderDefault, ResourceReadData};
+    use crate::resource::{res_key, BoxedResKey, Resource, ResourceLoadError, ResourceLoadResult, ResourceLoaderDefault, ResourceLoaderSourceType, ResourceReadData};
 
     pub(in crate::resource) async fn timeout<T>(fut: impl Future<Output = T>, time: Duration) -> T {
         let timeout_fn = async move {
@@ -834,6 +834,43 @@ pub mod tests {
         }
     }
 
+    #[derive(Clone)]
+    pub(in crate::resource) struct TestVirtualLoader<T> {
+        pub value: T,
+    }
+
+    impl<T> TestVirtualLoader<T> {
+        pub fn new(value: T) -> Self {
+            Self {
+                value,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<T: Clone + Send + Sync + 'static> ResourceLoader for TestVirtualLoader<T> {
+        type Output = T;
+        type Key = ();
+
+        async fn load(
+            &self,
+            _data: ResourceReadData,
+            _ctx: &ResourceLoadContext
+        ) -> Result<Box<Self::Output>, ResourceLoadError> {
+            Ok(Box::new(self.value.clone()))
+        }
+
+        #[inline]
+        fn key(&self) -> Self::Key {
+            ()
+        }
+
+        #[inline]
+        fn source_type(&self) -> ResourceLoaderSourceType {
+            ResourceLoaderSourceType::Virtual
+        }
+    }
+
     #[derive(Debug)]
     pub(in crate::resource) struct TestResRef<T: ?Sized + Send + Sync + 'static> {
         pub resources: Vec<Arc<Resource<T>>>,
@@ -888,9 +925,67 @@ pub mod tests {
         }
     }
 
+    #[derive(Clone)]
+    pub(in crate::resource) struct TestVirtualRefLoader<L: ResourceLoader> {
+        ids: Vec<ResourceId>,
+        loader: L,
+    }
+
+    impl<L: ResourceLoader> TestVirtualRefLoader<L> {
+        #[inline]
+        pub fn new(ids: impl Into<String>, loader: L) -> Self {
+            let ids = ids.into().split(':')
+                .map(|id| ResourceId::from(id))
+                .collect();
+            Self {
+                ids,
+                loader,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<L> ResourceLoader for TestVirtualRefLoader<L>
+    where
+        L: ResourceLoader + Clone,
+    {
+        type Output = TestResRef<L::Output>;
+        type Key = (Vec<ResourceId>, L::Key);
+
+        async fn load(
+            &self,
+            _data: ResourceReadData,
+            ctx: &ResourceLoadContext,
+        ) -> Result<Box<Self::Output>, ResourceLoadError> {
+            let futs = self.ids.iter()
+                .cloned()
+                .map(|id| ctx.get_with_loader(id, self.loader.clone()))
+                .collect::<Vec<_>>();
+            let mut resources = Vec::with_capacity(futs.len());
+            for fut in futs {
+                resources.push(fut.await?);
+            }
+
+            Ok(Box::new(TestResRef {
+                resources,
+            }))
+        }
+
+        #[inline]
+        fn key(&self) -> Self::Key {
+            (self.ids.clone(), self.loader.key())
+        }
+
+        fn source_type(&self) -> ResourceLoaderSourceType {
+            ResourceLoaderSourceType::Virtual
+        }
+    }
+
     macro_rules! ref_loader {
         ( $final:expr ) => { $final };
         ( ():$($rem:tt)* ) => { crate::resource::manager::tests::TestRefLoader::new(ref_loader!($($rem)*)) };
+        ( Ref:$($rem:tt)* ) => { crate::resource::manager::tests::TestRefLoader::new(ref_loader!($($rem)*)) };
+        ( VRef($id:literal):$($rem:tt)* ) => { crate::resource::manager::tests::TestVirtualRefLoader::new($id, ref_loader!($($rem)*)) };
     }
     pub(in crate::resource) use ref_loader;
 
@@ -962,14 +1057,17 @@ pub mod tests {
         }
     }
 
-    #[derive(Educe)]
-    #[educe(Deref, DerefMut, Default)]
-    struct ResourceDataMapRaw(HashMap<ResourceId, (Vec<u8>, String)>);
+    #[derive(Default)]
+    struct ResourceDataMapRaw {
+        data: HashMap<ResourceId, (Vec<u8>, String)>,
+        load_counts: HashMap<ResourceId, AtomicUsize>,
+        update_overrides: HashSet<ResourceId>,
+    }
 
     impl ResourceHashProvider for ResourceDataMapRaw {
         #[inline]
         fn hash(&self, id: &ResourceId) -> Option<String> {
-            self.0.get(id).map(|(_, hash)| hash.clone())
+            self.data.get(id).map(|(_, hash)| hash.clone())
         }
     }
 
@@ -990,7 +1088,15 @@ pub mod tests {
         }
 
         fn get(&self, id: &ResourceId) -> Option<(Vec<u8>, String)> {
-            self.raw.read().get(id).map(|(r, h)| (r.clone(), h.clone()))
+            let raw = self.raw.read();
+            if let Some((data, hash)) = raw.data.get(id) {
+                raw.load_counts.get(id)
+                    .expect("load count should be initialized")
+                    .fetch_add(1, Ordering::Relaxed);
+                Some((data.clone(), hash.clone()))
+            } else {
+                None
+            }
         }
 
         /// Lock this data map to allow mutations.
@@ -1020,6 +1126,21 @@ pub mod tests {
                 "Resource '{id}' should {m}be watched by: {:?}", self.watcher,
             );
         }
+
+        /// Assert that a given [ResourceId]'s data was retrieved `expected_count` times.
+        pub fn assert_load_count(&self, id: impl Into<ResourceId>, expected_count: usize) {
+            let id = id.into();
+            let raw = self.raw.read();
+            let actual = match raw.load_counts.get(&id) {
+                Some(count) => count.load(Ordering::Relaxed),
+                None => 0,
+            };
+            assert_eq!(
+                actual,
+                expected_count,
+                "Resource '{id}' should be loaded {expected_count} times; was only loaded {actual} times",
+            );
+        }
     }
 
     /// Mutable lock on a [ResourceDataMap].
@@ -1039,11 +1160,12 @@ pub mod tests {
         ) {
             let id = id.into();
             let hash = hash.into();
-            let update = match self.raw.insert(id.clone(), (Vec::from(data), hash.clone())).is_some() {
+            let update = match self.raw.data.insert(id, (Vec::from(data), hash.clone())).is_some() {
                 true => ResourceUpdate::Modified(hash),
                 false => ResourceUpdate::Added(hash),
             };
-            if self.watcher.is_watched(&id) {
+            self.raw.load_counts.entry(id).or_default();
+            if self.watcher.is_watched(&id) || self.raw.update_overrides.contains(&id) {
                 self.updates.insert(id, update);
             }
         }
@@ -1051,10 +1173,20 @@ pub mod tests {
         /// Remove the entry specified by the given `id`, if it exists.
         pub fn remove(&mut self, id: impl Into<ResourceId>) {
             let id = id.into();
-            if self.raw.remove(&id).is_some() {
-                if self.watcher.is_watched(&id) {
+            if self.raw.data.remove(&id).is_some() {
+                if self.watcher.is_watched(&id) || self.raw.update_overrides.contains(&id) {
                     self.updates.insert(id, ResourceUpdate::Removed);
                 }
+            }
+        }
+
+        /// Force certain IDs to always trigger updates, even if they are not being watched.
+        pub fn set_trigger_update_override(&mut self, id: impl Into<ResourceId>, enabled: bool) {
+            let id = id.into();
+            if enabled {
+                self.raw.update_overrides.insert(id);
+            } else {
+                self.raw.update_overrides.remove(&id);
             }
         }
     }
@@ -1171,17 +1303,22 @@ pub mod tests {
     }
 
     pub(in crate::resource) struct TestLoadInfo<L: ResourceLoader> {
-        pub key: ResourceId,
+        pub id: ResourceId,
         pub loader: L,
     }
 
     impl<L: ResourceLoader> TestLoadInfo<L> {
         #[inline]
-        pub fn new(key: impl Into<ResourceId>, loader: L) -> Self {
+        pub fn new(id: impl Into<ResourceId>, loader: L) -> Self {
             Self {
-                key: key.into(),
+                id: id.into(),
                 loader,
             }
+        }
+
+        #[inline]
+        pub fn key(&self) -> BoxedResKey {
+            res_key(self.id, &self.loader)
         }
     }
 
@@ -1432,13 +1569,13 @@ pub mod tests {
         }
 
         let mut fut = test_resource_ctx.manager
-            .get_with_loader(load_info.key, load_info.loader)
+            .get_with_loader(load_info.id, load_info.loader)
             .to_boxed();
 
         for adapter_info in adapter_info {
             fut = match adapter_info {
                 AdapterInfo::OrGetOrLoad(load_info) => {
-                    fut.or_get_with_loader(load_info.key, load_info.loader).to_boxed()
+                    fut.or_get_with_loader(load_info.id, load_info.loader).to_boxed()
                 },
                 AdapterInfo::OrDefault => {
                     fut.or_default().to_boxed()
@@ -1475,16 +1612,15 @@ pub mod tests {
             setup_dependency_data,
             timeout,
             BulkUpdate,
-            ExpectedDataEntry,
             ExpectedLoadInfo,
             ExpectedLoadResult,
             ExpectedResourceRef,
             StringLoader,
-            TestDataEntry
-            ,
+            TestDataEntry,
             TestLoadInfo,
             TestResChainLoader,
             TestResLoader,
+            TestVirtualLoader,
             Update,
         };
     }

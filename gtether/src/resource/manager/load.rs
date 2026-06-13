@@ -18,7 +18,18 @@ use crate::resource::manager::task::{ManagerExecutor, TaskPriority};
 use crate::resource::manager::update::UpdateLock;
 use crate::resource::manager::{GetOrLoad, ManagerTask, ResourceFuture};
 use crate::resource::source::{ResourceUpdate, SourceIndex};
-use crate::resource::{res_key, BoxedResKey, ResKey, Resource, ResourceDefaultLoader, ResourceLoadError, ResourceLoadResult, ResourceLoader, ResourceMut};
+use crate::resource::{
+    res_key,
+    BoxedResKey,
+    ResKey,
+    Resource,
+    ResourceDefaultLoader,
+    ResourceLoadError,
+    ResourceLoadResult,
+    ResourceLoader,
+    ResourceLoaderSourceType,
+    ResourceMut,
+};
 use crate::util::waker::MultiWaker;
 
 /// Priority for resource loading tasks.
@@ -343,9 +354,12 @@ impl<L: ?Sized + ResourceLoader> UpdateWork<L> {
                 (id, &**loader),
                 task_data.value,
             ));
-            let entry = CacheEntryTyped::from_resource_loaded(
-                resource,
+            let entry = CacheEntryTyped::from_parts(
+                id,
                 loader.clone(),
+                CacheEntryTypedInner::Loaded {
+                    strong: resource,
+                },
             );
             group.insert(entry);
         } else {
@@ -517,23 +531,28 @@ impl<L: ?Sized + ResourceLoader> UpdateWork<L> {
         // check for cancellation before making a mutating change
         smol::future::yield_now().await;
 
-        let entry = if !self.wakers.is_empty() {
+        let mut entry_inner = if !self.wakers.is_empty() {
             // at least one future is waiting on this, so we can insert a strong reference
-            CacheEntryTyped::from_resource_loaded(
-                resource,
-                self.loader,
-            )
+            CacheEntryTypedInner::Loaded {
+                strong: resource,
+            }
         } else {
-            CacheEntryTyped::from_resource(
-                &resource,
-                self.loader,
-            )
+            CacheEntryTypedInner::Value {
+                weak: Arc::downgrade(&resource),
+            }
         };
-        if let Some(entry) = group.insert(entry) {
-            if let CacheEntryTypedInner::Updating { task, .. } = entry.inner {
-                // Let this task cleanly complete without being cancelled.
+        if let Some(entry) = group.get_mut(&self.loader) {
+            std::mem::swap(&mut entry.inner, &mut entry_inner);
+            if let CacheEntryTypedInner::Updating { task, .. } = entry_inner {
+                // Let this task cleanly complete without being canceled.
                 task.detach();
             }
+        } else {
+            group.insert(CacheEntryTyped::from_parts(
+                self.id,
+                self.loader,
+                entry_inner,
+            ));
         }
     }
 }
@@ -571,6 +590,28 @@ impl<T: ?Sized + Send + Sync + 'static> From<ResourceLoadResult<T>> for EntryGet
         }
     }
 }
+
+/*#[derive(Debug, Clone)]
+struct SourceMetadata {
+    hash: String,
+    source_idx: SourceIndex,
+}
+
+#[derive(Debug, Clone)]
+enum CacheEntrySourceMetadata {
+    NoSource,
+    SingleSource(SourceMetadata),
+}
+
+impl CacheEntrySourceMetadata {
+    fn valid_for_update(&self, new_hash: &str, new_source_idx: &SourceIndex) -> bool {
+        match self {
+            Self::NoSource => true,
+            Self::SingleSource(metadata) =>
+                &metadata.hash != new_hash && new_source_idx <= &metadata.source_idx,
+        }
+    }
+}*/
 
 enum CacheEntryTypedInner<L: ?Sized + ResourceLoader> {
     Loading {
@@ -619,29 +660,15 @@ impl<L: ?Sized + ResourceLoader> CacheEntryTyped<L> {
         }
     }
 
-    fn from_resource(
-        resource: &Arc<Resource<L::Output>>,
+    fn from_parts(
+        id: ResourceId,
         loader: Arc<L>,
+        inner: CacheEntryTypedInner<L>,
     ) -> Self {
         Self {
-            id: resource.key().id(),
+            id,
             loader,
-            inner: CacheEntryTypedInner::Value {
-                weak: Arc::downgrade(resource),
-            },
-        }
-    }
-
-    fn from_resource_loaded(
-        resource: Arc<Resource<L::Output>>,
-        loader: Arc<L>,
-    ) -> Self {
-        Self {
-            id: resource.key().id(),
-            loader,
-            inner: CacheEntryTypedInner::Loaded {
-                strong: resource,
-            },
+            inner,
         }
     }
 
@@ -863,6 +890,7 @@ pub trait CacheSubGroup: Any + Send + Sync + 'static {
         cache: &Arc<Cache>,
         src_idx: &SourceIndex,
         update_lock: &Arc<UpdateLock>,
+        dependent: bool,
     ) -> HashSet<BoxedResKey>;
 }
 
@@ -872,10 +900,16 @@ impl<L: ?Sized + ResourceLoader> CacheSubGroup for CacheSubGroupTyped<L> {
         cache: &Arc<Cache>,
         src_idx: &SourceIndex,
         update_lock: &Arc<UpdateLock>,
+        dependent: bool,
     ) -> HashSet<BoxedResKey> {
         let mut keys = HashSet::default();
         let mut remove = HashSet::default();
         for (k, entry) in self.entries.iter_mut() {
+            if entry.loader.source_type() == ResourceLoaderSourceType::Virtual && !dependent {
+                #[cfg(test)]
+                update_lock.sync.update.mark_attempt(res_key(entry.id, &*entry.loader));
+                continue
+            }
             if entry.start_update(cache, src_idx, update_lock.clone()) {
                 keys.insert(res_key(entry.id, &*entry.loader));
             } else {
@@ -975,48 +1009,46 @@ impl CacheGroup {
     pub fn start_update(
         &mut self,
         id: ResourceId,
-        update: Option<ResourceUpdate>,
+        update: ResourceUpdate,
         source_idx: &SourceIndex,
         sources: &Sources,
         update_lock: &Arc<UpdateLock>,
         cache: &Arc<Cache>,
     ) -> CacheGroupUpdateResult {
-        if let Some(update) = update {
-            let (hash, source_idx) = match update {
-                ResourceUpdate::Added(hash) | ResourceUpdate::Modified(hash) => {
-                    if !self.metadata.valid_for_update(&hash, source_idx) {
+        let (hash, source_idx) = match update {
+            ResourceUpdate::Added(hash) | ResourceUpdate::Modified(hash) => {
+                if !self.metadata.valid_for_update(&hash, source_idx) {
+                    return CacheGroupUpdateResult::Skipped
+                }
+
+                (hash, source_idx.clone())
+            },
+            ResourceUpdate::Removed => {
+                let new_source = match sources.find_hash(&id) {
+                    Some(new_source) => new_source,
+                    // Data was removed, but there isn't a backup. Leave existing
+                    // entry alone for now
+                    None => {
+                        warn!(%id, "All valid data sources have been removed for active resource");
                         return CacheGroupUpdateResult::Skipped
-                    }
+                    },
+                };
 
-                    (hash, source_idx.clone())
-                },
-                ResourceUpdate::Removed => {
-                    let new_source = match sources.find_hash(&id) {
-                        Some(new_source) => new_source,
-                        // Data was removed, but there isn't a backup. Leave existing
-                        // entry alone for now
-                        None => {
-                            warn!(%id, "All valid data sources have been removed for active resource");
-                            return CacheGroupUpdateResult::Skipped
-                        },
-                    };
+                (new_source.hash, new_source.idx)
+            },
+            ResourceUpdate::MovedSourceIndex(old_source_idx) => {
+                let result = if self.metadata.source_idx == old_source_idx {
+                    self.metadata.source_idx = source_idx.clone();
+                    CacheGroupUpdateResult::Moved
+                } else {
+                    CacheGroupUpdateResult::Skipped
+                };
+                return result
+            },
+        };
 
-                    (new_source.hash, new_source.idx)
-                },
-                ResourceUpdate::MovedSourceIndex(old_source_idx) => {
-                    let result = if self.metadata.source_idx == old_source_idx {
-                        self.metadata.source_idx = source_idx.clone();
-                        CacheGroupUpdateResult::Moved
-                    } else {
-                        CacheGroupUpdateResult::Skipped
-                    };
-                    return result
-                },
-            };
-
-            self.metadata.hash = Some(hash);
-            self.metadata.source_idx = source_idx;
-        }
+        self.metadata.hash = Some(hash);
+        self.metadata.source_idx = source_idx;
 
         let mut keys = HashSet::default();
         for sub_group in self.sub_groups.values_mut() {
@@ -1024,6 +1056,7 @@ impl CacheGroup {
                 cache,
                 &self.metadata.source_idx,
                 update_lock,
+                false,
             ));
         }
         CacheGroupUpdateResult::Updated(keys)
@@ -1040,6 +1073,7 @@ impl CacheGroup {
                 cache,
                 &self.metadata.source_idx,
                 update_lock,
+                true,
             );
             CacheGroupUpdateResult::Updated(keys)
         } else {
@@ -1331,39 +1365,48 @@ impl Cache {
             let sources = sources.clone();
             let loader = loader.clone();
             async move {
-                match sources.find_data(&id).await {
-                    Some(Ok(data)) => {
-                        trace!(
-                        source_idx = %data.source.idx,
-                        hash = ?data.source.hash,
-                        "Found source data"
-                    );
-                        if let Some(cache) = cache.upgrade() {
-                            cache.update_metadata(
-                                id,
-                                data.source.hash,
-                                data.source.idx.clone(),
-                            ).await;
-                        }
+                let data = match loader.source_type() {
+                    ResourceLoaderSourceType::FirstFound => {
+                        match sources.find_data(&id).await {
+                            Some(Ok(data)) => {
+                                trace!(
+                                    source_idx = %data.source.idx,
+                                    hash = ?data.source.hash,
+                                    "Found source data"
+                                );
+                                if let Some(cache) = cache.upgrade() {
+                                    cache.update_metadata(
+                                        id,
+                                        data.source.hash,
+                                        data.source.idx.clone(),
+                                    ).await;
+                                }
 
-                        if operation == ResourceLoadOperation::Load {
-                            // If this is the original load, we need to start watching for updates
-                            sources.watch_n(&id, &data.source.idx)
-                        }
+                                if operation == ResourceLoadOperation::Load {
+                                    // If this is the original load, we need to start watching for updates
+                                    sources.watch_n(&id, &data.source.idx)
+                                }
 
-                        match loader.load(data.data, &ctx).await {
-                            Ok(value) => {
-                                let dependencies = ctx.dependencies.into_inner();
-                                Ok(ResourceTaskData {
-                                    value,
-                                    dependencies,
-                                })
+                                data.data
                             },
-                            Err(e) => Err(e),
+                            Some(Err(e)) => return Err(e),
+                            None => return Err(ResourceLoadError::NotFound(id.clone())),
                         }
                     },
-                    Some(Err(e)) => Err(e),
-                    None => Err(ResourceLoadError::NotFound(id.clone())),
+                    ResourceLoaderSourceType::Virtual => {
+                        Box::pin(smol::io::empty())
+                    },
+                };
+
+                match loader.load(data, &ctx).await {
+                    Ok(value) => {
+                        let dependencies = ctx.dependencies.into_inner();
+                        Ok(ResourceTaskData {
+                            value,
+                            dependencies,
+                        })
+                    },
+                    Err(e) => Err(e),
                 }
             }.boxed()
         }
@@ -1554,38 +1597,86 @@ mod tests {
     }
 
     #[rstest]
-    #[case::not_found("key", None, ExpectedLoadResult::NotFound(ResourceId::from("key")))]
-    #[case::error("invalid", Some(TestDataEntry::new("invalid", b"\xC0", "h_invalid")), ExpectedLoadResult::ReadErr)]
-    #[case::ok("key", Some(TestDataEntry::new("key", b"value", "h_value")), ExpectedLoadResult::Ok("value".to_string()))]
+    #[case::not_found(
+        None,
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestResLoader::new("key")),
+            expected: ExpectedLoadResult::<String>::NotFound(ResourceId::from("key")),
+        },
+        0,
+    )]
+    #[case::error(
+        Some(TestDataEntry::new("invalid", b"\xC0", "h_invalid")),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("invalid", TestResLoader::new("invalid")),
+            expected: ExpectedLoadResult::<String>::ReadErr,
+        },
+        1,
+    )]
+    #[case::ok(
+        Some(TestDataEntry::new("key", b"value", "h_value")),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestResLoader::new("key")),
+            expected: ExpectedLoadResult::Ok(String::from("value")),
+        },
+        1,
+    )]
+    #[case::ok_virtual(
+        None,
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestVirtualLoader::new(String::from("value"))),
+            expected: ExpectedLoadResult::Ok(String::from("value"))
+        },
+        0,
+    )]
     #[test_attr(test_log(apply(smol_test)))]
-    async fn test_load(
+    async fn test_load<L, A>(
         test_resource_ctx: TestResourceContext<1>,
-        #[case] id: &str,
         #[case] start_data: Option<TestDataEntry>,
-        #[case] expected_load_result: ExpectedLoadResult<String>,
-    ) {
+        #[case] expected_entry: ExpectedLoadInfo<L, A>,
+        #[case] expected_load_count: usize,
+    )
+    where
+        L: ResourceLoader + Clone,
+        L::Output: Debug + Sized,
+        A: Debug + PartialEq<L::Output>,
+    {
         if let Some(start_data) = start_data {
             test_resource_ctx.data_maps[0].lock().insert(start_data.id, start_data.data, start_data.hash);
         }
 
-        let key = res_key(id, &TestResLoader::new(id));
+        let key = expected_entry.load_info.key();
         let fut = {
             let _lock = test_resource_ctx.manager.test_ctx().sync_load.block().await;
-            let fut = test_resource_ctx.manager.get_with_loader(id, TestResLoader::new(id));
+            let fut = test_resource_ctx.manager.get_with_loader(
+                expected_entry.load_info.id,
+                expected_entry.load_info.loader.clone(),
+            );
             fut.check().expect_err("Resource should not be loaded yet")
         };
 
         let result = fut.await;
         // Hold a reference to keep possibly loaded values from expiring
-        let _maybe_value = expected_load_result.assert_matches(result);
+        let _maybe_value = expected_entry.expected.assert_matches(result);
         test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, 1);
+        test_resource_ctx.data_maps[0].assert_load_count(
+            expected_entry.load_info.id,
+            expected_load_count,
+        );
 
-        let result = test_resource_ctx.manager.get_with_loader(id, TestResLoader::new(id))
+        let result = test_resource_ctx.manager.get_with_loader(
+            expected_entry.load_info.id,
+            expected_entry.load_info.loader.clone(),
+        )
             .check()
             .expect("Result should be cached and pollable");
-        expected_load_result.assert_matches(result);
+        expected_entry.expected.assert_matches(result);
         // No extra loads should have been made
         test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, 1);
+        test_resource_ctx.data_maps[0].assert_load_count(
+            expected_entry.load_info.id,
+            expected_load_count,
+        );
     }
 
     #[rstest]
@@ -1648,19 +1739,27 @@ mod tests {
         ).await.expect("String resource should load for 'key'");
         let id_value = test_resource_ctx.manager.get::<ResourceId>("key")
             .await.expect("ResourceId resource should load for 'key'");
+        let virtual_value = test_resource_ctx.manager.get_with_loader(
+            "key",
+            TestVirtualLoader::new(String::from("value")),
+        ).await.expect("Virtual String resource should load for 'key'");
 
-        assert_eq!(*string_value.read(), "value".to_owned());
+        assert_eq!(*string_value.read(), String::from("value"));
         assert_eq!(*id_value.read(), ResourceId::from("key"));
+        assert_eq!(*virtual_value.read(), String::from("value"));
 
         let string_loader_key = res_key("key", &TestResLoader::new("key"));
         let id_loader_key = res_key("key", &IdentityLoader);
+        let virtual_loader_key = res_key("key", &TestVirtualLoader::new(String::from("value")));
         test_resource_ctx.manager.test_ctx().sync_load.assert_count(&string_loader_key, 1);
         test_resource_ctx.manager.test_ctx().sync_load.assert_count(&id_loader_key, 1);
+        test_resource_ctx.manager.test_ctx().sync_load.assert_count(&virtual_loader_key, 1);
+        test_resource_ctx.data_maps[0].assert_load_count("key", 2);
     }
 
     #[rstest]
     #[case::single(
-        DependencyGraph::builder()
+        true, DependencyGraph::builder()
             .add(
                 res_key("a", &ref_loader!(():TestResLoader::new("b"))),
                 [res_key("b", &TestResLoader::new("b"))]
@@ -1675,11 +1774,30 @@ mod tests {
             (res_key("a", &ref_loader!(():TestResLoader::new("b"))), 1),
             (res_key("b", &TestResLoader::new("b")), 1),
         ],
+        [("a", 1), ("b", 1)],
+    )]
+    #[case::single_virtual(
+        false, DependencyGraph::builder()
+            .add(
+                res_key("a", &ref_loader!(VRef("b"):TestResLoader::new("b"))),
+                [res_key("b", &TestResLoader::new("b"))]
+            )
+            .build(),
+        [TestDataEntry::new("b", b"value", "h_value")],
+        [ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("a", ref_loader!(VRef("b"):TestResLoader::new("b"))),
+            expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec!["value"])),
+        }],
+        [
+            (res_key("a", &ref_loader!(VRef("b"):TestResLoader::new("b"))), 1),
+            (res_key("b", &TestResLoader::new("b")), 1),
+        ],
+        [("a", 0), ("b", 1)],
     )]
     #[case::linear(
-        DependencyGraph::builder()
+        true, DependencyGraph::builder()
             .add(
-                res_key("a", &ref_loader!(():():TestResLoader::new("c"))),
+                res_key("a", &ref_loader!(Ref:Ref:TestResLoader::new("c"))),
                 [res_key("b", &ref_loader!(():TestResLoader::new("c")))]
             )
             .add(
@@ -1699,9 +1817,10 @@ mod tests {
             (res_key("b", &ref_loader!(():TestResLoader::new("c"))), 1),
             (res_key("c", &TestResLoader::new("c")), 1),
         ],
+        [("a", 1), ("b", 1), ("c", 1)],
     )]
     #[case::tree(
-        DependencyGraph::builder()
+        true, DependencyGraph::builder()
             .add(
                 res_key("a1", &ref_loader!(():():StringLoader)),
                 [
@@ -1763,9 +1882,10 @@ mod tests {
             (res_key("c2", &StringLoader), 1),
             (res_key("c3", &StringLoader), 1),
         ],
+        [("a1", 1), ("a2", 1), ("b1", 1), ("b2", 1), ("c1", 1), ("c2", 1), ("c3", 1)],
     )]
     #[case::diamond(
-        DependencyGraph::builder()
+        true, DependencyGraph::builder()
             .add(
                 res_key("a", &TestResChainLoader),
                 [
@@ -1795,21 +1915,26 @@ mod tests {
             // Even though b1..b3 loads this, it _should_ be cached during the overall "a" load
             (res_key("c", &TestResChainLoader), 1),
         ],
+        [("a", 1), ("b1", 1), ("b2", 1), ("b3", 1), ("c", 1)],
     )]
     #[test_attr(test_log(apply(smol_test)))]
     async fn test_load_dependencies<L, A>(
         test_resource_ctx: TestResourceContext<1>,
+        #[case] insert_dependency_data: bool,
         #[case] expected_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
         #[case] expected_entries: impl IntoIterator<Item=ExpectedLoadInfo<L, A>>,
         #[case] expected_load_counts: impl IntoIterator<Item=(BoxedResKey, usize)>,
+        #[case] expected_data_load_counts: impl IntoIterator<Item=(impl Into<ResourceId>, usize)>,
     )
     where
         L: ResourceLoader,
         L::Output: Debug + Sized,
         A: Debug + PartialEq<L::Output>,
     {
-        setup_dependency_data(&test_resource_ctx.data_maps[0], &expected_graph);
+        if insert_dependency_data {
+            setup_dependency_data(&test_resource_ctx.data_maps[0], &expected_graph);
+        }
         {
             let mut data_map = test_resource_ctx.data_maps[0].lock();
             for entry in data_entries.into_iter() {
@@ -1820,7 +1945,7 @@ mod tests {
         let mut values = Vec::new();
         for entry in expected_entries.into_iter() {
             let result = test_resource_ctx.manager.get_with_loader(
-                entry.load_info.key,
+                entry.load_info.id,
                 entry.load_info.loader,
             ).await;
             values.push(entry.expected.assert_matches(result));
@@ -1829,6 +1954,9 @@ mod tests {
         assert_eq!(&*test_resource_ctx.manager.dependencies.read(), &expected_graph);
         for (key, expected_count) in expected_load_counts.into_iter() {
             test_resource_ctx.manager.test_ctx().sync_load.assert_count(&key, expected_count);
+        }
+        for (id, expected_count) in expected_data_load_counts.into_iter() {
+            test_resource_ctx.data_maps[0].assert_load_count(id, expected_count);
         }
 
         // Drop any held resources and check again

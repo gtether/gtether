@@ -211,7 +211,7 @@ impl UpdateManagerThread {
 
                     let result = group.start_update(
                         id,
-                        Some(update),
+                        update,
                         &source_idx,
                         &self.sources,
                         &update_lock,
@@ -308,32 +308,93 @@ mod tests {
     }
 
     #[rstest]
-    #[case::value_to_value(ExpectedDataEntry::ok("key"), ExpectedDataEntry::ok_new("key"))]
-    #[case::value_to_error(ExpectedDataEntry::ok("key"), ExpectedDataEntry::read_error_new("key"))]
-    #[case::error_to_value(ExpectedDataEntry::read_error("key"), ExpectedDataEntry::ok_new("key"))]
-    #[case::error_to_error(ExpectedDataEntry::read_error("key"), ExpectedDataEntry::read_error_new("key"))]
+    #[case::value_to_value(
+        TestDataEntry::new("key", b"value", "h_value"),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestResLoader::new("key")),
+            expected: ExpectedLoadResult::Ok(String::from("value")),
+        },
+        TestDataEntry::new("key", b"new_value", "h_new_value"),
+        ExpectedLoadResult::Ok(String::from("new_value")),
+        1, 2, true,
+    )]
+    #[case::value_to_error(
+        TestDataEntry::new("key", b"value", "h_value"),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestResLoader::new("key")),
+            expected: ExpectedLoadResult::Ok(String::from("value")),
+        },
+        TestDataEntry::new("key", b"new_\xC0", "h_new_invalid"),
+        ExpectedLoadResult::ReadErr,
+        1, 2, true,
+    )]
+    #[case::error_to_value(
+        TestDataEntry::new("key", b"\xC0", "h_invalid"),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestResLoader::new("key")),
+            expected: ExpectedLoadResult::ReadErr,
+        },
+        TestDataEntry::new("key", b"new_value", "h_new_value"),
+        ExpectedLoadResult::Ok(String::from("new_value")),
+        0, 2, true,
+    )]
+    #[case::error_to_error(
+        TestDataEntry::new("key", b"\xC0", "h_invalid"),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestResLoader::new("key")),
+            expected: ExpectedLoadResult::<String>::ReadErr,
+        },
+        TestDataEntry::new("key", b"new_\xC0", "h_new_invalid"),
+        ExpectedLoadResult::ReadErr,
+        0, 2, true,
+    )]
+    #[case::virtual_value_to_value(
+        TestDataEntry::new("key", b"value", "h_value"),
+        ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("key", TestVirtualLoader::new(String::from("value"))),
+            expected: ExpectedLoadResult::Ok(String::from("value")),
+        },
+        TestDataEntry::new("key", b"new_value", "h_new_value"),
+        ExpectedLoadResult::Ok(String::from("value")),
+        0, 0, false,
+    )]
     #[test_attr(test_log(apply(smol_test)))]
-    async fn test_update(
+    async fn test_update<L, A>(
         test_resource_ctx: TestResourceContext<1>,
-        #[case] start: ExpectedDataEntry<String>,
-        #[case] end: ExpectedDataEntry<String>,
-    ) {
-        let key = res_key(start.entry.id, &TestResLoader::new(start.entry.id));
-        test_resource_ctx.data_maps[0].lock().insert(start.entry.id.clone(), start.entry.data, start.entry.hash);
+        #[case] start_data: TestDataEntry,
+        #[case] start_expected: ExpectedLoadInfo<L, A>,
+        #[case] end_data: TestDataEntry,
+        #[case] end_expected: ExpectedLoadResult<A>,
+        #[case] expected_update_count: usize,
+        #[case] expected_data_load_count: usize,
+        #[case] expected_should_watch: bool,
+    )
+    where
+        L: ResourceLoader + Clone,
+        L::Output: Debug + Sized,
+        A: Debug + PartialEq<L::Output>,
+        <L as ResourceLoader>::Output: PartialEq<A>,
+    {
+        let key = res_key(start_expected.load_info.id, &start_expected.load_info.loader);
+        {
+            let mut data_map = test_resource_ctx.data_maps[0].lock();
+            data_map.insert(start_data.id, start_data.data, start_data.hash);
+            data_map.set_trigger_update_override(start_data.id, true);
+        }
 
-        test_resource_ctx.data_maps[0].assert_watch(start.entry.id.clone(), false);
+        test_resource_ctx.data_maps[0].assert_watch(start_expected.load_info.id, false);
         let result = test_resource_ctx.manager.get_with_loader(
-            start.entry.id.clone(),
-            TestResLoader::new(start.entry.id.clone()),
+            start_expected.load_info.id,
+            start_expected.load_info.loader.clone(),
         ).await;
-        let value = start.expected.assert_matches(result);
-        test_resource_ctx.data_maps[0].assert_watch(start.entry.id.clone(), true);
+        let value = start_expected.expected.assert_matches(result);
+        test_resource_ctx.data_maps[0].assert_watch(start_expected.load_info.id, expected_should_watch);
         test_resource_ctx.manager.test_ctx().sync_update_block.assert_count(&(), 0);
 
         {
             let _lock = test_resource_ctx.manager.test_ctx().sync_update_block.block().await;
-            test_resource_ctx.data_maps[0].lock().insert(end.entry.id.clone(), end.entry.data, end.entry.hash);
-            if let ExpectedLoadResult::Ok(expected_value) = &start.expected {
+            test_resource_ctx.data_maps[0].lock().insert(end_data.id, end_data.data, end_data.hash);
+            if let ExpectedLoadResult::Ok(expected_value) = &start_expected.expected {
                 let value = value.as_ref().unwrap();
                 assert_eq!(&*value.read(), expected_value);
             }
@@ -343,43 +404,41 @@ mod tests {
             test_resource_ctx.manager.test_ctx().sync_update_block.wait_count(&(), 1).await;
             test_resource_ctx.manager.test_ctx().sync_update.wait_attempts(&key, 1).await;
         }, Duration::from_millis(500)).await;
-        match end.expected {
+        test_resource_ctx.manager.test_ctx().sync_update.assert_count(&key, expected_update_count);
+        match end_expected {
             ExpectedLoadResult::Ok(expected_value) => {
                 match value {
                     Some(value) => {
-                        test_resource_ctx.manager.test_ctx().sync_update.assert_count(&key, 1);
-                        assert_eq!(*value.read(), expected_value.to_owned());
+                        assert_eq!(*value.read(), expected_value);
                     },
                     None => {
-                        test_resource_ctx.manager.test_ctx().sync_update.assert_count(&key, 0);
                         let value = test_resource_ctx.manager.get_with_loader(
-                            end.entry.id.clone(),
-                            TestResLoader::new(end.entry.id.clone()),
-                        ).await.expect(&format!("Resource should load for '{:#?}'", &end.entry.id));
-                        assert_eq!(*value.read(), expected_value.to_owned());
+                            start_expected.load_info.id,
+                            start_expected.load_info.loader.clone(),
+                        ).await.expect(&format!("Resource should load for '{}'", start_expected.load_info.id));
+                        assert_eq!(*value.read(), expected_value);
                     },
                 }
             },
             ExpectedLoadResult::NotFound(_) => unimplemented!(),
             ExpectedLoadResult::ReadErr => {
-                match start.expected {
+                match start_expected.expected {
                     ExpectedLoadResult::Ok(expected_value) => {
-                        test_resource_ctx.manager.test_ctx().sync_update.assert_count(&key, 1);
                         let value = value.as_ref().unwrap();
                         assert_eq!(*value.read(), expected_value);
                     },
                     ExpectedLoadResult::NotFound(_) => unimplemented!(),
                     ExpectedLoadResult::ReadErr => {
-                        test_resource_ctx.manager.test_ctx().sync_update.assert_count(&key, 0);
                         test_resource_ctx.manager.get_with_loader(
-                            end.entry.id.clone(),
-                            TestResLoader::new(end.entry.id.clone()),
-                        ).await.expect_err(&format!("Resource should fail to load for '{:#?}'", &end.entry.id));
+                            start_expected.load_info.id,
+                            start_expected.load_info.loader.clone(),
+                        ).await.expect_err(&format!("Resource should fail to load for '{}'", start_expected.load_info.id));
                     },
                 }
             },
         }
-        test_resource_ctx.data_maps[0].assert_watch(end.entry.id.clone(), true);
+        test_resource_ctx.data_maps[0].assert_load_count(start_expected.load_info.id, expected_data_load_count);
+        test_resource_ctx.data_maps[0].assert_watch(start_expected.load_info.id, expected_should_watch);
     }
 
     #[rstest]
@@ -529,6 +588,7 @@ mod tests {
             (res_key("a", &TestResChainLoader), 1..=1),
             (res_key("b", &TestResChainLoader), 1..=1),
         ],
+        [("a", 2), ("b", 2)],
         DependencyGraph::builder()
             .add(res_key("a", &TestResChainLoader), [res_key("b", &TestResChainLoader)])
             .build(),
@@ -549,6 +609,7 @@ mod tests {
             (res_key("b", &TestResChainLoader), 0..=0),
             (res_key("c", &TestResChainLoader), 1..=1),
         ],
+        [("a", 2), ("b", 1), ("c", 1)],
         DependencyGraph::builder()
             .add(res_key("a", &TestResChainLoader), [res_key("c", &TestResChainLoader)])
             .build(),
@@ -570,9 +631,30 @@ mod tests {
             (res_key("b", &TestResChainLoader), 1..=1),
             (res_key("c", &TestResChainLoader), 1..=1),
         ],
+        [("a", 2), ("b", 2), ("c", 2)],
         DependencyGraph::builder()
             .add(res_key("a", &TestResChainLoader), [res_key("b", &TestResChainLoader)])
             .add(res_key("b", &TestResChainLoader), [res_key("c", &TestResChainLoader)])
+            .build(),
+    )]
+    #[case::single_virtual(
+        DependencyGraph::builder().build(),
+        [TestDataEntry::new("b", b"value", "h_value")],
+        [ExpectedLoadInfo {
+            load_info: TestLoadInfo::new("a", ref_loader!(VRef("b"):TestResLoader::new("b"))),
+            expected: ExpectedLoadResult::Ok(ExpectedResourceRef::new(vec!["value"])),
+        }],
+        BulkUpdate::new(0, [Update::Insert(TestDataEntry::new("b", b"new_value", "h_new_value"))]),
+        [ExpectedResourceRef::new(vec!["new_value"])],
+        [
+            (res_key("a", &ref_loader!(VRef("b"):TestResLoader::new("b"))), 1..=1),
+            (res_key("b", &TestResLoader::new("b")), 1..=1),
+        ],
+        [("a", 0), ("b", 2)],
+        DependencyGraph::builder()
+            .add(res_key("a", &ref_loader!(VRef("b"):TestResLoader::new("b"))), [
+                res_key("b", &TestResLoader::new("b"))
+            ])
             .build(),
     )]
     #[case::tree(
@@ -637,6 +719,9 @@ mod tests {
             (res_key("c2", &TestResChainLoader), 1..=2),
             (res_key("c3", &TestResChainLoader), 1..=1),
         ],
+        // just need some to keep typing happy, but we honestly don't care about the rest as the
+        // above check handles it
+        [("a1", 2), ("a2", 2)],
         DependencyGraph::builder()
             .add(res_key("a1", &TestResChainLoader), [res_key("b1", &TestResChainLoader)])
             .add(res_key("a2", &TestResChainLoader), [
@@ -688,6 +773,7 @@ mod tests {
             // Even though b1..b3 loads this, it _should_ be cached during the overall "a" load
             (res_key("c", &TestResChainLoader), 1..=1),
         ],
+        [("a", 2), ("b1", 2), ("b2", 2), ("b3", 2), ("c", 2)],
         DependencyGraph::builder()
             .add(res_key("a", &TestResChainLoader), [
                 res_key("b1", &TestResChainLoader),
@@ -700,18 +786,21 @@ mod tests {
             .build(),
     )]
     #[test_attr(test_log(apply(smol_test)))]
-    async fn test_update_dependencies<L>(
+    async fn test_update_dependencies<L, A>(
         test_resource_ctx: TestResourceContext<1>,
         #[case] dependency_graph: DependencyGraph,
         #[case] data_entries: impl IntoIterator<Item=TestDataEntry>,
-        #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<L, Vec<&'static str>>>,
+        #[case] initial_entries: impl IntoIterator<Item=ExpectedLoadInfo<L, A>>,
         #[case] update: BulkUpdate,
-        #[case] expected_values: impl IntoIterator<Item=Vec<&'static str>>,
+        #[case] expected_values: impl IntoIterator<Item=A>,
         #[case] expected_load_counts: impl IntoIterator<Item=(BoxedResKey, impl RangeBounds<usize> + Debug)>,
+        #[case] expected_data_load_counts: impl IntoIterator<Item=(impl Into<ResourceId>, usize)>,
         #[case] expected_graph: DependencyGraph,
     )
     where
-        L: ResourceLoader<Output=Vec<String>>,
+        L: ResourceLoader,
+        L::Output: Debug + Sized,
+        A: Debug + PartialEq<L::Output>,
     {
         setup_dependency_data(&test_resource_ctx.data_maps[0], &dependency_graph);
         {
@@ -724,9 +813,9 @@ mod tests {
         let mut values = Vec::new();
         let mut wait_keys = HashSet::default();
         for entry in initial_entries.into_iter() {
-            wait_keys.insert(res_key(entry.load_info.key, &entry.load_info.loader));
+            wait_keys.insert(entry.load_info.key());
             let result = test_resource_ctx.manager.get_with_loader(
-                entry.load_info.key,
+                entry.load_info.id,
                 entry.load_info.loader,
             ).await;
             let value = entry.expected.assert_matches(result)
@@ -752,6 +841,9 @@ mod tests {
         assert_eq!(&*test_resource_ctx.manager.dependencies.read(), &expected_graph);
         for (key, expected_range) in expected_load_counts.into_iter() {
             test_resource_ctx.manager.test_ctx().sync_load.assert_count_range(&key, expected_range);
+        }
+        for (id, expected_count) in expected_data_load_counts.into_iter() {
+            test_resource_ctx.data_maps[0].assert_load_count(id, expected_count);
         }
     }
 }

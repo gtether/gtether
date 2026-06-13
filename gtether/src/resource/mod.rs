@@ -423,6 +423,26 @@ pub type ResourceLoadResult<T> = Result<Arc<Resource<T>>, ResourceLoadError>;
 /// Raw data type for loading resources from.
 pub type ResourceReadData = Pin<Box<dyn AsyncRead + Send>>;
 
+/// The method by which a resource loader expects its source data to be gathered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceLoaderSourceType {
+    /// The first source that contains data for the specified [ID](ResourceId) will be used.
+    FirstFound,
+
+    /// No resource sources will be used.
+    ///
+    /// This is useful for resource loaders that don't rely on data themselves, such as composite
+    /// loaders that chain load via other loaders.
+    ///
+    /// The `data` passed to [`ResourceLoader::load()`] will be a "no-op" that immediately yields
+    /// "end-of-file".
+    ///
+    /// Resources loaded via a virtual loader will not be updated when the data associated with
+    /// their ID is updated. They _will_ however still be updated when one of their dependencies
+    /// is updated.
+    Virtual,
+}
+
 /// User-defined interface for loading [Resources][res] from [raw data][rd].
 ///
 /// ResourceLoaders are used to define the behavior for loading and updating [Resources][res] from
@@ -544,6 +564,19 @@ pub trait ResourceLoader: Send + Sync + 'static {
     }
 
     fn key(&self) -> Self::Key;
+
+    /// The method that is used to find source data for this resource loader.
+    ///
+    /// This value should not change once a loader has been handed off to the resource manager.
+    /// Changing this value in such a situation (such as with interior mutability) will cause
+    /// undefined behavior.
+    ///
+    /// See [ResourceLoaderSourceType] for more on the available methods.
+    ///
+    /// The default value is [ResourceLoaderSourceType::FirstFound].
+    fn source_type(&self) -> ResourceLoaderSourceType {
+        ResourceLoaderSourceType::FirstFound
+    }
 }
 
 /// Simple [ResourceLoader] that yields the [ID](ResourceLoader) that was used to find data.
